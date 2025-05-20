@@ -1,0 +1,36 @@
+[Unit]
+Description=SyncSonic Bluetooth Audio Service
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+User=syncsonic
+RuntimeDirectory=syncsonic
+Environment=XDG_RUNTIME_DIR=/run/syncsonic
+Environment=PULSE_SYSTEM_BUS=1
+
+# Start a fresh PulseAudio daemon for the syncsonic user
+ExecStartPre=/usr/bin/pulseaudio --daemonize=yes --exit-idle-time=-1 --log-target=journal -F /home/syncsonic/SyncSonicPi/pulse-headless.pa
+
+# Kill any leftover PulseAudio instance (optional dash allows it to fail silently)
+ExecStartPre=-/usr/bin/pkill -x pulseaudio
+
+# Remove stale socket
+ExecStartPre=/usr/bin/rm -f /run/syncsonic/pulse/native
+
+# Ensure runtime directory and ownership
+ExecStartPre=/usr/bin/mkdir -p /run/syncsonic/pulse
+ExecStartPre=/usr/bin/chown syncsonic:syncsonic /run/syncsonic/pulse
+
+# Start your custom script
+ExecStart=/home/syncsonic/SyncSonicPi/start_syncsonic.sh
+
+# Restart policy
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target 

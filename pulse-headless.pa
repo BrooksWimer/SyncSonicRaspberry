@@ -1,0 +1,2 @@
+# Minimal headless PulseAudio config
+load-module module-native-protocol-unix auth-anonymous=1 socket=/run/syncsonic/pulse/native 

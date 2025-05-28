@@ -19,50 +19,50 @@ def remove_loopback_for_device(mac: str):
     subprocess.call(["pactl", "unload-module", f"module-loopback sink={sink_name}"])
 
 def setup_pulseaudio() -> bool:
-    """Ensure PulseAudio is running and prepare a *virtual_out* sink.
+    """Ensure PulseAudio is running and prepare a virtual_out sink.
 
     Returns
     -------
     bool
-        ``True`` if everything is ready, ``False`` otherwise.
+        True if everything is ready, False otherwise.
     """
-
     try:
-        # ────────────────────────────────────────────────────────────────
-        # 1) Is PulseAudio alive?
-        # ────────────────────────────────────────────────────────────────
-        log.info("🔊 Checking if PulseAudio daemon is responsive …")
+        # Step 0: Kill any existing PulseAudio processes and remove stale sockets
+        log.info("Cleaning up previous PulseAudio state...")
+        subprocess.run(["pkill", "-9", "pulseaudio"], check=False)
+        subprocess.run(["rm", "-rf", "/run/user/1000/pulse/"], check=False)
+        subprocess.run(["rm", "-rf", "/run/syncsonic/pulse/"], check=False)
+        time.sleep(1)
+
+        # Step 1: Check if PulseAudio is currently running
+        log.info("Checking if PulseAudio daemon is responsive...")
         info_result = subprocess.run(["pactl", "info"], capture_output=True, text=True)
 
         if info_result.returncode != 0 or "Server Name" not in info_result.stdout:
-            log.warning("💤 PulseAudio not responding – restarting it")
+            log.warning("PulseAudio not responding, attempting to start it")
 
-            # Kill *all* PulseAudio processes (if any) and start a fresh one
-            subprocess.run(["pkill", "-9", "pulseaudio"], check=False)
-            time.sleep(1)
+            # Start PulseAudio with no idle timeout
+            subprocess.run(["pulseaudio", "--start", "--exit-idle-time=-1"], check=False)
 
-            subprocess.run(["pulseaudio", "--start"], check=False)
-
-            # Give it a moment to come up
+            # Wait up to 5 seconds for PulseAudio to come up
             for i in range(5):
                 result = subprocess.run(["pactl", "info"], capture_output=True, text=True)
                 if result.returncode == 0 and "Server Name" in result.stdout:
-                    log.info("✅ PulseAudio is up (after %d attempt(s))", i + 1)
+                    log.info("PulseAudio started successfully (after %d attempt(s))", i + 1)
                     break
                 time.sleep(1)
             else:
-                log.error("❌ Failed to start PulseAudio – aborting audio init")
+                log.error("Failed to start PulseAudio; aborting audio initialization")
                 return False
 
-        # ────────────────────────────────────────────────────────────────
-        # 2) Ensure *virtual_out* sink exists (null-sink used as audio hub)
-        # ────────────────────────────────────────────────────────────────
+        # Step 2: Check whether the virtual sink already exists
         existing = subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True, text=True)
         if "virtual_out" in existing.stdout:
-            log.info("🟢 Sink 'virtual_out' already present – skipping creation")
+            log.info("Sink 'virtual_out' already exists; skipping creation")
             return True
 
-        log.info("➕ Creating virtual sink 'virtual_out'")
+        # Step 3: Create the virtual sink
+        log.info("Creating virtual sink 'virtual_out'")
         result = subprocess.run([
             "pactl", "load-module", "module-null-sink",
             "sink_name=virtual_out",
@@ -70,28 +70,27 @@ def setup_pulseaudio() -> bool:
         ], capture_output=True, text=True)
 
         if result.returncode != 0:
-            log.error("❌ Failed to load virtual sink: %s", result.stderr.strip())
+            log.error("Failed to load virtual sink: %s", result.stderr.strip())
             return False
 
         module_id = result.stdout.strip()
-        log.info("✅ Loaded module-null-sink (id=%s)", module_id)
+        log.info("Loaded module-null-sink (id=%s)", module_id)
 
-        # ────────────────────────────────────────────────────────────────
-        # 3) Make it the default sink so every loopback lands in there
-        # ────────────────────────────────────────────────────────────────
+        # Step 4: Set the virtual sink as the default sink
         set_result = subprocess.run(["pactl", "set-default-sink", "virtual_out"], capture_output=True, text=True)
         if set_result.returncode != 0:
-            log.error("❌ Unable to set 'virtual_out' as default sink: %s", set_result.stderr.strip())
+            log.error("Unable to set 'virtual_out' as default sink: %s", set_result.stderr.strip())
             return False
 
-        log.info("🏁 PulseAudio initialisation complete – default sink is 'virtual_out'")
+        log.info("PulseAudio initialization complete; default sink is 'virtual_out'")
         return True
 
-    except Exception as e:  # pragma: no cover – defensive
-        log.exception("❌ Unhandled exception during PulseAudio init: %s", e)
+    except Exception as e:
+        log.exception("Unhandled exception during PulseAudio initialization: %s", e)
         return False
 
-def create_loopback(expected_sink_prefix: str, latency_ms: int = 100, wait_seconds: int = 20) -> bool:
+
+def create_loopback(expected_sink_prefix: str, latency_ms: int = 100, wait_seconds: int = 5) -> bool:
     """
     Waits for a specific sink to appear (matching by prefix), unloads any existing loopbacks for it,
     and then creates a clean new loopback.
@@ -116,11 +115,17 @@ def create_loopback(expected_sink_prefix: str, latency_ms: int = 100, wait_secon
                 subprocess.run(["pactl", "unload-module", module_id])
 
     def load_loopback(actual_sink_name: str):
+        """Load loopback with strict latency enforcement to prevent underruns or drift."""
         result = subprocess.run([
             "pactl", "load-module", "module-loopback",
             "source=virtual_out.monitor",
             f"sink={actual_sink_name}",
-            f"latency_msec={latency_ms}",
+            "source_dont_move=1",                # Keep source pinned
+            f"latency_msec={latency_ms}",        # Target latency (from slider)
+            f"max_latency_msec={latency_ms}",    # Prevent PulseAudio from increasing it
+            "fast_adjust_threshold_msec=20",     # Rapid correction if latency goes off target
+            "adjust_latency=false",              # Prevent sink-based dynamic latency shifts
+            "use_sink_latency=yes"               # Enforce latency at the sink side
         ], capture_output=True, text=True)
         return result
 

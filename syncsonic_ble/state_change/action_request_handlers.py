@@ -60,6 +60,10 @@ def handle_set_latency(char, data):
     sink_prefix = f"bluez_sink.{mac.replace(':', '_')}"
     ok = create_loopback(sink_prefix, latency_ms=int(latency))
     if ok:
+        # Add to loopbacks set if we have access to the connection service
+        if char.connection_service:
+            char.connection_service.loopbacks.add(mac)
+            logger.info(f"✅ Added {mac} to loopbacks set after latency update")
         return _encode(Msg.SUCCESS, {"latency": latency})
     return _encode(Msg.ERROR, {"error": "loopback failed"})
 

@@ -121,21 +121,24 @@ class DeviceManager:
             return
 
 
-        # auto‑connect profile if transport missing --------------------------
-        _ensure_media_transport(self.bus, dev_obj, mac)
+        # # auto‑connect profile if transport missing --------------------------
+        # _ensure_media_transport(self.bus, dev_obj, mac)
 
-        # finally create loopback & mark connected ---------------------------
-        sink_name = f"bluez_sink.{mac.replace(':', '_')}.a2dp_sink"
-        create_loopback(sink_name)
+        # pass to the flow state management ---------------------------
         self.connected.add(mac)
-        log.info("Created loopback for %s", mac)
+        log.info("Tracking %s as connected — loopback deferred to FSM", mac)
+        from syncsonic_ble.state_management.connection_manager import Intent
+        from syncsonic_ble.state_management.connection_manager import work_q
+        work_q.put((Intent.LOOPBACK_SYNC, {"mac": mac, "connected": True}))
 
     def _handle_disconnection(self, mac: str):
         if mac not in self.connected:
             return
         self.connected.remove(mac)
-        remove_loopback_for_device(mac)
-        log.info("%s disconnected – %d speaker(s) left", mac, len(self.connected))
+        log.info("Tracking %s as disconnected — loopback removal deferred to FSM", mac)
+        from syncsonic_ble.state_management.connection_manager import Intent
+        from syncsonic_ble.state_management.connection_manager import work_q
+        work_q.put((Intent.LOOPBACK_SYNC, {"mac": mac, "connected": False}))
 
     # ───────────────────────── misc helpers ─────────────────────────────────
     def _device_found(self, path: str):
@@ -167,22 +170,3 @@ class DeviceManager:
         self.devices[path] = {"device": obj, "props": props_iface, "iface": dev_iface}
         log.info("Registered expected speaker %s at %s", mac, path)
 
-# helper – ensure MediaTransport exists before we create loopback ------------
-
-def _ensure_media_transport(bus: dbus.SystemBus, dev_obj, mac: str):
-    from syncsonic_ble.utils.constants import DBUS_OM_IFACE
-    om  = bus.get_object(BLUEZ_SERVICE_NAME, "/")
-    mgr = dbus.Interface(om, DBUS_OM_IFACE)
-    objs = mgr.GetManagedObjects()
-    fmt = mac.replace(":", "_")
-    has_transport = any(
-        "org.bluez.MediaTransport1" in ifaces and fmt in path
-        for path, ifaces in objs.items()
-    )
-    if not has_transport:
-        try:
-            dbus_iface = dbus.Interface(dev_obj, DEVICE_INTERFACE)
-            dbus_iface.ConnectProfile(A2DP_UUID)
-            log.info("Triggered A2DP ConnectProfile for %s", mac)
-        except Exception as exc:
-            log.error("ConnectProfile failed for %s: %s", mac, exc)

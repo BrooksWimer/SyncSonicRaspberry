@@ -8,6 +8,7 @@ Thread‑safe orchestrator that owns **all** Bluetooth logic:
 * Runs **one** background worker thread that consumes intents from a
   `queue.Queue` – so every BlueZ call happens in that single thread.
 * Can be driven by any transport: Flask today, BLE tomorrow.
+is it working?
 """
 
 from __future__ import annotations
@@ -268,7 +269,7 @@ class ConnectionService:
                     # signal discovery failed
                     if self._char:
                         self._char.send_notification(
-                            Msg.ERROR,
+                            Msg.CONNECTION_STATUS_UPDATE,
                             {"phase": "discovery_timeout", "device": dev_mac}
                         )
                     break
@@ -304,7 +305,7 @@ class ConnectionService:
                     # signal pairing failure
                     if self._char:
                         self._char.send_notification(
-                            Msg.ERROR,
+                            Msg.CONNECTION_STATUS_UPDATE,
                             {"phase": "pairing_failed", "device": dev_mac, "attempt": attempt}
                         )
 
@@ -325,22 +326,54 @@ class ConnectionService:
                         Msg.CONNECTION_STATUS_UPDATE,
                         {"phase": "connect_start", "device": dev_mac}
                     )
-
+                logger.info(f"entering the if connect loop")
                 if connect_device_dbus(device_path, self.bus):
-
                     device_path = device_path_on_adapter(self.bus, adapter_mac, dev_mac)
                     dev_obj = self.bus.get_object(BLUEZ_SERVICE_NAME, device_path)
                     dev_iface = Interface(dev_obj, DEVICE_INTERFACE)
 
+                    # wait for MediaTransport1 to appear
+                    logger.info(f"→ Waiting for MediaTransport1 for {dev_mac} before ConnectProfile...")
+                    if not self.wait_for_media_transport(dev_mac):
+                        logger.warning(f"❌ MediaTransport1 never appeared for {dev_mac} after Device.Connect()")
+                        attempt += 1
+                        remove_device_dbus(device_path, self.bus)
+                        state = "run_discovery"
+                        continue  # retry
 
-                    # A2DP Sink UUID constant imported at top
+                    # Add a small delay to allow BlueZ to stabilize
+                    time.sleep(1)
 
+                    # Now attempt A2DP ConnectProfile
                     logger.info(f"→ [DEBUG] Asking BlueZ to connect A2DP on {device_path}")
                     try:
                         dev_iface.ConnectProfile(A2DP_UUID)
                         logger.info("→ [DEBUG] ConnectProfile(A2DP) succeeded")
                     except Exception as e:
-                        logger.info(f"⚠️ ConnectProfile(A2DP) failed: {e}")
+                        error_str = str(e)
+                        if "InProgress" in error_str:
+                            logger.info(f"→ A2DP connection in progress, waiting...")
+                            # Wait a bit longer for the connection to complete
+                            time.sleep(2)
+                            try:
+                                dev_iface.ConnectProfile(A2DP_UUID)
+                                logger.info("→ [DEBUG] ConnectProfile(A2DP) succeeded on retry")
+                            except Exception as e2:
+                                logger.error(f"❌ ConnectProfile failed on retry for {dev_mac}: {e2}")
+                                if self._char:
+                                    self._char.send_notification(
+                                        Msg.CONNECTION_STATUS_UPDATE,
+                                        {"phase": "connect_profile_failed", "device": dev_mac}
+                                    )
+                                continue
+                        else:
+                            logger.error(f"❌ ConnectProfile failed for {dev_mac}: {e}")
+                            if self._char:
+                                self._char.send_notification(
+                                    Msg.CONNECTION_STATUS_UPDATE,
+                                    {"phase": "connect_profile_failed", "device": dev_mac}
+                                )
+                            continue
 
                     # signal connect success
                     if self._char:
@@ -363,11 +396,12 @@ class ConnectionService:
                     
                 if self._char:
                     self._char.send_notification(
-                        Msg.ERROR,
+                        Msg.CONNECTION_STATUS_UPDATE,
                         {"phase": "connect_failed", "device": dev_mac, "attempt": attempt}
                     )
-
-                state = "pair"  # fall back
+                logger.info(f"removing the device and retrying")
+                remove_device_dbus(device_path, self.bus)
+                state = "run_discovery"
                 attempt += 1
 
         logger.info(f"    ❌ failed to reconnect {dev_mac}")
@@ -382,4 +416,28 @@ class ConnectionService:
         if mac in self.loopbacks:
             remove_loopback_for_device(mac)
             self.loopbacks.remove(mac)
+
+    
+    # helper – ensure MediaTransport exists before we create loopback ------------
+
+    def wait_for_media_transport(self, mac: str, timeout: int = 5) -> bool:
+        fmt = mac.replace(":", "_")
+        om_iface = Interface(self.bus.get_object(BLUEZ_SERVICE_NAME, "/"), DBUS_OM_IFACE)
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            try:
+                objs = om_iface.GetManagedObjects()
+                if any(
+                    "org.bluez.MediaTransport1" in ifaces and fmt in path
+                    for path, ifaces in objs.items()
+                ):
+                    return True
+            except Exception as e:
+                logger.warning(f"[wait_for_media_transport] Error checking MediaTransport1 for {mac}: {e}")
+            time.sleep(0.5)
+
+        return False
+
+
 

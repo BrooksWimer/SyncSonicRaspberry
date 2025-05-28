@@ -17,20 +17,20 @@ remaining adapters act as A2DP sinks that connect to speakers.
 
 ## Features
 
-• 📡 **Custom BLE GATT service**
+• **Custom BLE GATT service**
   – One characteristic handles all phone ↔︎ Pi messaging (binary protocol).
 
-• 🎛 **Multiple adapters**
+• **Multiple adapters**
   – Dynamically select audio endpoints and hot-swap faulty dongles.
 
-• 🎚 **Real-time audio control**
+• **Real-time audio control**
   – Set volume, latency, mute state and receive connection-status updates.
 
-• 🛠 **Self-healing**
+• **Self-healing**
   – Helper script (`reset_bt_adapters.sh`) that power-cycles USB ports, renames
     adapters and exports the *UART* controller via the `RESERVED_HCI` variable.
 
-• 🐍 **Pure-Python** implementation that relies only on BlueZ and GLib
+• **Pure-Python** implementation that relies only on BlueZ and GLib
   (through *dbus-python* & *PyGObject*).
 
 ---

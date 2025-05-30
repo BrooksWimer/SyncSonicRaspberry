@@ -1,8 +1,3 @@
-Great, I’ll review the contents of your project and generate a comprehensive README that explains the full system architecture, how the frontend and backend work together, and all the components involved. This README will focus on making the overall structure and logic clear to readers exploring your portfolio.
-
-I’ll let you know once it’s ready.
-
-
 # SyncSonic – Multi-Device Bluetooth Audio Hub
 
 ## Project Overview and Purpose

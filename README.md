@@ -11,7 +11,7 @@ SyncSonic consists of two main parts working together:
 * **Raspberry Pi Hub (Backend):** A Raspberry Pi (with multiple Bluetooth adapters) runs the backend software. This hub is the bridge between the phone’s audio and the Bluetooth speakers. It receives the audio stream from the user’s phone and then simultaneously transmits that audio to all connected Bluetooth speakers. It also hosts a local server to communicate with the mobile app for control commands.
 * **Expo Mobile App (Frontend):** A cross-platform mobile application (built with Expo/React Native) serves as the user interface. The app lets users select which speakers to connect, control synchronization settings, and send commands to the Pi hub. The phone’s audio output is integrated such that when you play music on your phone (and direct it to SyncSonic), the Pi will act as the output and forward the music to all chosen speakers.
 
-**How it works (big picture):** The mobile app and Raspberry Pi communicate over a local network (Wi-Fi). The user interacts with the app to pick speakers and adjust settings; the app sends these choices to the Pi’s backend. The Pi then uses its multiple Bluetooth radios to pair with and stream to each speaker concurrently. Under the hood, the Pi uses *one Bluetooth adapter per speaker* to overcome the one-device limit – effectively creating individual connections that share the same audio source. The audio from the phone is captured by the Pi (as if the Pi were a Bluetooth speaker for the phone) and then duplicated out to all connected speaker devices in sync.
+**How it works (big picture):** The mobile app and Raspberry Pi communicate using Bluetooth Low Eneregy (BLE). The user interacts with the app to pick speakers and adjust settings; the app sends these choices to the Pi’s backend. The Pi then uses its multiple Bluetooth radios to pair with and stream to each speaker concurrently. Under the hood, the Pi uses *one Bluetooth adapter per speaker* to overcome the one-device limit – effectively creating individual connections that share the same audio source. The audio from the phone is captured by the Pi (as if the Pi were a Bluetooth speaker for the phone) and then duplicated out to all connected speaker devices in sync.
 
 ## Backend – Raspberry Pi Hub
 
@@ -19,20 +19,52 @@ The backend is the **heart of SyncSonic**, running on a Raspberry Pi configured 
 
 * **Bluetooth Connection Manager:** The Pi manages multiple Bluetooth connections simultaneously. It uses multiple USB Bluetooth adapters so that each speaker gets its own adapter (enabling parallel A2DP audio streams). The software scans for nearby Bluetooth speakers, handles pairing (if not already paired), and connects to the selected devices. It leverages the BlueZ Bluetooth stack on Linux (and tools like `bluetoothctl` or BlueZ D-Bus APIs behind the scenes) to initiate and maintain these connections.
 * **Audio Streaming and Synchronization:** The Pi acts as a Bluetooth audio **sink** for the phone and as a **source** for the speakers. In practice, you pair your phone to the Pi (the Pi identifies itself as an audio receiver). When you play music on your phone, the sound is sent to the Pi. The backend captures this single audio stream and routes it to all active speaker connections at once. To achieve this, the system creates a **virtual combined audio output** that includes all connected Bluetooth speakers, so the music is duplicated to each one. This setup relies on the Pi’s audio subsystem (PulseAudio or a similar sound server) to synchronize output and adjust for any timing differences. (Using multiple adapters avoids the limitation where one Bluetooth transmitter can only handle one audio device at a time.) The backend can also apply per-speaker calibrations – for example, delaying audio on a closer speaker to match a farther speaker, or adjusting volumes – so that the output is **synchronized and balanced** across your space.
-* **Control API Server:** Running alongside the audio logic is a lightweight web server (e.g. a REST API). This server receives commands from the mobile app and updates the system state. For instance, when the user toggles a particular speaker on in the app, the app calls an API endpoint on the Pi (something like `/connectDevice` with the speaker’s ID); the backend then runs the routine to pair/connect to that device. Similarly, there may be endpoints like `/disconnectDevice`, `/scanDevices` (to trigger a Bluetooth scan and report available devices back to the app), or `/calibrate` (to apply latency/volume adjustments). The API server sends responses/status back to the app, so the user gets feedback (like “Speaker X connected” or “Calibration saved”). This backend API is what makes the **frontend-backend communication** possible in real time.
+* **Control Communication via BLE:** The SyncSonic system originally used a REST API for communication between the mobile app and the Raspberry Pi hub, requiring both devices to be on the same local Wi-Fi network. While functional, this approach limited portability and required users to configure network settings manually. To overcome these limitations, the project transitioned to using Bluetooth Low Energy (BLE) for all control communication. Now, the mobile app interacts with the Raspberry Pi hub directly over BLE by reading and writing to custom characteristics. For example, when a user toggles a speaker on or off, selects devices, or adjusts calibration settings, the app sends a BLE command directly to the Pi. The Pi then handles pairing, connection, or parameter updates and responds with BLE notifications, allowing the app to update the UI in real time with status messages like “Speaker X connected” or “Calibration saved.” This shift to BLE significantly improves usability and portability: no internet connection or network setup is required, making SyncSonic a plug-and-play solution that can be used anywhere—indoors, outdoors, or on the go. It also aligns better with the user expectation that a wireless speaker system should “just work” without setup hurdles.
 
-**Backend Project Structure:** The code for the backend is organized into folders and modules that reflect these responsibilities. Major components include:
+## Backend Project Structure
 
-* **`backend/`** – Top-level directory for the Raspberry Pi hub code.
+The backend is organized into a Python package called `syncsonic_ble` with the following structure:
 
-  * **`server`** (or `app`) **module**: Entry point of the backend application. This sets up the web server (e.g. starts a Flask app or Node/Express server) and initializes the Bluetooth/audio services. It defines the API routes that the mobile app can call.
-  * **`bluetooth/`** (folder or module): Contains the Bluetooth management logic. For example, a `device_manager.py` or `BluetoothManager.js` here would handle scanning for devices, pairing, and connecting using the BlueZ stack. It may wrap lower-level commands (like calling `bluetoothctl` commands or BlueZ D-Bus calls) into functions like `scan_devices()` or `connect_to_device(address)`.
-  * **`audio/`** (folder or module): Handles audio capture and distribution. This might include scripts or configurations for PulseAudio. For instance, it could have a module that sets up a combined sink (grouping all Bluetooth speaker outputs) and manages audio streams. If written in Python, it might use a library or system calls to manage PulseAudio modules; if in Node, it might call `pacmd`/`pactl` utilities. This component ensures that when the phone’s audio stream comes in, it’s forwarded to all connected outputs in sync.
-  * **`calibration/`** (or as part of audio module): Code for applying latency offsets or volume adjustments per speaker. This could simply be part of the audio module, adjusting PulseAudio settings or buffering to sync playback timing.
-  * **`utils/`** (utilities): There may be utility scripts for things like parsing device info, managing config files (like storing paired device addresses), etc.
-  * **Configuration files**: e.g. a file for known devices or a setup script. Possibly `requirements.txt` (if Python) or `package.json` (if Node) listing dependencies like BlueZ libraries, Flask/Express, etc.
+### Core Components
 
-Overall, the backend is engineered to run automatically on the Pi (perhaps starting on boot), awaiting commands from the app and continuously managing the multi-device audio stream.
+* **`backend/`** – Top-level directory containing:
+  * **`syncsonic_ble/`** – Main Python package containing the core application code
+    * **`main.py`** – Entry point that bootstraps the BLE GATT server, connection service, and runs the GLib main loop. It handles initialization of PulseAudio, D-Bus integration, BlueZ adapter selection, and sets up the pairing agent.
+    * **`state_management/`** – Contains core state management components:
+      * `bus_manager.py` – Manages D-Bus connections
+      * `device_manager.py` – Handles Bluetooth device discovery and management
+      * `connection_manager.py` – Manages BLE connections and state
+    * **`infra/`** – Infrastructure components:
+      * `connection_agent.py` – Implements the phone pairing agent
+      * `gatt_service.py` – Implements the BLE GATT service and characteristics
+    * **`helpers/`** – Utility modules:
+      * `pulseaudio_helpers.py` – PulseAudio setup and configuration
+      * `adapter_helpers.py` – BlueZ adapter management utilities
+    * **`utils/`** – General utilities:
+      * `logging_conf.py` – Logging configuration
+      * `constants.py` – Application constants and UUIDs
+    * **`state_change/`** – Handles state transitions and events
+
+### System Files
+
+* **`syncsonic.service`** – Systemd service file for running the application as a service
+* **`start_syncsonic.sh`** – Shell script to start the application
+* **`reset_bt_adapters.sh`** – Utility script for resetting Bluetooth adapters
+* **`pulse-headless.pa`** – PulseAudio configuration for headless operation
+
+### Architecture Overview
+
+The backend is designed to run as a systemd service on the Raspberry Pi, providing a BLE GATT server that mobile devices can connect to. It uses:
+- BlueZ for Bluetooth management
+- D-Bus for system communication
+- PulseAudio for audio handling
+
+The application follows a modular architecture with clear separation between:
+- State management
+- Infrastructure components
+- Utility functions
+
+This structure reflects the implementation which uses BLE (Bluetooth Low Energy) for device communication. The system is built around a GATT service that handles device discovery, pairing, and audio streaming coordination.
 
 ## Frontend – Expo Mobile App
 
@@ -43,71 +75,100 @@ The frontend is a **React Native app (built with Expo)** that provides an intuit
 * **Calibration and Settings:** SyncSonic’s app may provide a settings screen for audio calibration. For example, the user could set a delay for a specific speaker (if one speaker is physically closer, a slight delay can prevent the sound from that speaker leading the others). The app might present sliders or input fields for each connected speaker’s volume level and delay. When adjusted, the app sends these parameters to the backend (perhaps via a `/calibrate` or `/settings` API call), which in turn applies them to the audio pipeline. This helps achieve the optimal, synchronized sound mentioned in the project’s goals.
 * **Status and Feedback:** The app provides feedback to the user. For instance, if a connect command fails or a device is out of range, the app can display an error or notification. When everything is working, the app might show a “Now Playing on X speakers” message, confirming that the audio is streaming to all chosen devices.
 
-**Frontend Project Structure:** The mobile app’s code is organized within the **`frontend/`** directory. Notable parts of the Expo app include:
+## Frontend Architecture
 
-* **`App.js` / `App.tsx`:** The entry file for the React Native app. This likely sets up the root component and navigation. It might also establish a connection to the backend (for example, setting a base URL for API calls, possibly reading a config for the Pi’s IP address).
-* **Screens:** The app is probably divided into screens (using React Navigation or a similar library). Examples of screens:
+### Project Structure
 
-  * `DevicesScreen` (or similar) – shows the list of Bluetooth devices and toggles to connect them.
-  * `CalibrationScreen` – provides controls for adjusting sync settings like volume and delay for each speaker.
-  * Maybe a `Home` or `StatusScreen` – giving an overview and instructions (e.g. reminding the user to pair their phone to the SyncSonic hub via Bluetooth in the phone’s settings).
-* **Components:** Reusable components might live in a `components/` folder. For example, a custom list item component for a Bluetooth device (showing name, a toggle switch, and maybe connection status indicator), or a slider component for volume/delay.
-* **State Management:** The app might use React hooks or Context API to manage the state of devices and settings. For instance, a context provider could store the list of devices and their connected status, updating when the user toggles or when new data comes from the backend. Alternatively, it could use a library like Redux for state, though for a project like this, Context + hooks might suffice.
-* **API Services:** There may be a `services/` or `api/` module that centralizes the calls to the backend. For example, functions like `fetchDevices()`, `connectDevice(id)`, `disconnectDevice(id)`, `sendCalibration(data)` would reside here, using `fetch` or Axios to make HTTP requests to the Pi’s server. This helps keep network logic separate from the UI components.
-* **Expo Config:** Because this is an Expo app, it includes configuration for permissions and APIs. The app likely needs permission to access the local network (to reach the Pi’s server) and possibly Bluetooth permissions if it were to do any Bluetooth tasks on the phone side (though primarily the heavy lifting is on the Pi). The `app.json` (Expo config) might declare these permissions. Additionally, if the app needed to initiate the phone-to-Pi Bluetooth pairing, it might use a native module (though in most cases the user would pair their phone to the Pi through the phone’s OS settings, not directly through the app).
+The mobile app is built using Expo and React Native, with a modern, well-organized structure:
 
-The frontend is built to be user-friendly: the user just toggles which speakers to include and maybe adjusts a few sliders. It doesn’t matter if the speakers are from different manufacturers – the app abstracts that complexity. Once the selection is made, the user can play audio from any app (Spotify, Apple Music, etc.) on their phone, and the Pi hub will make sure that sound comes out through all the chosen speakers in sync.
+#### App Entry & Navigation
+- Uses Expo Router for file-based routing and navigation
+- Main screens located in the `app/` directory:
+  - `DeviceSelectionScreen.tsx` - Handles Bluetooth device scanning and pairing
+  - `SpeakerConfigScreen.tsx` - Manages speaker configurations and settings
 
-## Communication and Data Flow
+#### UI Components & Styling
+- Uses Tamagui as the UI component library with built-in theme support
+- Components organized in the `components/` directory:
+  - `TopBar.tsx` - Common navigation component
+- Supports both dark and light themes, automatically switching based on system preferences
 
-The **communication between the mobile app and the Raspberry Pi backend** follows a clear request-response pattern, usually over HTTP (REST API calls) within the local network. Here’s an example of the typical workflow and data flow in SyncSonic:
+#### State Management & Data Flow
+- React hooks for state management (`hooks/` directory)
+- Contexts managed in `contexts/` directory
+- Local data persistence through SQLite database operations
 
-1. **Device Discovery:** When the user opens the app, it needs to display available speakers. The app sends a request (e.g. `GET /devices`) to the Pi’s API. The backend’s Bluetooth manager scans for nearby discoverable Bluetooth audio devices (if not already scanned recently) and returns a list of devices (each with an identifier, name, and possibly an indicator if it’s already connected or remembered). The app then shows this list in the UI, perhaps with toggles next to each device name.
-2. **Connecting Speakers:** The user selects one or more speakers to use. Suppose the user toggles “On” two devices in the app’s list. For each toggle on, the app calls an endpoint like `POST /connect` with the device’s ID or address. The backend receives the request and initiates the Bluetooth connection process for that device: it may pair (if not paired before), then connect to the speaker’s A2DP profile. When successful, the backend adds that device to the combined audio sink (so it will start receiving audio). The API then responds back with a success status, which the app uses to update the UI (marking that speaker as connected/active). If there’s an error (device not in range or connection failed), the backend would respond with an error status, and the app can display a message to the user.
-3. **Streaming Audio:** After the user has connected the desired speakers via the app, the system is ready to play music. The user now plays audio on the phone (outside the app – e.g., open a music app or YouTube). They select **SyncSonic (the Pi)** as the output – this step typically involves going to the phone’s Bluetooth settings and ensuring the phone is paired to the Pi and using it as an audio output (much like you’d connect to any Bluetooth headphone or speaker). Once that’s done, any audio on the phone is sent to the Pi. The Pi’s backend (through PulseAudio) picks up this incoming audio stream and **broadcasts it to all connected Bluetooth speakers simultaneously**. Essentially, the Pi is forwarding the music in real time to each speaker. Because all speakers are receiving the same stream from the combined sink, they stay in lockstep (the system attempts to keep playback synchronized, adjusting for minor timing differences). The result: all rooms play the same music at the same time.
-4. **Calibration Adjustments:** Suppose one speaker is slightly lagging or one is too loud. The user can open the calibration/settings screen in the app. Here they might see each connected speaker listed with controls like *volume level* and *delay (ms)*. The user tweaks these values (e.g. lower the volume on Speaker A, add 50ms delay to Speaker B). When changes are made, the app sends a request (e.g. `POST /calibrate`) with the new settings. The backend applies these settings by adjusting the audio pipeline – for instance, setting the PulseAudio per-sink volume or adding a buffering delay for that device’s stream. These adjustments help fine-tune the synchronization and sound balance. The backend might respond with the updated status, and the app reflects that (maybe showing a confirmation like “All speakers calibrated”).
-5. **Disconnecting Speakers:** If the user turns off a toggle for a speaker in the app, it sends a `POST /disconnect` command for that device. The backend then stops streaming to that speaker and disconnects the Bluetooth link. The app updates the UI to show it’s no longer active. The user can then even power down that speaker or choose a different set of speakers. (If the user stops using SyncSonic entirely, they’d stop playback on the phone and possibly the phone would disconnect from the Pi; the system can be reused anytime as needed by reconnecting through the app.)
+#### Utility Functions
+Core functionality organized in the `utils/` directory:
+- `PairingFunctions.ts` - Handles BLE device pairing logic
+- `SpeakerFunctions.ts` - Manages speaker control operations
+- `ConfigurationFunctions.ts` - Handles configuration management
 
-Throughout this flow, the **mobile app and backend maintain a simple dialog**: the app issues control commands (connect/disconnect/calibrate), and the backend performs the action and replies with the outcome. The heavy continuous task (audio streaming) doesn’t require constant back-and-forth messaging with the app – once the streams are set up, the Pi handles it autonomously. The app is essentially a remote control and configuration panel, while the Pi does the streaming labor.
+#### Bluetooth Communication
+- Direct BLE communication with speakers:
+  - Device scanning and discovery
+  - Device pairing and connection management
+  - Real-time control of speaker settings
+  - No API or server communication required
 
-## Major Components and Folder Structure
+### Key Features
 
-To summarize, here are the major components of the SyncSonic project and the structure of the codebase:
+1. **Device Selection & Pairing**
+   - BLE device scanning and discovery
+   - Direct pairing with Bluetooth speakers
+   - Support for multiple speaker configurations
 
-* **Raspberry Pi Backend (`/backend` folder):**
+2. **Speaker Control**
+   - Individual volume control via BLE
+   - Fine-tuned latency control
+   - Direct connection management
 
-  * *Purpose:* Manages Bluetooth connections and audio streaming; provides an API for control.
-  * *Main components:*
+3. **Configuration Management**
+   - Create, save, and delete speaker configurations
+   - Automatic saving of settings changes
+   - Local storage of configurations
 
-    * **Bluetooth Manager:** Scans for devices, pairs, connects/disconnects speakers (using multiple adapters).
-    * **Audio Manager:** Handles audio routing from phone to speakers (configures combined audio sink, manages synchronization and calibration).
-    * **API Server:** Runs a local web service (e.g. Flask or Express) with endpoints like `/devices`, `/connect`, `/disconnect`, `/calibrate` for the app to call.
-  * *Key files/folders:* You’ll find an entry-point (such as `server.py` or `index.js`) that starts the application. A config file might specify known device IDs or network settings. Subfolders like `bluetooth/` and `audio/` encapsulate the logic for those domains (as described above). Any calibration logic might be in the audio module or a separate utility file. Logging could be implemented to track connections and errors for debugging.
-* **Expo Mobile App Frontend (`/frontend` folder):**
+### Project Configuration
+- TypeScript for type safety
+- Configuration files:
+  - `app.config.ts` - Expo configuration
+  - `tamagui.config.ts` - UI theme and component configuration
+  - `tsconfig.json` - TypeScript configuration
 
-  * *Purpose:* Provides a user-friendly interface to control the system and visualize status.
-  * *Main components:*
+### User Experience Flow
 
-    * **Device Selection Screen:** Lists available Bluetooth speakers and allows connecting/disconnecting them via toggles.
-    * **Calibration/Settings Screen:** Offers controls for fine-tuning speaker sync (volume sliders, delay adjustments, etc.).
-    * **Status Display:** Indicates which speakers are active and maybe instructions for pairing the phone to the hub.
-    * **Network Module:** Handles HTTP requests to the backend API (wrapping fetch calls for device list, connect/disconnect, etc.).
-  * *Key files/folders:* The app’s core is in `App.js` (initializing the app and navigation). UI code is organized into React components and screens – e.g. `DeviceListItem`, `DeviceListScreen`, `CalibrationScreen`. There may be a `constants/` or config file where the backend server URL or IP is defined (so the app knows where to send requests – possibly the Pi’s IP or a local hostname). The `package.json` will list dependencies like React Navigation for screen routing or any UI libraries used. Since it’s an Expo app, the `app.json` defines app name, permissions (likely needs Bluetooth and network access permissions), and possibly orientation or other settings. All styling and layout is done with React Native’s StyleSheet or a UI library, ensuring the app is easy to use.
+1. **Initial Setup**
+   - Connect to the Pi over Classic Bluetooth from phones bluetooth settings
+   - Launch app and connect to Pi over Bluetooth Low Eneregy for communication
+   - Navigate to device selection screen
+   - Scan for available Bluetooth speakers
+   - Select and pair desired speakers
 
-By separating the project into these two clear folders (backend and frontend), the repository makes it easy for developers or reviewers to focus on either the system logic or the app interface. The **backend** folder contains everything that runs on the Pi, and the **frontend** folder contains the mobile app code. This modular separation also means each part can be developed and tested mostly independently – for example, you could simulate the backend with dummy data when developing the app, or test the backend’s Bluetooth functions without the app by calling its APIs via tools like curl.
+3. **Configuration Creation**
+   - Create named configurations for different speaker setups
+   - Configure individual speaker settings
+   - Save configurations for future use
 
-## Key Processes and Design Choices
+4. **Daily Use**
+   - Select saved configuration
+   - Adjust volume and latency as needed
+   - Connect/disconnect speakers as required
 
-**Multiple Bluetooth Connections:** A core challenge solved by SyncSonic is streaming audio to multiple Bluetooth devices simultaneously. Normally, one Bluetooth transmitter (like a phone or a single adapter) cannot send audio to multiple speakers at once. SyncSonic’s design tackles this by using **multiple Bluetooth adapters (dongles) on the Raspberry Pi**, effectively giving the Pi multiple “Bluetooth radios.” The backend software pairs each adapter to a different speaker, achieving a one-to-one link per speaker. All adapters are then fed the same audio source, which is how the system keeps the speakers playing the same content. This design is innovative because it creates a unified sound system out of independent speakers that typically wouldn’t work together.
+The frontend is designed to be user-friendly and intuitive, handling the complexity of managing multiple Bluetooth speakers through direct BLE communication. This allows users to focus on their audio experience without the need for intermediate servers or APIs.
 
-**Synchronization and Audio Quality:** When sending one audio stream to multiple outputs, keeping them in sync is vital – even small timing differences can cause an echo effect. SyncSonic addresses this by using the Pi’s PulseAudio capabilities (or similar sound server) to create a **combined output**. This combined output ensures each speaker gets audio frames in a synchronized manner. Additionally, the calibration feature allows manual fine-tuning. For instance, if one speaker has a slight inherent delay (or is further away physically), adding a few milliseconds delay to the others can align the sound. Likewise, individual volume control helps balance speakers of different wattages or in different rooms so one isn’t overpowering the rest. These adjustments contribute to a cohesive listening experience where all speakers sound like one system.
+### Technical Implementation
 
-**Frontend-Backend Communication:** The choice to use a simple REST API over Wi-Fi makes the system flexible and easy to work with. The mobile app doesn’t need to handle heavy audio data; it just sends control messages. This keeps the app lightweight (it’s essentially sending small JSON commands and receiving status updates). It also means the phone’s resources are free for the actual audio playback and other tasks. By using HTTP requests, the developers leveraged common tools and did not have to implement a complex protocol – any team member familiar with web APIs could understand the communication. It’s also easier to debug (you can test API endpoints with a browser or Postman during development).
+The app follows modern React Native best practices with:
+- Clear separation of concerns
+- Type-safe development with TypeScript
+- Efficient state management
+- Direct BLE communication
+- Local data persistence
+- Responsive and theme-aware UI
 
-**Expo for Rapid Development:** Using Expo for the mobile app likely accelerated development. Expo provides many pre-built components and simplifies deployment to devices. The app can run on both Android and iOS without platform-specific code for most of its functionality (since the heavy Bluetooth work is offloaded to the Pi, the app mostly deals with network requests and UI). Expo also handles permissions and can package the app for testing quickly, which is great for a student project timeline. The app’s focus is on usability: making it straightforward for a user to set up a party or study session with multi-room audio in a few taps.
+This architecture ensures a smooth, reliable user experience while maintaining the flexibility to support various Bluetooth speaker configurations.
 
-**Project Folder Organization:** This project is organized as a monorepo (both backend and frontend in one repository). This makes it convenient for a portfolio viewer or developer to see the entire system in one place. Each part has its own dependencies and can be worked on separately, but they are version-controlled together – ensuring that a certain version of the frontend is meant to work with a certain version of the backend. Clear folder naming (like `backend` and `frontend`) and modular code structure reflect good practice for a full-stack project. For someone exploring the code, it’s easy to navigate: for server logic, go to the backend folder; for app UI, go to the frontend folder. Comments in code (not visible here) likely further explain how functions are implemented, complementing this high-level README.
 
----
 
-**In summary**, SyncSonic’s README would educate a reader on how the system achieves multi-speaker Bluetooth audio synchronization. It describes how the Raspberry Pi acts as a hub with multiple Bluetooth interfaces to stream music in parallel, and how the Expo-based mobile app lets users control this setup easily. The project showcases an inventive use of hardware and software: combining Bluetooth networking, audio processing, and a user-friendly mobile interface to solve a real-world problem (playing music on all your speakers at once). This documentation provides a clear understanding of each component’s role, the data flow between components, and the overall architecture that makes **“goodbye to brand restrictions and hello to harmony”** possible. All of these details are presented in a structured way to help learners and portfolio viewers appreciate the engineering behind SyncSonic.
+
+**In summary**, SyncSonic is a novel audio technology that brings synchronized, multi-speaker Bluetooth streaming to the masses—regardless of speaker brand, platform, or environment. Unlike anything currently available on the market, SyncSonic enables users to connect multiple Bluetooth speakers simultaneously and play audio in perfect sync across all of them. It addresses a growing demand for affordable multi-room or shared-group audio experiences, delivering the functionality of premium, brand-locked ecosystems (like Sonos or Apple's AirPlay) at a fraction of the cost. Initially implemented using a Raspberry Pi and multiple Bluetooth adapters, the system pairs with a custom-built mobile app that controls connections and calibration via Bluetooth Low Energy (BLE), requiring no Wi-Fi setup or internet connection. Now that the core system is fully functional, the next step is to develop a custom hardware unit—smaller, cheaper, and optimized for real-world use—turning SyncSonic into a plug-in phone accessory that anyone can carry and use anywhere. This hardware innovation will make true cross-brand, portable, synchronized Bluetooth audio possible for the first time.

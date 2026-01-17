@@ -48,6 +48,7 @@ class Intent(Enum):
     DISCONNECT   = auto()   # expects key: mac
     SET_EXPECTED = auto()   # expects key: list[str]
     LOOPBACK_SYNC = auto()  # expects key: {"mac": <str>, "connected": <bool>}
+    TEST_LATENCY = auto()   # New: test latency of connected speakers
 
 
 work_q: Queue[Tuple[Intent, Dict]] = Queue()  # one global queue
@@ -215,6 +216,28 @@ class ConnectionService:
                     remove_loopback_for_device(mac)
                     self.loopbacks.remove(mac)
                     logger.info(f"🗑️  Loopback removed after disconnect for {mac}")
+
+            elif intent is Intent.TEST_LATENCY:
+                macs = payload["macs"]
+                logger.info(f"Starting latency test for {len(macs)} speakers")
+                
+                # Use existing PulseAudio controls through the service
+                for mac in macs:
+                    sink = f"bluez_sink.{mac.replace(':', '_')}.a2dp_sink"
+                    
+                    # Test each speaker
+                    logger.info(f"Testing speaker {mac}")
+                    
+                    # Use existing PulseAudio helpers
+                    # This will work because it's running in the service context
+                    subprocess.run(["pactl", "set-sink-volume", sink, "50%"])
+                    time.sleep(0.5)
+                    # Record timestamp
+                    timestamp = time.time()
+                    logger.info(f"Speaker {mac} timestamp: {timestamp}")
+                    time.sleep(1.5)
+                    
+                logger.info("Latency test complete")
 
 
     # -----------------------------

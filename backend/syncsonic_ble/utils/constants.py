@@ -51,6 +51,7 @@ class Msg(IntEnum):
     SET_VOLUME              = 0x63
     GET_PAIRED_DEVICES      = 0x64
     SET_MUTE                = 0x65
+    ULTRASONIC_SYNC         = 0x67
     CONNECTION_STATUS_UPDATE= 0x70
     SCAN_START      = 0x40
     SCAN_STOP       = 0x41

@@ -308,3 +308,13 @@ export async function stopScanDevices(device: Device): Promise<void> {
   console.log('🛑 Stopping streaming scan');
   return bleWrite(device, MESSAGE_TYPES.SCAN_STOP, {});
 }
+
+/**
+ * Trigger one ultrasonic auto-sync cycle on the Pi.
+ * The Pi records mic, plays bursts to each speaker, detects delay, and applies one correction step.
+ * Result is delivered as a BLE notification (ultrasonic_sync_done) when done.
+ */
+export async function runUltrasonicSync(device: Device): Promise<void> {
+  console.log('🔊 Running ultrasonic auto-sync');
+  return bleWrite(device, MESSAGE_TYPES.ULTRASONIC_SYNC, {});
+}

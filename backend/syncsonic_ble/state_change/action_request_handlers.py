@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dbus, subprocess, os, json
+import threading
 from typing import Dict, Any
 from syncsonic_ble.utils.constants import Msg, DBUS_PROP_IFACE, DBUS_OM_IFACE, DEVICE_INTERFACE, BLUEZ_SERVICE_NAME, ADAPTER_INTERFACE
 from syncsonic_ble.helpers.pulseaudio_helpers import create_loopback
@@ -160,6 +161,34 @@ def _scan_stop(char, _):
     char._scan_adapter_mac = None
     return _encode(Msg.SUCCESS, {"scanning": False})
 
+
+def _run_ultrasonic_sync_worker(char):
+    """Run sync_once in background and notify when done."""
+    try:
+        from syncsonic_ble.helpers.ultrasonic_sync import sync_once, _load_syncsonic_env
+        _load_syncsonic_env()
+        ok = sync_once()
+        char.send_notification(Msg.SUCCESS, {
+            "ultrasonic_sync_done": True,
+            "success": ok,
+            "message": "Sync completed." if ok else "Sync failed or no correction needed.",
+        })
+    except Exception as e:
+        logger.exception("Ultrasonic sync failed: %s", e)
+        char.send_notification(Msg.SUCCESS, {
+            "ultrasonic_sync_done": True,
+            "success": False,
+            "message": str(e),
+        })
+
+
+def handle_ultrasonic_sync(char, _):
+    """Queue one ultrasonic sync cycle; result is sent via notification when done."""
+    t = threading.Thread(target=_run_ultrasonic_sync_worker, args=(char,), daemon=True)
+    t.start()
+    return _encode(Msg.SUCCESS, {"queued": True, "message": "Ultrasonic sync started."})
+
+
 # -------------------------------------------------------------------------
 
 def unknown_handler(char, _):
@@ -173,6 +202,7 @@ HANDLERS = {
     Msg.SET_VOLUME: handle_set_volume,
     Msg.GET_PAIRED_DEVICES: handle_get_paired,
     Msg.SET_MUTE: handle_set_mute,
+    Msg.ULTRASONIC_SYNC: handle_ultrasonic_sync,
     Msg.SCAN_START: _scan_start,
     Msg.SCAN_STOP: _scan_stop,
 } 

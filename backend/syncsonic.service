@@ -8,29 +8,34 @@ Type=simple
 User=syncsonic
 RuntimeDirectory=syncsonic
 Environment=XDG_RUNTIME_DIR=/run/syncsonic
+Environment=PULSE_SERVER=unix:/run/syncsonic/pulse/native
 Environment=PULSE_SYSTEM_BUS=1
+EnvironmentFile=-/etc/default/syncsonic
 
-# Start a fresh PulseAudio daemon for the syncsonic user
-ExecStartPre=/usr/bin/pulseaudio --daemonize=yes --exit-idle-time=-1 --log-target=journal -F /home/syncsonic/SyncSonicPi/pulse-headless.pa
+# Kill old pulseaudio FIRST (and only for this user)
+ExecStartPre=-/usr/bin/pkill -u syncsonic -x pulseaudio
 
-# Kill any leftover PulseAudio instance (optional dash allows it to fail silently)
-ExecStartPre=-/usr/bin/pkill -x pulseaudio
-
-# Remove stale socket
-ExecStartPre=/usr/bin/rm -f /run/syncsonic/pulse/native
-
-# Ensure runtime directory and ownership
+# Ensure runtime directory exists
 ExecStartPre=/usr/bin/mkdir -p /run/syncsonic/pulse
-ExecStartPre=/usr/bin/chown syncsonic:syncsonic /run/syncsonic/pulse
+ExecStartPre=/usr/bin/chown -R syncsonic:syncsonic /run/syncsonic
 
-# Start your custom script
-ExecStart=/home/syncsonic/SyncSonicPi/start_syncsonic.sh
+# Remove stale socket after killing old daemon
+ExecStartPre=-/usr/bin/rm -f /run/syncsonic/pulse/native
 
-# Restart policy
+# Reset adapters as ROOT here (no sudo spam in your script)
+ExecStartPre=+/home/syncsonic/SyncSonicPi/backend/reset_bt_adapters.sh
+
+ExecStartPre=/usr/bin/bluetoothctl discoverable on
+
+# Start headless pulseaudio LAST
+ExecStartPre=/usr/bin/pulseaudio --daemonize=yes --exit-idle-time=-1 --log-target=journal -F /home/syncsonic/SyncSonicPi/backend/pulse-headless.pa
+
+ExecStart=/home/syncsonic/SyncSonicPi/backend/start_syncsonic.sh
 Restart=on-failure
 RestartSec=3
+
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target 
+WantedBy=multi-user.target

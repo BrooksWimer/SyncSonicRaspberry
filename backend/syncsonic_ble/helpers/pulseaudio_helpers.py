@@ -27,12 +27,6 @@ def setup_pulseaudio() -> bool:
         True if everything is ready, False otherwise.
     """
     try:
-        # Step 0: Kill any existing PulseAudio processes and remove stale sockets
-        log.info("Cleaning up previous PulseAudio state...")
-        subprocess.run(["pkill", "-9", "pulseaudio"], check=False)
-        subprocess.run(["rm", "-rf", "/run/user/1000/pulse/"], check=False)
-        subprocess.run(["rm", "-rf", "/run/syncsonic/pulse/"], check=False)
-        time.sleep(1)
 
         # Step 1: Check if PulseAudio is currently running
         log.info("Checking if PulseAudio daemon is responsive...")
@@ -115,18 +109,18 @@ def create_loopback(expected_sink_prefix: str, latency_ms: int = 100, wait_secon
                 subprocess.run(["pactl", "unload-module", module_id])
 
     def load_loopback(actual_sink_name: str):
-        """Load loopback with strict latency enforcement to prevent underruns or drift."""
+        """
+        Load a loopback from virtual_out.monitor to a Bluetooth sink.
+        Latency is controlled explicitly via latency_msec.
+        """
         result = subprocess.run([
             "pactl", "load-module", "module-loopback",
             "source=virtual_out.monitor",
             f"sink={actual_sink_name}",
-            "source_dont_move=1",                # Keep source pinned
-            f"latency_msec={latency_ms}",        # Target latency (from slider)
-            f"max_latency_msec={latency_ms}",    # Prevent PulseAudio from increasing it
-            "fast_adjust_threshold_msec=20",     # Rapid correction if latency goes off target
-            "adjust_latency=false",              # Prevent sink-based dynamic latency shifts
-            "use_sink_latency=yes"               # Enforce latency at the sink side
+            "source_dont_move=true",
+            f"latency_msec={latency_ms}",
         ], capture_output=True, text=True)
+
         return result
 
     log.info("🌀 Creating loopback: virtual_out.monitor → %s* (timeout %ss)", expected_sink_prefix, wait_seconds)

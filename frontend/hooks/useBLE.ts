@@ -144,6 +144,8 @@ export function useBLE(onNotification?: NotificationHandler) {
           } else if (payload.connected) {
             // List of currently connected speakers
             updateDatabaseConnectionStates(payload.connected);
+          } else if (payload.ultrasonic_sync_done) {
+            // Ultrasonic sync result – handled by BLEContext handleNotify
           } else {
             // Assume this is the paired-device list coming from GET_PAIRED_DEVICES (0x64)
             const list: { mac: string; name: string; paired?: boolean }[] =

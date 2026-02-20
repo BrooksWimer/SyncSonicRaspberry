@@ -14,7 +14,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   ios: {
     ...config.ios,
     supportsTablet: true,
-    bundleIdentifier: 'com.sync-sonic.sync-sonic',
+    bundleIdentifier: 'com.brookswimer.syncsonicapp',
     userInterfaceStyle: 'automatic',
 
     // ← Add these two keys for BLE on iOS

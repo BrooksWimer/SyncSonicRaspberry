@@ -1,4 +1,35 @@
+# OS / IDE
 .config/
 .local/
 .ssh/
-.vscode/ 
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.eggs/
+
+# Node / Expo (frontend)
+node_modules/
+.expo/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dist/
+build/
+
+# Debug / generated (keep syncsonic_debug and spectrum images local)
+syncsonic_debug/
+recorded_spectrum*.png
+spectrum.png
+
+# Env and secrets (if you add any)
+.env
+.env.local
+.env.*.local

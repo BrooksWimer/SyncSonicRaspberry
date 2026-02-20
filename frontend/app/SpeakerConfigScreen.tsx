@@ -11,14 +11,14 @@ import {
   updateSpeakerConnectionStatus,
   getSpeakersFull
 } from '@/utils/database';
-import { useTheme, useThemeName, YStack, Text } from 'tamagui';
+import { useTheme, useThemeName, YStack, Text, Button } from 'tamagui';
 import { TopBar } from '@/components/topbar-variants/TopBar';
 import { 
   handleVolumeChange,
   handleLatencyChange
 } from '../utils/SpeakerFunctions';
 import { useBLEContext, } from '@/contexts/BLEContext';
-import { bleConnectOne, bleDisconnectOne, setVolume, setMute } from '../utils/ble_functions';
+import { bleConnectOne, bleDisconnectOne, setVolume, setMute, runUltrasonicSync } from '../utils/ble_functions';
 import LottieView from 'lottie-react-native';
 import { Audio } from 'expo-av';
 import { Header } from '@/components/texts/TitleText';
@@ -76,7 +76,7 @@ export default function SpeakerConfigScreen() {
   };
 
   // Use only piStatus from BLEContext
-  const { dbUpdateTrigger, connectedDevice, piStatus } = useBLEContext();
+  const { dbUpdateTrigger, connectedDevice, piStatus, lastUltrasonicSyncResult, clearUltrasonicSyncResult } = useBLEContext();
 
   // State to hold connected speakers (mapping from mac to name)
   const [connectedSpeakers, setConnectedSpeakers] = useState<{ [mac: string]: string }>({});
@@ -185,6 +185,10 @@ export default function SpeakerConfigScreen() {
       </View>
     );
   };
+
+  // Ultrasonic auto-sync: loading state and timeout ref
+  const [isUltrasonicSyncing, setIsUltrasonicSyncing] = useState(false);
+  const ultrasonicSyncTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Add local state for slider values and mute status
   const [sliderValues, setSliderValues] = useState<{
@@ -430,6 +434,29 @@ export default function SpeakerConfigScreen() {
     }
   }, [bleConnectionStatus]);
 
+  // When ultrasonic sync result arrives, show alert and clear syncing state
+  useEffect(() => {
+    if (!lastUltrasonicSyncResult || !isUltrasonicSyncing) return;
+    if (ultrasonicSyncTimeoutRef.current) {
+      clearTimeout(ultrasonicSyncTimeoutRef.current);
+      ultrasonicSyncTimeoutRef.current = null;
+    }
+    setIsUltrasonicSyncing(false);
+    const msg = lastUltrasonicSyncResult.message ?? (lastUltrasonicSyncResult.success ? 'Sync completed.' : 'Sync failed.');
+    Alert.alert(
+      lastUltrasonicSyncResult.success ? 'Auto-sync done' : 'Auto-sync',
+      msg,
+      [{ text: 'OK', onPress: clearUltrasonicSyncResult }]
+    );
+  }, [lastUltrasonicSyncResult, isUltrasonicSyncing, clearUltrasonicSyncResult]);
+
+  // Cleanup ultrasonic sync timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (ultrasonicSyncTimeoutRef.current) clearTimeout(ultrasonicSyncTimeoutRef.current);
+    };
+  }, []);
+
   const handleVolumeChangeWrapper = async (mac: string, newVolume: number, isSlidingComplete: boolean) => {
     await handleVolumeChange(
       mac,
@@ -646,6 +673,33 @@ export default function SpeakerConfigScreen() {
     }
   };
 
+  const handleUltrasonicSync = async () => {
+    if (!connectedDevice) {
+      Alert.alert('Error', 'No BLE device connected');
+      return;
+    }
+    if (Object.keys(connectedSpeakers).length < 2) {
+      Alert.alert('Auto-sync', 'Need at least 2 connected speakers for ultrasonic sync.');
+      return;
+    }
+    setIsUltrasonicSyncing(true);
+    clearUltrasonicSyncResult();
+    if (ultrasonicSyncTimeoutRef.current) clearTimeout(ultrasonicSyncTimeoutRef.current);
+    ultrasonicSyncTimeoutRef.current = setTimeout(() => {
+      ultrasonicSyncTimeoutRef.current = null;
+      setIsUltrasonicSyncing(false);
+      Alert.alert('Auto-sync', 'No response from Pi (timeout). Ensure USB mic is connected and try again.');
+    }, 20000);
+    try {
+      await runUltrasonicSync(connectedDevice);
+    } catch (e) {
+      ultrasonicSyncTimeoutRef.current && clearTimeout(ultrasonicSyncTimeoutRef.current);
+      ultrasonicSyncTimeoutRef.current = null;
+      setIsUltrasonicSyncing(false);
+      Alert.alert('Error', (e as Error)?.message ?? 'Failed to start auto-sync');
+    }
+  };
+
   const handleMuteToggle = async (mac: string) => {
     try {
       const isCurrentlyMuted = sliderValues[mac]?.isMuted || false;
@@ -721,8 +775,27 @@ export default function SpeakerConfigScreen() {
           <Header title={configNameParam}/>
           
           <ScrollView contentContainerStyle={{ paddingBottom: 15 }}>
-            
-            
+            {/* Auto-sync speakers (ultrasonic) – runs one sync cycle on the Pi */}
+            {Object.keys(connectedSpeakers).length >= 2 && (
+              <YStack alignSelf="center" marginTop={12} marginBottom={8} width="90%">
+                <Button
+                  size="$md"
+                  backgroundColor={pc as any}
+                  color="white"
+                  disabled={!connectedDevice || isUltrasonicSyncing}
+                  onPress={handleUltrasonicSync}
+                  opacity={isUltrasonicSyncing ? 0.7 : 1}
+                >
+                  <Text fontFamily="Finlandica" color="white">
+                    {isUltrasonicSyncing ? 'Syncing…' : 'Auto-sync speakers'}
+                  </Text>
+                </Button>
+                <Body center style={{ marginTop: 6, fontSize: 12, color: stc }}>
+                  Uses Pi mic to measure delay and adjust latency (2+ speakers).
+                </Body>
+              </YStack>
+            )}
+
             {Object.keys(connectedSpeakers).length === 0 ? (
               <Text style={{ fontFamily: 'Finlandica' }}>No connected speakers found.</Text>
             ) : (

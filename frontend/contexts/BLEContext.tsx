@@ -14,11 +14,20 @@ import { MESSAGE_TYPES } from "@/utils/ble_constants";
 /* ------------------------------------------------------------------ */
 /*  1.  context type = all fields from useBLE  +  piStatus            */
 /* ------------------------------------------------------------------ */
+export type UltrasonicSyncResult = {
+  ultrasonic_sync_done: true;
+  success: boolean;
+  message?: string;
+} | null;
+
 type BLECtx = ReturnType<typeof useBLE> & {
   /** payload last pushed by the Raspberry Pi (e.g. {connected:[…]}) */
   piStatus: any;
   dbUpdateTrigger: number;
   triggerDbUpdate: () => void;
+  /** Last ultrasonic sync result (set when Pi sends sync-done notification) */
+  lastUltrasonicSyncResult: UltrasonicSyncResult;
+  clearUltrasonicSyncResult: () => void;
 };
 
 const Ctx = createContext<BLECtx | null>(null);
@@ -30,6 +39,8 @@ export function BLEProvider({ children }: { children: ReactNode }) {
   const [piStatus, setPiStatus] = useState<any>({});
   const [dbUpdateTrigger, setDbUpdateTrigger] = useState(0);
   const triggerDbUpdate = () => setDbUpdateTrigger(v => v + 1);
+  const [lastUltrasonicSyncResult, setLastUltrasonicSyncResult] = useState<UltrasonicSyncResult>(null);
+  const clearUltrasonicSyncResult = () => setLastUltrasonicSyncResult(null);
 
   function handleNotify(err: BleError | null, chr: Characteristic | null) {
     if (err || !chr?.value) return;
@@ -37,6 +48,13 @@ export function BLEProvider({ children }: { children: ReactNode }) {
     if (type === MESSAGE_TYPES.SUCCESS && json.connected) {
       setPiStatus(json);
       triggerDbUpdate();         // ← bump your DB trigger if you still need it
+    }
+    if (type === MESSAGE_TYPES.SUCCESS && json?.ultrasonic_sync_done === true) {
+      setLastUltrasonicSyncResult({
+        ultrasonic_sync_done: true,
+        success: !!json.success,
+        message: json.message,
+      });
     }
   }
 
@@ -46,7 +64,9 @@ export function BLEProvider({ children }: { children: ReactNode }) {
     ...ble,
     piStatus,
     dbUpdateTrigger,
-    triggerDbUpdate
+    triggerDbUpdate,
+    lastUltrasonicSyncResult,
+    clearUltrasonicSyncResult,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

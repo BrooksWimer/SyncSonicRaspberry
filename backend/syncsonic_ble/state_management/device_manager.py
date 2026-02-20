@@ -68,7 +68,7 @@ class DeviceManager:
         if DEVICE_INTERFACE in interfaces:
             self._device_found(path)
 
-    def _properties_changed(self, interface, changed, invalidated, path):
+    def _properties_changed(self, interface, changed, invalidated=None, path=None):
         if interface != DEVICE_INTERFACE or "Connected" not in changed:
             return
 

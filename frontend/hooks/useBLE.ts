@@ -98,6 +98,7 @@ export function useBLE(onNotification?: NotificationHandler) {
   const [isScanning, setIsScanning] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus | null>(null);
   const [scannedDevices, setScannedDevices] = useState<Array<{ mac: string; name: string; paired?: boolean }>>([]);
+  const [wifiScannedDevices, setWifiScannedDevices] = useState<Array<{ mac: string; name: string; paired?: boolean }>>([]);
   const [pairedDevices, setPairedDevices] = useState<Array<{ mac: string; name: string; paired?: boolean }>>([]);
 
   const clearConnectionStatus = useCallback(() => {
@@ -167,7 +168,14 @@ export function useBLE(onNotification?: NotificationHandler) {
             });
             break;
           }
-        
+
+        case MESSAGE_TYPES.WIFI_SCAN_RESULTS: {
+            // payload.wifi_devices === [{ device_id, name, ip, type }]
+            const list = (payload.wifi_devices || []) as Array<{ device_id: string; name: string; ip?: string; type?: string }>;
+            setWifiScannedDevices(list.map(d => ({ mac: d.device_id, name: d.name || 'Sonos' })));
+            break;
+          }
+
         case MESSAGE_TYPES.CONNECTION_STATUS_UPDATE:
           // Handle connection status update
           if (payload.phase) {
@@ -206,15 +214,23 @@ export function useBLE(onNotification?: NotificationHandler) {
                 break;
               case "discovery_timeout":
                 statusMessage = "Could not find speaker. Please ensure it's in pairing mode.";
+                error = statusMessage;
                 break;
               case "pairing_failed":
                 statusMessage = `Pairing failed (attempt ${payload.attempt}/3). Please try again.`;
+                error = statusMessage;
                 break;
               case "connect_failed":
                 statusMessage = `Connection failed (attempt ${payload.attempt}/3). Please try again.`;
+                error = statusMessage;
+                break;
+              case "connect_profile_failed":
+                statusMessage = "Profile connection failed. Please try again.";
+                error = statusMessage;
                 break;
               case "loopback creation failed":
                 statusMessage = "Connection successful but audio routing failed. Please try connecting again.";
+                error = statusMessage;
                 break;
             }
 
@@ -503,7 +519,9 @@ const waitForPi = (): Promise<Device> =>
       if (
         dev &&
         (dev.name?.toLowerCase() === "sync-sonic" ||
-         dev.localName?.toLowerCase() === "sync-sonic")
+         dev.localName?.toLowerCase() === "sync-sonic" ||
+         dev.name?.toLowerCase() === "syncsonic" ||
+         dev.localName?.toLowerCase() === "SyncSonic")
       ) {
         stopScan();
         clearTimeout(timer);
@@ -528,6 +546,8 @@ const waitForPi = (): Promise<Device> =>
     setConnectionStatus,
     clearConnectionStatus,
     scannedDevices,
+    wifiScannedDevices,
+    clearWifiScannedDevices: () => setWifiScannedDevices([]),
     pairedDevices,
   };
 }

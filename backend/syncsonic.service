@@ -14,6 +14,11 @@ EnvironmentFile=-/etc/default/syncsonic
 
 # Kill old pulseaudio FIRST (and only for this user)
 ExecStartPre=-/usr/bin/pkill -u syncsonic -x pulseaudio
+ExecStartPre=-/usr/bin/pkill -u syncsonic -x pipewire
+ExecStartPre=-/usr/bin/pkill -u syncsonic -x pipewire-pulse
+ExecStartPre=-/usr/bin/pkill -u syncsonic -x wireplumber
+ExecStartPre=-/usr/bin/pkill -u syncsonic -x pw-loopback
+ExecStartPre=-/usr/bin/pkill -u syncsonic -f /home/syncsonic/SyncSonicPi/backend/tools/pw_delay_filter
 
 # Ensure runtime directory exists
 ExecStartPre=/usr/bin/mkdir -p /run/syncsonic/pulse
@@ -21,14 +26,14 @@ ExecStartPre=/usr/bin/chown -R syncsonic:syncsonic /run/syncsonic
 
 # Remove stale socket after killing old daemon
 ExecStartPre=-/usr/bin/rm -f /run/syncsonic/pulse/native
+ExecStartPre=-/usr/bin/rm -f /run/syncsonic/pipewire-0
+ExecStartPre=-/usr/bin/rm -f /run/syncsonic/bus
+ExecStartPre=-/usr/bin/rm -f /run/syncsonic/dbus-session.pid
 
 # Reset adapters as ROOT here (no sudo spam in your script)
 ExecStartPre=+/home/syncsonic/SyncSonicPi/backend/reset_bt_adapters.sh
 
 ExecStartPre=/usr/bin/bluetoothctl discoverable on
-
-# Start headless pulseaudio LAST
-ExecStartPre=/usr/bin/pulseaudio --daemonize=yes --exit-idle-time=-1 --log-target=journal -F /home/syncsonic/SyncSonicPi/backend/pulse-headless.pa
 
 ExecStart=/home/syncsonic/SyncSonicPi/backend/start_syncsonic.sh
 Restart=on-failure

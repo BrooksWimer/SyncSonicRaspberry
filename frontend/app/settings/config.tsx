@@ -88,16 +88,27 @@ export default function Config() {
             } 
         });
     };
-    // The "Find Bluetooth Devices" button is now conditionally labeled.
-    // When editing, it becomes "Add Bluetooth Devices".
+    // Find/Add Bluetooth devices – same screen, deviceType=bluetooth
     const onSelectDevicesPress = () => {
-        // Pass along current devices (existing configuration speakers)
         router.replace({
             pathname: '/DeviceSelectionScreen',
             params: {
                 configID: configID.toString(),
                 configName,
-                existingDevices: JSON.stringify(devices)
+                existingDevices: JSON.stringify(devices),
+                deviceType: 'bluetooth'
+            }
+        });
+    };
+    // Find/Add Wi‑Fi (Sonos) devices – same screen, deviceType=wifi
+    const onSelectWifiDevicesPress = () => {
+        router.replace({
+            pathname: '/DeviceSelectionScreen',
+            params: {
+                configID: configID.toString(),
+                configName,
+                existingDevices: JSON.stringify(devices),
+                deviceType: 'wifi'
             }
         });
     };
@@ -155,7 +166,7 @@ export default function Config() {
 
 
 
-                {/* Select Devices Button ---------------------------------------------------------------------*/}
+                {/* Select Bluetooth Devices Button -------------------------------------------------------------*/}
                 <Button
                     onPress={onSelectDevicesPress}
                     onLongPress={() => insertDummyData()}
@@ -168,7 +179,19 @@ export default function Config() {
                         {configID ? "Add Bluetooth Devices" : "Find Bluetooth Devices"}
                     </H1>
                 </Button>
-                {/* Select Devices Button ---------------------------------------------------------------------*/}
+                {/* Select Wi‑Fi Devices Button (same style, directly underneath) ------------------------------*/}
+                <Button
+                    onPress={onSelectWifiDevicesPress}
+                    backgroundColor={pc as any}
+                    color="white"
+                    borderRadius={5}
+                    padding={10}
+                >
+                    <H1 style={{ fontFamily: "Inter", color: "white" }}>
+                        {configID ? "Add Wi‑Fi Devices" : "Find Wi‑Fi Devices"}
+                    </H1>
+                </Button>
+                {/* Select Devices Buttons ---------------------------------------------------------------------*/}
 
             </YStack>
 

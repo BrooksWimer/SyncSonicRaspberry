@@ -242,6 +242,8 @@ class Characteristic(dbus.service.Object, DBusPathMixin):
                 "Notifications %s via CCCD",
                 "enabled" if self.notifying else "disabled",
             )
+            if self.notifying and getattr(self, "device_manager", None):
+                self.push_status({"connected": list(self.device_manager._all_connected())})
             return
 
         # Normal command --------------------------------------------------
@@ -288,6 +290,9 @@ class Characteristic(dbus.service.Object, DBusPathMixin):
             return
         self.notifying = True
         log.info("Notifications enabled via StartNotify")
+        # Push full current state so app opens with correct speaker state
+        if getattr(self, "device_manager", None):
+            self.push_status({"connected": list(self.device_manager._all_connected())})
 
     @dbus.service.method(GATT_CHRC_IFACE)
     def StopNotify(self):  # noqa: N802 – DBus naming
@@ -376,7 +381,7 @@ class Advertisement(dbus.service.Object, DBusPathMixin):
         self.bus             = bus
         self.ad_type         = advertising_type
         self.service_uuids   = [SERVICE_UUID]
-        self.local_name      = "Sync-Sonic"
+        self.local_name      = "SyncSonic"
         self.include_tx_power= True
         self.discoverable    = True
         super().__init__(bus, self.path)

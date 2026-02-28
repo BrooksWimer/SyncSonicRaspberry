@@ -29,6 +29,12 @@ from syncsonic_ble.helpers.adapter_helpers import adapter_proxies, device_path_o
 
 logger = get_logger(__name__)
 
+
+def scan_wifi_sonos(timeout: int = 5):
+    """Discover Sonos devices on the network. Returns list of dicts (device_id, name, ip, type)."""
+    from syncsonic_ble.helpers.sonos_discovery import discover_sonos
+    return discover_sonos(timeout=timeout)
+
 # ---------------------------------------------------------------------------
 # Helper types
 # ---------------------------------------------------------------------------

@@ -32,6 +32,7 @@ class DeviceManager:
         self.max_reconnect_attempts: int = 3
         self.pairing_in_progress: Set[str] = set()
         self.connected: Set[str] = set()
+        self.wifi_connected: Set[str] = set()  # sonos:UID device_ids
         self.expected: set[str] = set()
         self._status: Dict[str, Dict] = {}
         self._char   = None            # will be injected later
@@ -68,7 +69,19 @@ class DeviceManager:
         if DEVICE_INTERFACE in interfaces:
             self._device_found(path)
 
-    def _properties_changed(self, interface, changed, invalidated=None, path=None):
+    def _properties_changed(self, *args, **kwargs):
+        # D-Bus PropertiesChanged may pass (interface, changed, invalidated) or
+        # (interface, changed) with path as path_keyword; accept any variant.
+        path = kwargs.get("path")
+        if len(args) >= 3:
+            interface, changed, invalidated = args[0], args[1], args[2]
+            if len(args) >= 4:
+                path = args[3]
+        elif len(args) >= 2:
+            interface, changed = args[0], args[1]
+            invalidated = kwargs.get("invalidated")
+        else:
+            return
         if interface != DEVICE_INTERFACE or "Connected" not in changed:
             return
 
@@ -89,7 +102,7 @@ class DeviceManager:
         alias = changed.get("Alias", mac)
         self._status[mac] = {"alias": alias, "connected": connected}
         if self._char:
-            self._char.push_status({"connected": list(self.connected)})
+            self._char.push_status({"connected": list(self._all_connected())})
 
     # ───────────────────────── connection helpers ───────────────────────────
     def _handle_new_connection(self, path: str, mac: str):
@@ -139,6 +152,22 @@ class DeviceManager:
         from syncsonic_ble.state_management.connection_manager import Intent
         from syncsonic_ble.state_management.connection_manager import work_q
         work_q.put((Intent.LOOPBACK_SYNC, {"mac": mac, "connected": False}))
+
+    def _all_connected(self) -> Set[str]:
+        """Unified set of connected device IDs (BT MACs + sonos:UID)."""
+        return self.connected | self.wifi_connected
+
+    def add_wifi_connected(self, device_id: str) -> None:
+        """Mark a Wi‑Fi (Sonos) device as connected."""
+        self.wifi_connected.add(device_id)
+        if self._char:
+            self._char.push_status({"connected": list(self._all_connected())})
+
+    def remove_wifi_connected(self, device_id: str) -> None:
+        """Mark a Wi‑Fi (Sonos) device as disconnected."""
+        self.wifi_connected.discard(device_id)
+        if self._char:
+            self._char.push_status({"connected": list(self._all_connected())})
 
     # ───────────────────────── misc helpers ─────────────────────────────────
     def _device_found(self, path: str):

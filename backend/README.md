@@ -64,6 +64,15 @@ sudo apt update && sudo apt install -y \
 
 > **Note** `pulseaudio` can be substituted with `pipewire-pulse` if you prefer.
 
+**Optional – Wi‑Fi (Sonos) speakers:**  
+To stream audio to Sonos devices, install Icecast and FFmpeg (do **not** install Python packages via system `pip`; use the backend venv and `apt` for these):
+
+```
+sudo apt install -y icecast2 ffmpeg
+```
+
+The service uses source password `syncsonic`; configure Icecast (e.g. `/etc/icecast2/icecast.xml`) so the source mount accepts that password.
+
 ### 2. Python environment
 
 ```bash
@@ -159,10 +168,11 @@ journalctl -u syncsonic.service -f
 
 ## Environment variables
 
-| Variable         | Required | Default | Description                                       |
-|------------------|:--------:|:-------:|---------------------------------------------------|
-| `RESERVED_HCI`   |   ✅    | —       | Name of the adapter dedicated to BLE advertising. |
-| `PYTHONUNBUFFERED`|   ⬜     | `1`     | Already set by `start_syncsonic.sh` for live logs.|
+| Variable                | Required | Default | Description |
+|-------------------------|:--------:|:-------:|-------------|
+| `RESERVED_HCI`          |   ✅     | —       | Name of the adapter dedicated to BLE advertising. |
+| `PYTHONUNBUFFERED`      |   ⬜     | `1`     | Already set by `start_syncsonic.sh` for live logs. |
+| `PULSE_SERVER`          |   ⬜     | `unix:/run/syncsonic/pulse/native` | PulseAudio socket for the FFmpeg stream (SyncSonic headless instance). |
 
 ---
 
@@ -174,7 +184,9 @@ journalctl -u syncsonic.service -f
 | Characteristic     | `19b10001-e8f2-537e-4f6c-d104768a1217`   | Supports **R/W/Notify**          |
 | ClientConfigDescr. | `00002902-0000-1000-8000-00805f9b34fb`   | Standard CCCD for notifications  |
 
-The binary protocol is defined in `syncsonic_ble/utils/constants.py#Msg`.
+The binary protocol is defined in `syncsonic_ble/utils/constants.py#Msg`.  
+Wi‑Fi discovery uses separate message types: `WIFI_SCAN_START` (0x44), `WIFI_SCAN_RESULTS` (0x46).  
+`CONNECT_ONE` / `DISCONNECT` accept either a Bluetooth MAC or a Sonos device ID (`sonos:RINCON_...`).
 
 ---
 

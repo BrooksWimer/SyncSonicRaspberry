@@ -107,6 +107,11 @@ write_reserved_hci_env() {
   log "💾 Wrote RESERVED_HCI=$reserved to $ENVFILE"
 }
 
+# Name that the phone should see for the SyncSonic BLE device. If the reserved
+# adapter is not detected as UART, it gets "raspberrypi-N" here; the Python
+# service will set the Alias to SYNCSONIC_ADAPTER_NAME at startup anyway.
+SYNCSONIC_ADAPTER_NAME="SyncSonic"
+
 name_and_choose_reserved_hci() {
   local -a all_hcis=()
   local hci bus_type reserved=""
@@ -120,8 +125,8 @@ name_and_choose_reserved_hci() {
 
     if [[ "$bus_type" == "UART" ]]; then
       reserved="$hci"
-      hciconfig "$hci" name "Sync-Sonic" || true
-      log "📡 Reserved $hci for phone (UART bus)."
+      hciconfig "$hci" name "$SYNCSONIC_ADAPTER_NAME" || true
+      log "📡 Reserved $hci for phone (UART bus), named $SYNCSONIC_ADAPTER_NAME."
     else
       hciconfig "$hci" name "raspberrypi-$count" || true
       log "🔊 Named $hci → raspberrypi-$count"
@@ -132,7 +137,7 @@ name_and_choose_reserved_hci() {
   if [[ -n "$reserved" ]]; then
     write_reserved_hci_env "$reserved"
   else
-    log "⚠️ No UART adapter found; RESERVED_HCI left unset."
+    log "⚠️ No UART adapter found; RESERVED_HCI left unset. If RESERVED_HCI is set elsewhere, the SyncSonic service will still set that adapter's name to $SYNCSONIC_ADAPTER_NAME at startup."
   fi
 }
 

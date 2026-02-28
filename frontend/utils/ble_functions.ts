@@ -310,6 +310,14 @@ export async function stopScanDevices(device: Device): Promise<void> {
 }
 
 /**
+ * Send WIFI_SCAN_START to the Pi; results arrive via WIFI_SCAN_RESULTS notification.
+ */
+export async function startWifiScan(device: Device): Promise<void> {
+  console.log('📶 Starting Wi‑Fi (Sonos) scan');
+  return bleWrite(device, MESSAGE_TYPES.WIFI_SCAN_START, {});
+}
+
+/**
  * Trigger one ultrasonic auto-sync cycle on the Pi.
  * The Pi records mic, plays bursts to each speaker, detects delay, and applies one correction step.
  * Result is delivered as a BLE notification (ultrasonic_sync_done) when done.

@@ -2,10 +2,8 @@
 load-module module-native-protocol-unix auth-anonymous=1 socket=/run/syncsonic/pulse/native
 
 # Ensure bluetooth sinks are created in THIS daemon
-load-module module-dbus-protocol
 load-module module-bluetooth-policy
 load-module module-bluetooth-discover
-load-module module-bluez5-discover
 
 # Create the shared sink in THIS daemon
 load-module module-null-sink sink_name=virtual_out sink_properties=device.description=virtual_out

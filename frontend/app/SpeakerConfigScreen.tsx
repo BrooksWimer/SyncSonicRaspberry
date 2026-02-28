@@ -283,6 +283,31 @@ export default function SpeakerConfigScreen() {
     }
   }, [configIDParam, speakersStr, dbUpdateTrigger]);
   
+  // Replace UI speaker state from backend when we have full state (e.g. on app open)
+  useEffect(() => {
+    if (!piStatus || !Array.isArray(piStatus.connected) || Object.keys(connectedSpeakers).length === 0) return;
+    const connectedMacs = (piStatus.connected as string[]).map((m: string) => m.toUpperCase());
+    setSettings(prev => {
+      let changed = false;
+      const next = { ...prev };
+      Object.keys(connectedSpeakers).forEach(mac => {
+        if (!next[mac]) return;
+        const isConnected = connectedMacs.includes(mac.toUpperCase());
+        if (next[mac].isConnected !== isConnected) {
+          next[mac] = { ...next[mac], isConnected };
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+    if (configIDParam) {
+      const configIdNum = Number(configIDParam);
+      Object.keys(connectedSpeakers).forEach(mac => {
+        updateSpeakerConnectionStatus(configIdNum, mac, connectedMacs.includes(mac.toUpperCase()));
+      });
+    }
+  }, [piStatus?.connected, configIDParam]); // intentional: run when backend connected list arrives
+
   // Listen for piStatus updates to track connection changes
   useEffect(() => {
     if (!piStatus || piStatus.connected === undefined) return;
@@ -416,21 +441,40 @@ export default function SpeakerConfigScreen() {
 
   // Listen for BLE connection status updates
   useEffect(() => {
-    if (bleConnectionStatus?.mac) {
-      // Only update if we're in a connecting state
-      const currentStatus = loadingSpeakers[bleConnectionStatus.mac]?.action;
-      if (currentStatus === 'connect') {
-        const mac = bleConnectionStatus.mac.toString();
-        setLoadingSpeakers(prev => ({
-          ...prev,
-          [mac]: {
-            action: 'connect',
-            statusMessage: bleConnectionStatus.status,
-            progress: bleConnectionStatus.progress,
-            error: bleConnectionStatus.error
-          }
-        }));
-      }
+    if (!bleConnectionStatus?.mac) return;
+    const mac = bleConnectionStatus.mac.toString();
+
+    // Failure phases: stop spinner and show error, then clear
+    const failurePhases = ['discovery_timeout', 'pairing_failed', 'connect_failed', 'connect_profile_failed'];
+    const isFailure = failurePhases.some(p => bleConnectionStatus.status?.toLowerCase().includes(p)) || !!bleConnectionStatus.error;
+    if (isFailure) {
+      setLoadingSpeakers(prev => ({
+        ...prev,
+        [mac]: {
+          action: null,
+          statusMessage: bleConnectionStatus.status ?? 'Connection failed',
+          error: bleConnectionStatus.error ?? bleConnectionStatus.status
+        }
+      }));
+      // Clear overlay after 5s so user can retry
+      const t = setTimeout(() => {
+        setLoadingSpeakers(prev => ({ ...prev, [mac]: null }));
+      }, 5000);
+      return () => clearTimeout(t);
+    }
+
+    // In-progress: show status (spinner stays until success or failure)
+    const currentStatus = loadingSpeakers[mac]?.action;
+    if (currentStatus === 'connect') {
+      setLoadingSpeakers(prev => ({
+        ...prev,
+        [mac]: {
+          action: 'connect',
+          statusMessage: bleConnectionStatus.status,
+          progress: bleConnectionStatus.progress,
+          error: bleConnectionStatus.error
+        }
+      }));
     }
   }, [bleConnectionStatus]);
 
@@ -701,37 +745,41 @@ export default function SpeakerConfigScreen() {
   };
 
   const handleMuteToggle = async (mac: string) => {
+    const isCurrentlyMuted = sliderValues[mac]?.isMuted || false;
+    const newMuted = !isCurrentlyMuted;
+
+    if (!connectedDevice) {
+      console.error('No BLE device connected for mute toggle');
+      Alert.alert("Error", "No BLE device connected");
+      return;
+    }
+
+    // Optimistic update: apply mute state in UI immediately
+    setSliderValues(prev => ({
+      ...prev,
+      [mac]: { ...prev[mac], isMuted: newMuted }
+    }));
+
     try {
-      const isCurrentlyMuted = sliderValues[mac]?.isMuted || false;
-      
-      if (!connectedDevice) {
-        console.error('No BLE device connected for mute toggle');
-        Alert.alert("Error", "No BLE device connected");
-        return;
-      }
+      await setMute(connectedDevice, mac, newMuted);
 
-      // Use the new BLE-based setMute function
-      await setMute(connectedDevice, mac, !isCurrentlyMuted);
-
-      // Update local state
-      setSliderValues(prev => ({
-        ...prev,
-        [mac]: { ...prev[mac], isMuted: !isCurrentlyMuted }
-      }));
-
-      // Update database if we have a config ID
       if (configIDParam) {
         updateSpeakerSettings(
-          Number(configIDParam), 
-          mac, 
-          settings[mac]?.volume || 50, 
+          Number(configIDParam),
+          mac,
+          settings[mac]?.volume || 50,
           settings[mac]?.latency || 100,
           sliderValues[mac]?.balance || 0.5,
-          !isCurrentlyMuted
+          newMuted
         );
       }
     } catch (error) {
       console.error("Error toggling mute:", error);
+      // Revert optimistic update on failure
+      setSliderValues(prev => ({
+        ...prev,
+        [mac]: { ...prev[mac], isMuted: isCurrentlyMuted }
+      }));
       Alert.alert("Error", "Failed to toggle mute.");
     }
   };

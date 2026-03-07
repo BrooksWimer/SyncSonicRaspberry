@@ -29,7 +29,11 @@ from syncsonic_ble.state_change.action_functions import (
     remove_device_dbus,
 )
 from syncsonic_ble.helpers.actuation import get_actuation_manager
-from syncsonic_ble.helpers.pipewire_control_plane import publish_output_mix
+from syncsonic_ble.helpers.pipewire_control_plane import (
+    get_transport_base_ms,
+    publish_output_mix,
+    publish_transport_profile,
+)
 from syncsonic_ble.helpers.device_type_helpers import is_sonos
 from syncsonic_ble.utils.logging_conf import get_logger
 import subprocess
@@ -87,6 +91,7 @@ class ConnectionService:
         self._worker = threading.Thread(target=self._run_worker, daemon=True)
         self._worker.start()
         self._char = None  # will be injected later
+        self._refresh_transport_profile()
         logger.info("ConnectionService worker thread started")
 
     def set_device_manager(self, dev_mgr: DeviceManager) -> None:
@@ -101,10 +106,16 @@ class ConnectionService:
         """Called by *any* transport thread (Flask / BLE etc.)."""
         work_q.put((intent, payload))
 
+    def _refresh_transport_profile(self) -> None:
+        wifi_active = bool(self._device_manager and self._device_manager.wifi_connected)
+        publish_transport_profile(wifi_session_active=wifi_active)
+
     def _ensure_output_actuation(self, mac: str, requested_delay_ms: Optional[float] = None) -> bool:
         target_delay = requested_delay_ms
         if target_delay is None:
             target_delay = self.actuation.get_commanded_delay(mac)
+        else:
+            target_delay = get_transport_base_ms() + max(0.0, float(target_delay))
         ok, _snapshot = self.actuation.apply_fallback_delay(mac, float(target_delay), mode="provision")
         if ok:
             self.loopbacks.add(mac.upper())
@@ -229,6 +240,7 @@ class ConnectionService:
                     if sonos_connect(device_id, stream_url):
                         if self._device_manager:
                             self._device_manager.add_wifi_connected(device_id)
+                        self._refresh_transport_profile()
                         if self._char:
                             self._char.send_notification(
                                 Msg.CONNECTION_STATUS_UPDATE,
@@ -320,6 +332,7 @@ class ConnectionService:
                         sonos_disconnect(device_id)
                         if self._device_manager:
                             self._device_manager.remove_wifi_connected(device_id)
+                        self._refresh_transport_profile()
                         wifi_left = (self._device_manager.wifi_connected if self._device_manager else set())
                         if not wifi_left:
                             get_audio_stream_service().stop_stream()

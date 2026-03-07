@@ -5,7 +5,7 @@ import threading
 from typing import Dict, Any
 from syncsonic_ble.utils.constants import Msg, DBUS_PROP_IFACE, DBUS_OM_IFACE, DEVICE_INTERFACE, BLUEZ_SERVICE_NAME, ADAPTER_INTERFACE
 from syncsonic_ble.helpers.actuation import get_actuation_manager
-from syncsonic_ble.helpers.pipewire_control_plane import publish_output_mix
+from syncsonic_ble.helpers.pipewire_control_plane import get_transport_base_ms, publish_output_mix
 from syncsonic_ble.helpers.device_type_helpers import is_sonos
 from syncsonic_ble.utils.logging_conf import get_logger
 from syncsonic_ble.state_management.scan_manager import ScanManager
@@ -36,6 +36,8 @@ def _compact_actuation_payload(details: Dict[str, Any]) -> Dict[str, Any]:
         "target_delay_ms",
         "correction_step_ms",
         "applied",
+        "setup_done",
+        "target_onset_ms",
     ):
         if key in details:
             compact[key] = details[key]
@@ -47,6 +49,14 @@ def _compact_actuation_payload(details: Dict[str, Any]) -> Dict[str, Any]:
     controller_states = details.get("controller_states")
     if isinstance(controller_states, dict):
         compact["controller_count"] = len(controller_states)
+
+    measured = details.get("measured")
+    if isinstance(measured, list):
+        compact["measured_count"] = len(measured)
+
+    failed = details.get("failed")
+    if isinstance(failed, list):
+        compact["failed_count"] = len(failed)
 
     return compact
 
@@ -117,7 +127,8 @@ def handle_set_latency(char, data):
     if is_sonos(mac):
         # Sonos: store desired latency for future use; no-op for v1
         return _encode(Msg.SUCCESS, {"latency": latency})
-    latency_ms = float(latency)
+    slider_latency_ms = max(0.0, float(latency))
+    latency_ms = get_transport_base_ms() + slider_latency_ms
     manager = get_actuation_manager()
     ok, snapshot = manager.apply_control_target(mac, delay_ms=latency_ms, rate_ppm=0.0, mode="manual")
     if ok:
@@ -239,19 +250,19 @@ def handle_wifi_scan_start(char, _):
 
 
 def _run_ultrasonic_sync_worker(char):
-    """Run sync_once in background and notify when done."""
+    """Run end-to-end setup calibration in background and notify when done."""
     try:
-        from syncsonic_ble.helpers.ultrasonic_sync import sync_once, _load_syncsonic_env
-        _load_syncsonic_env()
-        ok, details = sync_once()
+        from syncsonic_ble.helpers.latency_setup import run_end_to_end_setup
+
+        ok, details = run_end_to_end_setup()
         char.send_notification(Msg.SUCCESS, {
             "ultrasonic_sync_done": True,
             "success": ok,
-            "message": "Sync completed." if ok else "Sync failed or no correction needed.",
+            "message": "Setup calibration completed." if ok else "Setup calibration failed.",
             "actuation": _compact_actuation_payload(details),
         })
     except Exception as e:
-        logger.exception("Ultrasonic sync failed: %s", e)
+        logger.exception("End-to-end setup calibration failed: %s", e)
         char.send_notification(Msg.SUCCESS, {
             "ultrasonic_sync_done": True,
             "success": False,
@@ -260,10 +271,10 @@ def _run_ultrasonic_sync_worker(char):
 
 
 def handle_ultrasonic_sync(char, _):
-    """Queue one ultrasonic sync cycle; result is sent via notification when done."""
+    """Queue one end-to-end setup calibration cycle; result is sent via notification."""
     t = threading.Thread(target=_run_ultrasonic_sync_worker, args=(char,), daemon=True)
     t.start()
-    return _encode(Msg.SUCCESS, {"queued": True, "message": "Ultrasonic sync started."})
+    return _encode(Msg.SUCCESS, {"queued": True, "message": "Setup calibration started."})
 
 
 # -------------------------------------------------------------------------

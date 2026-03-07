@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from syncsonic_ble.helpers.pipewire_control_plane import (
     clear_output_control,
+    get_transport_base_ms,
     publish_output_control,
 )
 from syncsonic_ble.helpers.pipewire_runtime import has_pipewire_cli
@@ -60,9 +61,10 @@ class PipeWireNodeBackend(BaseActuationBackend):
 
     def apply_control(self, mac: str, delay_ms: float, rate_ppm: float, *, mode: str) -> ActuationApplyResult:
         runtime_available = has_pipewire_cli()
+        applied_delay_ms = max(float(delay_ms), get_transport_base_ms())
         control_path = publish_output_control(
             mac,
-            delay_ms=delay_ms,
+            delay_ms=applied_delay_ms,
             rate_ppm=rate_ppm,
             mode=mode,
             active=True,
@@ -75,7 +77,7 @@ class PipeWireNodeBackend(BaseActuationBackend):
                 if runtime_available
                 else "pipewire_runtime_unavailable"
             ),
-            applied_delay_ms=float(delay_ms),
+            applied_delay_ms=applied_delay_ms,
             applied_rate_ppm=float(rate_ppm),
             control_path=control_path,
         )

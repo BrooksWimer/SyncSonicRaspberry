@@ -36,7 +36,6 @@ class ActuationManager:
     """Tracks commanded per-speaker timing state and fallback loopback actuation."""
 
     MIN_DELAY_MS = 20.0
-    MAX_DELAY_MS = 4000.0
 
     def __init__(self) -> None:
         self._lock = Lock()
@@ -217,7 +216,7 @@ class ActuationManager:
         return result.ok
 
     def _clamp_delay(self, delay_ms: float) -> float:
-        return max(self.MIN_DELAY_MS, min(self.MAX_DELAY_MS, float(delay_ms)))
+        return max(self.MIN_DELAY_MS, float(delay_ms))
 
 
 _ACTUATION_MANAGER: Optional[ActuationManager] = None

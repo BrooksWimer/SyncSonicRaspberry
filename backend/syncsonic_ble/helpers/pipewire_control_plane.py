@@ -11,22 +11,25 @@ log = get_logger(__name__)
 
 CONTROL_DIR = os.path.join(tempfile.gettempdir(), "syncsonic_pipewire")
 CONTROL_STATE_PATH = os.path.join(CONTROL_DIR, "control_state.json")
+DEFAULT_TRANSPORT_BASE_MS = 120.0
+WIFI_SESSION_TRANSPORT_BASE_MS = float(os.environ.get("SYNCSONIC_WIFI_TRANSPORT_BASE_MS", "900"))
 
 
 def _load_state() -> Dict[str, Any]:
     if not os.path.exists(CONTROL_STATE_PATH):
-        return {"schema": 1, "outputs": {}}
+        return {"schema": 1, "globals": {}, "outputs": {}}
     try:
         with open(CONTROL_STATE_PATH, "r", encoding="ascii") as fh:
             state = json.load(fh)
         if not isinstance(state, dict):
-            return {"schema": 1, "outputs": {}}
+            return {"schema": 1, "globals": {}, "outputs": {}}
         state.setdefault("schema", 1)
+        state.setdefault("globals", {})
         state.setdefault("outputs", {})
         return state
     except Exception as exc:
         log.warning("Failed to read PipeWire control state: %s", exc)
-        return {"schema": 1, "outputs": {}}
+        return {"schema": 1, "globals": {}, "outputs": {}}
 
 
 def _write_state(state: Dict[str, Any]) -> None:
@@ -66,6 +69,25 @@ def publish_output_control(
         float(rate_ppm),
         mode,
         active,
+    )
+    return CONTROL_STATE_PATH
+
+
+def publish_transport_profile(*, wifi_session_active: bool) -> str:
+    state = _load_state()
+    globals_state = state.setdefault("globals", {})
+    transport_base_ms = (
+        WIFI_SESSION_TRANSPORT_BASE_MS
+        if wifi_session_active
+        else DEFAULT_TRANSPORT_BASE_MS
+    )
+    globals_state["wifi_session_active"] = bool(wifi_session_active)
+    globals_state["transport_base_ms"] = round(float(transport_base_ms), 3)
+    _write_state(state)
+    log.info(
+        "PipeWire transport profile -> wifi_session_active=%s transport_base=%.3f ms",
+        bool(wifi_session_active),
+        float(transport_base_ms),
     )
     return CONTROL_STATE_PATH
 
@@ -111,3 +133,14 @@ def clear_output_control(mac: str) -> str:
 
 def read_control_state() -> Dict[str, Any]:
     return _load_state()
+
+
+def get_transport_base_ms(default_ms: float = DEFAULT_TRANSPORT_BASE_MS) -> float:
+    state = _load_state()
+    globals_state = state.get("globals", {})
+    if not isinstance(globals_state, dict):
+        return float(default_ms)
+    try:
+        return max(float(default_ms), float(globals_state.get("transport_base_ms", default_ms)))
+    except Exception:
+        return float(default_ms)

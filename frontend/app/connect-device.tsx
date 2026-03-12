@@ -154,7 +154,7 @@ export default function ConnectDevice() {
           textAlign="center"
           marginBottom={32}
         >
-          Select your Sync-Sonic device from the list below
+          Select your SyncSonic device from the list below
         </Text>
 
         <FlatList

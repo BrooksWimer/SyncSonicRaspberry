@@ -27,7 +27,10 @@ export const MESSAGE_TYPES = {
   ULTRASONIC_SYNC: 0x67,
   // Connection Status Update
   CONNECTION_STATUS_UPDATE: 0x70,  // General connection status update
-  SCAN_DEVICES : 0x43,
-  SCAN_START   : 0x40,
-  SCAN_STOP    : 0x41
+  SCAN_DEVICES      : 0x43,
+  SCAN_START        : 0x40,
+  SCAN_STOP         : 0x41,
+  WIFI_SCAN_START   : 0x44,
+  WIFI_SCAN_STOP    : 0x45,
+  WIFI_SCAN_RESULTS : 0x46,
 } as const; 

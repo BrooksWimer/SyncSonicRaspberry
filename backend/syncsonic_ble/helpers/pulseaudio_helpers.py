@@ -1,4 +1,4 @@
-# utils/pulseaudio.py
+# utils/audio_server.py
 import subprocess
 import time
 from typing import List, Optional
@@ -12,14 +12,28 @@ log = get_logger(__name__)
 #  Public helpers
 # --------------------------------------------------------------------------
 
+def _find_loopback_module_ids(actual_sink_name: str) -> List[str]:
+    modules_output = subprocess.run(
+        ["pactl", "list", "short", "modules"],
+        capture_output=True,
+        text=True,
+    )
+    module_ids: List[str] = []
+    for line in modules_output.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and "module-loopback" in parts[1] and actual_sink_name in line:
+            module_ids.append(parts[0])
+    return module_ids
+
 def remove_loopback_for_device(mac: str):
     """Unload every loopback that targets the *sink* of the given BT MAC."""
     sink_name = f"bluez_sink.{mac.replace(':', '_')}.a2dp_sink"
     log.info("🗑️  Removing loopback(s) for %s", sink_name)
-    subprocess.call(["pactl", "unload-module", f"module-loopback sink={sink_name}"])
+    for module_id in _find_loopback_module_ids(sink_name):
+        subprocess.run(["pactl", "unload-module", module_id], check=False)
 
-def setup_pulseaudio() -> bool:
-    """Ensure PulseAudio is running and prepare a virtual_out sink.
+def setup_audio_server() -> bool:
+    """Ensure the configured Pulse-compatible server is reachable and prepare a virtual_out sink.
 
     Returns
     -------
@@ -28,25 +42,21 @@ def setup_pulseaudio() -> bool:
     """
     try:
 
-        # Step 1: Check if PulseAudio is currently running
-        log.info("Checking if PulseAudio daemon is responsive...")
+        # Step 1: Check if the Pulse-compatible server is currently running
+        log.info("Checking if audio server is responsive...")
         info_result = subprocess.run(["pactl", "info"], capture_output=True, text=True)
 
         if info_result.returncode != 0 or "Server Name" not in info_result.stdout:
-            log.warning("PulseAudio not responding, attempting to start it")
+            log.error("Pulse-compatible audio server is not responding")
 
-            # Start PulseAudio with no idle timeout
-            subprocess.run(["pulseaudio", "--start", "--exit-idle-time=-1"], check=False)
-
-            # Wait up to 5 seconds for PulseAudio to come up
             for i in range(5):
                 result = subprocess.run(["pactl", "info"], capture_output=True, text=True)
                 if result.returncode == 0 and "Server Name" in result.stdout:
-                    log.info("PulseAudio started successfully (after %d attempt(s))", i + 1)
+                    log.info("Audio server is responsive (after %d attempt(s))", i + 1)
                     break
                 time.sleep(1)
             else:
-                log.error("Failed to start PulseAudio; aborting audio initialization")
+                log.error("Failed to reach audio server; aborting audio initialization")
                 return False
 
         # Step 2: Check whether the virtual sink already exists
@@ -76,12 +86,17 @@ def setup_pulseaudio() -> bool:
             log.error("Unable to set 'virtual_out' as default sink: %s", set_result.stderr.strip())
             return False
 
-        log.info("PulseAudio initialization complete; default sink is 'virtual_out'")
+        log.info("Audio server initialization complete; default sink is 'virtual_out'")
         return True
 
     except Exception as e:
-        log.exception("Unhandled exception during PulseAudio initialization: %s", e)
+        log.exception("Unhandled exception during audio server initialization: %s", e)
         return False
+
+
+def setup_pulseaudio() -> bool:
+    """Backward-compatible alias for older imports."""
+    return setup_audio_server()
 
 
 def create_loopback(expected_sink_prefix: str, latency_ms: int = 100, wait_seconds: int = 5) -> bool:

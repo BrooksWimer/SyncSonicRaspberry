@@ -28,6 +28,10 @@ import time
 import wave
 from typing import Dict, List, Optional, Tuple
 
+from syncsonic_ble.helpers.analyze_bursts_debug import detect_burst_onsets
+from syncsonic_ble.helpers.actuation import get_actuation_manager
+from syncsonic_ble.helpers.alignment_controller import get_alignment_controller
+
 import numpy as np
 from scipy import signal as scipy_signal
 
@@ -81,12 +85,18 @@ def get_connected_speakers() -> List[str]:
         return []
     macs = []
     for line in result.stdout.splitlines():
-        if "bluez_sink." in line and ".a2dp_sink" in line:
-            parts = line.split()
-            if len(parts) >= 2:
-                sink_name = parts[1]
-                mac_part = sink_name.split(".")[1]
-                mac = mac_part.replace("_", ":")
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        sink_name = parts[1]
+        mac_part: Optional[str] = None
+        if "bluez_output." in sink_name:
+            mac_part = sink_name.split(".")[1]
+        elif "bluez_sink." in sink_name:
+            mac_part = sink_name.split(".")[1]
+        if mac_part:
+            mac = mac_part.replace("_", ":").upper()
+            if mac not in macs:
                 macs.append(mac)
     return macs
 
@@ -95,6 +105,16 @@ def _mac_to_sink(mac: str) -> str:
     return f"bluez_sink.{mac.replace(':', '_')}.a2dp_sink"
 
 
+# ---------------------------------------------------------------------------
+# PulseAudio latency roles (do not mix when applying sync corrections)
+# ---------------------------------------------------------------------------
+# - Loopback (source) latency: We set it via latency_msec when creating the loopback
+#   (load-module module-loopback). It is the buffer from virtual_out.monitor to the sink.
+# - Sink latency: From pactl list sinks (current/configured). The Bluetooth sink's own
+#   latency; we do not set it. PA may clamp our loopback request based on sink limits.
+# - Effective latency: From pactl list sink-inputs (Buffer Latency + Sink Latency).
+#   Total delay we use as "current" when computing corrections. Sync corrections must
+#   use only delta_ms (the measured sync error), never sink shortfall or requested - configured.
 # ---------------------------------------------------------------------------
 # Sink latency bounds (what PA reports; min/max are not in the protocol)
 # ---------------------------------------------------------------------------
@@ -478,12 +498,12 @@ def _refine_burst_onset(
 
 def _generate_spectrogram_with_markers(
     wav_path: str,
-    t1_sec: float,
-    t2_sec: float,
+    t1_sec: Optional[float],
+    t2_sec: Optional[float],
     output_path: str,
     sample_rate: int = RECORD_SAMPLE_RATE,
 ) -> None:
-    """Generate a spectrogram PNG with vertical lines at the two detected peak times."""
+    """Generate a spectrogram PNG; optional vertical lines at t1_sec, t2_sec when provided."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -503,18 +523,23 @@ def _generate_spectrogram_with_markers(
     Sxx_db = 10 * np.log10(Sxx + 1e-12)
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.pcolormesh(t, f, Sxx_db, shading="auto", cmap="viridis")
-    ax.axvline(x=t1_sec, color="cyan", linewidth=1.5, label="t1 (first peak)")
-    ax.axvline(x=t2_sec, color="orange", linewidth=1.5, label="t2 (second peak)")
+    if t1_sec is not None:
+        ax.axvline(x=t1_sec, color="cyan", linewidth=1.5, label="t1 (first peak)")
+    if t2_sec is not None:
+        ax.axvline(x=t2_sec, color="orange", linewidth=1.5, label="t2 (second peak)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Frequency (Hz)")
-    ax.set_title("Recording spectrogram with detected 19 kHz burst times")
-    ax.legend(loc="upper right")
+    ax.set_title("Recording spectrogram with detected 19 kHz burst times" if (t1_sec is not None and t2_sec is not None) else "Recording spectrogram (no peaks detected)")
+    if t1_sec is not None or t2_sec is not None:
+        ax.legend(loc="upper right")
     ax.set_ylim(0, min(24000, f.max()))
     try:
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         fig.savefig(output_path, dpi=120, bbox_inches="tight")
         plt.close(fig)
         log.info("Wrote spectrogram to %s", output_path)
+        # Grep-friendly line so you can quickly find the image path in logs
+        log.info("SYNC_DEBUG_IMAGE=%s", os.path.abspath(output_path))
     except OSError as e:
         log.warning("Could not write spectrogram: %s", e)
     plt.close(fig)
@@ -588,7 +613,7 @@ def cmd_record_detect(
         if result.returncode != 0:
             print("arecord failed:", result.stderr, file=sys.stderr)
             sys.exit(1)
-        t1, t2 = detect_two_burst_times(wav_path)
+        t1, t2, _ = detect_burst_onsets(wav_path, sr=RECORD_SAMPLE_RATE)
         if t1 is None:
             print("Could not detect two bursts.")
             sys.exit(1)
@@ -644,20 +669,18 @@ def create_loopback_for_sink(sink_name: str, latency_ms: int) -> bool:
 
 def apply_correction(mac: str, new_latency_ms: int, allow_decrease: bool = False) -> bool:
     """
-    Rebuild loopback for MAC with new_latency_ms.
-    If allow_decrease is False, we only increase; if current effective latency
-    is already >= new_latency_ms, we do nothing (return True).
+    Apply an explicit commanded delay for MAC.
+
+    The commanded delay is now tracked in the actuation manager rather than
+    derived from the sink's effective latency report.
     """
-    sink = _mac_to_sink(mac)
-    current = get_effective_loopback_latency_per_speaker().get(mac)
+    manager = get_actuation_manager()
+    current = manager.get_commanded_delay(mac)
     if current is not None and not allow_decrease and new_latency_ms < int(current):
         log.info("Skipping decrease: current %.1f ms >= requested %d ms", current, new_latency_ms)
-        return True
-    if not unload_loopback_for_sink(sink):
-        log.warning("No loopback found for %s", mac)
         return False
-    time.sleep(0.3)
-    return create_loopback_for_sink(sink, new_latency_ms)
+    ok, _snapshot = manager.apply_fallback_delay(mac, float(new_latency_ms), mode="cli_correct")
+    return ok
 
 
 def apply_correction_with_feedback(
@@ -667,8 +690,8 @@ def apply_correction_with_feedback(
     Like apply_correction, but after applying we re-read effective latency so
     you can track requested vs actual (to infer PA min/max clamping).
 
-    Returns (success, requested_ms, actual_effective_ms_after).
-    actual_effective_ms_after is None if we didn't apply or couldn't read back.
+    Returns (did_apply, requested_ms, actual_effective_ms_after).
+    did_apply is True only if we rebuilt the loopback; actual is None if we didn't apply.
     """
     requested = new_latency_ms
     ok = apply_correction(mac, new_latency_ms, allow_decrease=allow_decrease)
@@ -686,8 +709,12 @@ def cmd_correct(mac: str, latency_ms: int, allow_decrease: bool = False) -> None
     if apply_correction(mac, latency_ms, allow_decrease=allow_decrease):
         print(f"Loopback for {mac} set to {latency_ms} ms")
     else:
-        print(f"Failed to apply correction for {mac}", file=sys.stderr)
-        sys.exit(1)
+        current = get_effective_loopback_latency_per_speaker().get(mac)
+        if current is not None and not allow_decrease and current >= latency_ms:
+            print(f"Already at or above {latency_ms} ms (current {current:.0f} ms); no change.")
+        else:
+            print(f"Failed to apply correction for {mac}", file=sys.stderr)
+            sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +724,7 @@ RECORD_DURATION_SYNC = 8
 SETTLE_SEC = 0.2
 # Must be large enough (e.g. 5s) so the two 19 kHz onsets don't overlap in the recording.
 WAIT_BETWEEN_BURSTS_SEC = 5.0
+MAX_SPACING_ERROR_SEC = 0.75
 # Debug output paths (for inspection when running under PulseAudio / service).
 # On the Pi this is typically /tmp/syncsonic_debug. See DEBUG_OUTPUT.md for how to download via SFTP.
 SYNCSONIC_DEBUG_DIR = os.path.join(tempfile.gettempdir(), "syncsonic_debug")
@@ -705,26 +733,102 @@ SYNCSONIC_SPECTROGRAM_PNG = os.path.join(SYNCSONIC_DEBUG_DIR, "spectrogram.png")
 SYNCSONIC_META_TXT = os.path.join(SYNCSONIC_DEBUG_DIR, "last_sync_meta.txt")
 
 
+def _build_auto_sync_plan(
+    manager,
+    controller,
+    reference_mac: str,
+    target_mac: str,
+    measured_offset_ms: float,
+) -> Dict[str, object]:
+    reference_delay_ms = manager.get_commanded_delay(reference_mac)
+    target_delay_ms = manager.get_commanded_delay(target_mac)
+    plan = controller.plan_relative_correction(
+        reference_mac=reference_mac,
+        target_mac=target_mac,
+        measured_offset_ms=measured_offset_ms,
+        reference_delay_ms=reference_delay_ms,
+        target_delay_ms=target_delay_ms,
+    )
+    manager.record_measurement(
+        reference_mac,
+        target_mac,
+        raw_offset_ms=plan.measured_offset_ms,
+        filtered_offset_ms=plan.filtered_offset_ms,
+        ratio_ppm=plan.target_ratio_ppm,
+        mode=f"auto_sync_{plan.controller_mode}",
+    )
+    return plan.as_dict()
+
+
+def _apply_auto_sync_plan(manager, controller, plan: Dict[str, object]) -> Dict[str, object]:
+    details = dict(plan)
+    action = str(details.get("action", "rate_only"))
+
+    if action == "rate_only":
+        target_mac = str(details["target_mac"])
+        rate_ppm = float(details.get("target_ratio_ppm", 0.0))
+        target_delay_ms = manager.get_commanded_delay(target_mac)
+        ok, _snapshot = manager.apply_control_target(
+            target_mac,
+            delay_ms=target_delay_ms,
+            rate_ppm=rate_ppm,
+            mode=f"auto_sync_{details.get('controller_mode', 'lock')}",
+        )
+        details["applied"] = ok
+        details["states"] = manager.get_status_snapshot()
+        details["controller_states"] = controller.get_state_snapshot()
+        return details
+
+    adjusted_mac = str(details["adjusted_mac"])
+    target_mac = str(details["target_mac"])
+    target_delay_ms = float(details["target_delay_ms"])
+    target_rate_ppm = float(details.get("target_ratio_ppm", 0.0))
+    relock = bool(details.get("relock", False))
+    manager.note_auto_sync_action(adjusted_mac, relock=relock)
+    adjusted_rate_ppm = target_rate_ppm if adjusted_mac == target_mac else 0.0
+    ok, _snapshot = manager.apply_control_target(
+        adjusted_mac,
+        delay_ms=target_delay_ms,
+        rate_ppm=adjusted_rate_ppm,
+        mode="auto_sync_relock" if relock else "auto_sync_slew",
+    )
+    if adjusted_mac != target_mac:
+        manager.record_rate_target(
+            target_mac,
+            target_rate_ppm,
+            mode=f"auto_sync_{details.get('controller_mode', 'acquire')}",
+        )
+    details["applied"] = ok
+    details["states"] = manager.get_status_snapshot()
+    details["controller_states"] = controller.get_state_snapshot()
+    return details
+
+
 def sync_once(
     record_sec: float = RECORD_DURATION_SYNC,
     dry_run: bool = False,
-) -> bool:
+) -> Tuple[bool, Dict[str, object]]:
     """
     Run one sync cycle for exactly two speakers using relative timing (Option B):
-    1) Read current effective loopback latency per speaker (used when rebuilding).
+    1) Read and log effective loopback latency per speaker (not used as baseline).
     2) Start recording; play burst to A, note T_send_A; wait WAIT_BETWEEN_BURSTS_SEC;
        play burst to B, note T_send_B; wait for B to be heard.
     3) Detect two 19 kHz onsets in recording (first = A, second = B; spacing ensures no overlap).
     4) delta_ms = (t2 - t1)*1000 - (T_send_B - T_send_A)*1000 (no global clock alignment needed).
-    5) Add delay to the faster speaker: new_loopback = current_loopback + |delta_ms|; if PA clamps, speed up the slower sink.
+    5) Feed the measured relative error into the actuation manager, which owns the
+       commanded delay state and applies either a bounded slew or a re-lock jump.
     Returns True if correction was applied (or not needed).
     """
     _load_syncsonic_env()
     macs = get_connected_speakers()
+    manager = get_actuation_manager()
+    controller = get_alignment_controller()
     if len(macs) < 2:
         log.warning("Need at least 2 speakers; found %s", macs)
-        return False
+        return False, {"reason": "need_two_speakers", "connected": macs}
     mac_a, mac_b = macs[0], macs[1]
+    manager.ensure_output(mac_a)
+    manager.ensure_output(mac_b)
 
     latencies = get_effective_loopback_latency_per_speaker()
     print("Effective loopback latency (ms):", {m: latencies.get(m, "?") for m in [mac_a, mac_b]})
@@ -754,7 +858,7 @@ def sync_once(
     finally:
         pass
 
-    t1, t2 = detect_two_burst_times(wav_path)
+    t1, t2, _ = detect_burst_onsets(wav_path, sr=RECORD_SAMPLE_RATE)
     # Save recording and spectrogram for inspection (works while PulseAudio is running)
     os.makedirs(SYNCSONIC_DEBUG_DIR, exist_ok=True)
     shutil.copy(wav_path, SYNCSONIC_LAST_WAV)
@@ -766,9 +870,13 @@ def sync_once(
     if t1 is None:
         with open(SYNCSONIC_META_TXT, "w") as f:
             f.write("t1=None\n t2=None\n peaks_detected=0\n mac_a=%s\n mac_b=%s\n" % (mac_a, mac_b))
+        # Always write spectrogram so you can inspect why detection failed
+        _generate_spectrogram_with_markers(SYNCSONIC_LAST_WAV, None, None, SYNCSONIC_SPECTROGRAM_PNG)
         print("Could not detect two bursts; no correction applied.")
         print("Debug output: %s (WAV), %s (meta)" % (SYNCSONIC_LAST_WAV, SYNCSONIC_META_TXT))
-        return False
+        print("[SYNC_DEBUG] Spectrogram (open or scp this): %s" % os.path.abspath(SYNCSONIC_SPECTROGRAM_PNG))
+        log.info("SYNC_DEBUG_IMAGE=%s", os.path.abspath(SYNCSONIC_SPECTROGRAM_PNG))
+        return False, {"reason": "burst_detection_failed", "states": manager.get_status_snapshot()}
     # Option B: delta from relative timing only (no T_record_start / clock alignment)
     # delta_ms > 0 means B arrived later than A would imply -> B is slower -> add delay to A
     # delta_ms < 0 means A is slower -> add delay to B
@@ -783,67 +891,51 @@ def sync_once(
         )
     _generate_spectrogram_with_markers(SYNCSONIC_LAST_WAV, t1, t2, SYNCSONIC_SPECTROGRAM_PNG)
     print("Debug output: %s (WAV) | %s (spectrogram) | %s (meta)" % (SYNCSONIC_LAST_WAV, SYNCSONIC_SPECTROGRAM_PNG, SYNCSONIC_META_TXT))
+    print("[SYNC_DEBUG] Spectrogram (open or scp this): %s" % os.path.abspath(SYNCSONIC_SPECTROGRAM_PNG))
     print(f"Peak spacing (t2-t1)={peak_spacing_sec*1000:.1f} ms  send spacing={send_spacing_sec*1000:.1f} ms  delta_ms={delta_ms:.1f} (B - A)")
     # Sanity: peak spacing should be close to send spacing (~5s) if we detected the two bursts correctly
     print(f"[sanity] Expected peak spacing ≈ send spacing (={send_spacing_sec:.2f}s); got {peak_spacing_sec:.2f}s → delta_ms={delta_ms:.1f}")
     log.info("[sanity] send_spacing_sec=%.2f peak_spacing_sec=%.2f delta_ms=%.1f", send_spacing_sec, peak_spacing_sec, delta_ms)
+    spacing_error_sec = abs(peak_spacing_sec - send_spacing_sec)
+    if spacing_error_sec > MAX_SPACING_ERROR_SEC:
+        log.warning(
+            "Rejecting sync measurement: spacing sanity failed (expected %.2fs, got %.2fs, error %.2fs)",
+            send_spacing_sec,
+            peak_spacing_sec,
+            spacing_error_sec,
+        )
+        return False, {
+            "reason": "spacing_sanity_failed",
+            "offset_ms": delta_ms,
+            "peak_spacing_sec": peak_spacing_sec,
+            "send_spacing_sec": send_spacing_sec,
+            "states": manager.get_status_snapshot(),
+            "controller_states": controller.get_state_snapshot(),
+        }
 
     if abs(delta_ms) < 0.5:
         print("Already in sync (|delta| < 0.5 ms).")
-        return True
+        plan = _build_auto_sync_plan(manager, controller, mac_a, mac_b, delta_ms)
+        details = _apply_auto_sync_plan(manager, controller, plan)
+        return True, {
+            **details,
+            "action": "rate_only",
+        }
 
-    if delta_ms > 0:
-        # A is faster (B is slower) -> add delay to A using current loopback + delta
-        L_a = latencies.get(mac_a)
-        if L_a is None:
-            print("No effective latency for A; cannot correct. Check logs for pactl list sink-inputs output.")
-            return False
-        new_latency = int(L_a) + int(round(delta_ms))
-        print(f"A is faster by ~{delta_ms:.1f} ms. Rebuilding A loopback: current={L_a:.0f} ms -> {new_latency} ms")
-        if dry_run:
-            print("[dry-run] Would apply correction.")
-            return True
-        ok, requested, _ = apply_correction_with_feedback(mac_a, new_latency, allow_decrease=False)
-        if not ok:
-            return False
-        # If PA clamped (sink configured latency << requested), speed up the slower sink (B) to compensate
-        sink_info = get_sink_latency_info_per_speaker()
-        configured_ms = sink_info.get(mac_a, {}).get("configured_latency_ms")
-        if configured_ms is not None and configured_ms < requested * 0.5:
-            shortfall_ms = requested - configured_ms
-            L_b = latencies.get(mac_b)
-            if L_b is not None and shortfall_ms > 0:
-                new_b_latency = max(1, int(L_b) - int(round(shortfall_ms)))
-                log.info("PA clamped A: requested %d ms, sink configured %.1f ms. Speeding up B by ~%.1f ms: %.0f -> %d ms", requested, configured_ms, shortfall_ms, L_b, new_b_latency)
-                print(f"PA clamped A: requested {requested} ms, sink got {configured_ms:.1f} ms. Speeding up B by ~{shortfall_ms:.1f} ms: {L_b:.0f} -> {new_b_latency} ms")
-                apply_correction(mac_b, new_b_latency, allow_decrease=True)
-        return True
-    else:
-        # B is faster (A is slower) -> add delay to B using current loopback + |delta|
-        L_b = latencies.get(mac_b)
-        if L_b is None:
-            print("No effective latency for B; cannot correct. Check logs for pactl list sink-inputs output.")
-            return False
-        new_latency = int(L_b) + int(round(-delta_ms))
-        print(f"B is faster by ~{-delta_ms:.1f} ms. Rebuilding B loopback: current={L_b:.0f} ms -> {new_latency} ms")
-        if dry_run:
-            print("[dry-run] Would apply correction.")
-            return True
-        ok, requested, _ = apply_correction_with_feedback(mac_b, new_latency, allow_decrease=False)
-        if not ok:
-            return False
-        # If PA clamped (sink configured latency << requested), speed up the slower sink (A) to compensate
-        sink_info = get_sink_latency_info_per_speaker()
-        configured_ms = sink_info.get(mac_b, {}).get("configured_latency_ms")
-        if configured_ms is not None and configured_ms < requested * 0.5:
-            shortfall_ms = requested - configured_ms
-            L_a = latencies.get(mac_a)
-            if L_a is not None and shortfall_ms > 0:
-                new_a_latency = max(1, int(L_a) - int(round(shortfall_ms)))
-                log.info("PA clamped B: requested %d ms, sink configured %.1f ms. Speeding up A by ~%.1f ms: %.0f -> %d ms", requested, configured_ms, shortfall_ms, L_a, new_a_latency)
-                print(f"PA clamped B: requested {requested} ms, sink got {configured_ms:.1f} ms. Speeding up A by ~{shortfall_ms:.1f} ms: {L_a:.0f} -> {new_a_latency} ms")
-                apply_correction(mac_a, new_a_latency, allow_decrease=True)
-        return True
+    if dry_run:
+        print("[dry-run] Would apply correction.")
+        plan = _build_auto_sync_plan(manager, controller, mac_a, mac_b, delta_ms)
+        details = dict(plan)
+        details["applied"] = False
+        details["states"] = manager.get_status_snapshot()
+        details["controller_states"] = controller.get_state_snapshot()
+        return True, {
+            **details,
+            "action": "dry_run",
+        }
+    plan = _build_auto_sync_plan(manager, controller, mac_a, mac_b, delta_ms)
+    details = _apply_auto_sync_plan(manager, controller, plan)
+    return bool(details.get("applied")), details
 
 
 def cmd_sync_once(
@@ -851,7 +943,8 @@ def cmd_sync_once(
     dry_run: bool = False,
 ) -> None:
     """CLI: run one sync-once cycle."""
-    if not sync_once(record_sec=record_sec, dry_run=dry_run):
+    ok, _details = sync_once(record_sec=record_sec, dry_run=dry_run)
+    if not ok:
         sys.exit(1)
 
 

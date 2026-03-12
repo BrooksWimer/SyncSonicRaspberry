@@ -84,13 +84,16 @@ export default function Index() {
   
           // only proceed if it's actually our Pi (by UUID & optional name)
           const hasSvc = cached.serviceUUIDs?.includes(SERVICE_UUID);
-          const isPi   = cached.name?.startsWith("Sync-Sonic");  // or whatever your Pi advertises
+          const isPi   = cached.name?.startsWith("SyncSonic") || cached.name?.startsWith("Sync-Sonic");
           if (hasSvc && isPi) {
             console.log("✅ Fast-path: cached device looks good, connecting...");
             const conn = await connectToDevice(cached);
             await conn.discoverAllServicesAndCharacteristics();
             deviceConnection = conn;
             await ensurePiNotifications(conn, handleNotification);
+            setConnecting(false);
+            router.push('/home');
+            return;
           } else {
             console.warn("⚠️ Cached device isn't our Pi—dropping it");
             await removeLastConnectedDevice();  // clear bad cache
@@ -121,7 +124,7 @@ export default function Index() {
             if (
               device &&
               device.serviceUUIDs?.includes(SERVICE_UUID) &&
-              device.name?.startsWith("Sync-Sonic")
+              (device.name?.startsWith("SyncSonic") || device.name?.startsWith("Sync-Sonic"))
             ) {
               console.log("🔔 Found Pi during scan:", device.id, device.name);
               manager.stopDeviceScan();
@@ -142,7 +145,9 @@ export default function Index() {
 
       deviceConnection = await connectToDevice(foundDevice);
       console.log("✅ Scanned & connected to Pi", foundDevice.id);
+      await ensurePiNotifications(deviceConnection, handleNotification);
       setConnecting(false);
+      router.push('/home');
     }
   }
 

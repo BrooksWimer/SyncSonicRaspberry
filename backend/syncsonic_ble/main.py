@@ -2,15 +2,16 @@
 runs the single GLib MainLoop.  Replaces the previous gatt_server,
 event_pump and svc_singleton helpers."""
 
-import sys, os, dbus, dbus.service, dbus.mainloop.glib
+import sys, os, subprocess, dbus, dbus.service, dbus.mainloop.glib
 from gi.repository import GLib
 
 # First-party modules -------------------------------------------------------
 from syncsonic_ble.utils.logging_conf import get_logger
-from syncsonic_ble.helpers.pulseaudio_helpers import setup_pulseaudio
+from syncsonic_ble.helpers.pulseaudio_helpers import setup_audio_server
 from syncsonic_ble.utils.constants import (
     BLUEZ_SERVICE_NAME, SERVICE_UUID, CHARACTERISTIC_UUID, GATT_MANAGER_IFACE,
-    LE_ADVERTISING_MANAGER_IFACE, AGENT_MANAGER_INTERFACE, AGENT_PATH, reserved
+    LE_ADVERTISING_MANAGER_IFACE, AGENT_MANAGER_INTERFACE, AGENT_PATH, reserved,
+    ADAPTER_INTERFACE, DBUS_PROP_IFACE,
 )
 from syncsonic_ble.state_management.bus_manager import get_bus
 
@@ -41,7 +42,7 @@ def main():
     """Initialise everything then enter the single GLib main loop."""
 
     # 1) Audio & logging ----------------------------------------------------
-    setup_pulseaudio()
+    setup_audio_server()
 
     # 2) D-Bus / GLib integration -----------------------------------------
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
@@ -55,6 +56,27 @@ def main():
         sys.exit(1)
     log.info("🎛️  Using primary adapter: %s", adapter_path)
 
+    # Force the reserved adapter to show as "SyncSonic" everywhere (phone settings + BLE scan).
+    # 1) Set controller name via hciconfig so the phone's system Bluetooth list shows SyncSonic.
+    try:
+        subprocess.run(
+            ["hciconfig", reserved, "name", "SyncSonic"],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        log.info("📛 Set %s controller name to SyncSonic (hciconfig)", reserved)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log.warning("hciconfig name failed (phone may show other name): %s", e)
+    # 2) Set BlueZ Alias so BlueZ and BLE use SyncSonic too.
+    try:
+        adapter_obj = bus.get_object(BLUEZ_SERVICE_NAME, adapter_path)
+        props = dbus.Interface(adapter_obj, DBUS_PROP_IFACE)
+        props.Set(ADAPTER_INTERFACE, "Alias", dbus.String("SyncSonic"))
+        log.info("📛 Set adapter Alias to SyncSonic (BlueZ)")
+    except Exception as e:
+        log.warning("Could not set adapter Alias (phone may see wrong name): %s", e)
+
     # 4) Pairing agent ------------------------------------------------------
     PhonePairingAgent(bus, AGENT_PATH)  # object lives as long as program
     agent_mgr = dbus.Interface(
@@ -65,9 +87,8 @@ def main():
     agent_mgr.RequestDefaultAgent(AGENT_PATH)
     log.info("🤝 Pairing agent registered at %s", AGENT_PATH)
 
-    # 5) Runtime services ---------------------------------------------------
+    # 5) Runtime services (single instance each – do not duplicate)
     conn_service = ConnectionService()              # worker thread inside
-
     dev_mgr = DeviceManager(bus, adapter_path)
 
     gatt_service = GattService(bus, 0, SERVICE_UUID, primary=True)
@@ -85,6 +106,7 @@ def main():
     char.set_device_manager(dev_mgr)
     char.set_connection_service(conn_service)
     conn_service._char = char  # allow service to push BLE notifications
+    conn_service.set_device_manager(dev_mgr)  # Wi‑Fi connected tracking
 
     # CCCD descriptor -------------------------------------------------------
     cccd = ClientConfigDescriptor(bus, 0, char)

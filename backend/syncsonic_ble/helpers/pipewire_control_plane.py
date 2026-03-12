@@ -62,7 +62,7 @@ def publish_output_control(
     })
     outputs[mac] = current
     _write_state(state)
-    log.info(
+    log.debug(
         "PipeWire control-plane publish %s -> delay=%.3f ms rate=%.3f ppm mode=%s active=%s",
         mac,
         float(delay_ms),
@@ -112,7 +112,7 @@ def publish_output_mix(
     current["right_percent"] = int(max(0, min(150, right_percent)))
     outputs[mac] = current
     _write_state(state)
-    log.info(
+    log.debug(
         "PipeWire mix publish %s -> left=%s%% right=%s%%",
         mac,
         current["left_percent"],
@@ -127,7 +127,7 @@ def clear_output_control(mac: str) -> str:
     outputs = state.setdefault("outputs", {})
     outputs.pop(mac, None)
     _write_state(state)
-    log.info("PipeWire control-plane cleared %s", mac)
+    log.debug("PipeWire control-plane cleared %s", mac)
     return CONTROL_STATE_PATH
 
 

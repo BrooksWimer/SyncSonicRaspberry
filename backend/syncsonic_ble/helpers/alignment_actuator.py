@@ -21,19 +21,13 @@ class OutputActuatorState:
 
 
 class AlignmentActuatorEngine:
-    """Persistent actuator state that slews toward control targets.
+    """Persistent actuator state that applies control targets immediately.
 
-    This models the authoritative delay-line + bounded-rate behavior from the
-    research:
-    - relock jumps for large discontinuities
-    - bounded delay slewing during normal operation
-    - bounded rate slewing toward a small ppm target
+    SyncSonic delay filters are intended to be set to explicit values and held.
+    Any slew/relock loop here causes repeated transport rebuilds and audio
+    instability. We therefore publish fixed delay/rate targets directly.
     """
 
-    LOCK_SLEW_MS_PER_SEC = 1.0
-    ACQUIRE_SLEW_MS_PER_SEC = 6.0
-    RATE_SLEW_PPM_PER_SEC = 120.0
-    RESYNC_THRESHOLD_MS = 30.0
     TRANSPORT_BASE_MS = 120.0
 
     def __init__(self) -> None:
@@ -74,8 +68,7 @@ class AlignmentActuatorEngine:
                 snapshots[mac] = asdict(state)
                 continue
 
-            dt = max(0.0, now - state.updated_at)
-            self._apply_target(state, raw, dt, transport_base_ms)
+            self._apply_target(state, raw, transport_base_ms)
             state.updated_at = now
             snapshots[mac] = asdict(state)
 
@@ -85,7 +78,6 @@ class AlignmentActuatorEngine:
         self,
         state: OutputActuatorState,
         raw: Dict[str, Any],
-        dt: float,
         transport_base_ms: float,
     ) -> None:
         state.mode = str(raw.get("mode", state.mode))
@@ -94,29 +86,15 @@ class AlignmentActuatorEngine:
         target_rate = float(raw.get("rate_ppm", state.target_rate_ppm))
         state.target_delay_ms = target_delay
         state.target_rate_ppm = target_rate
-
-        relock = "relock" in state.mode or abs(target_delay - state.applied_delay_ms) >= self.RESYNC_THRESHOLD_MS
-        if relock:
-            state.applied_delay_ms = self._clamp_delay(target_delay, state.transport_delay_ms)
-            state.delay_line_ms = max(0.0, state.applied_delay_ms - state.transport_delay_ms)
-            state.applied_rate_ppm = target_rate
-            state.relock_events += 1
-            state.correction_events += 1
-            return
-
-        slew_rate = self.ACQUIRE_SLEW_MS_PER_SEC if "acquire" in state.mode else self.LOCK_SLEW_MS_PER_SEC
-        max_delay_step = max(0.0, dt * slew_rate)
-        delay_error = target_delay - state.applied_delay_ms
-        delay_step = max(-max_delay_step, min(max_delay_step, delay_error))
-        if abs(delay_step) > 0.0:
-            state.correction_events += 1
-        state.applied_delay_ms = self._clamp_delay(state.applied_delay_ms + delay_step, state.transport_delay_ms)
+        changed = (
+            abs(target_delay - state.applied_delay_ms) >= 0.001
+            or abs(target_rate - state.applied_rate_ppm) >= 0.001
+        )
+        state.applied_delay_ms = self._clamp_delay(target_delay, state.transport_delay_ms)
         state.delay_line_ms = max(0.0, state.applied_delay_ms - state.transport_delay_ms)
-
-        max_rate_step = max(0.0, dt * self.RATE_SLEW_PPM_PER_SEC)
-        rate_error = target_rate - state.applied_rate_ppm
-        rate_step = max(-max_rate_step, min(max_rate_step, rate_error))
-        state.applied_rate_ppm += rate_step
+        state.applied_rate_ppm = target_rate
+        if changed:
+            state.correction_events += 1
 
     def _clamp_delay(self, value: float, transport_base_ms: float) -> float:
         return max(float(transport_base_ms), float(value))

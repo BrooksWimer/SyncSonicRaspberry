@@ -326,3 +326,16 @@ export async function runUltrasonicSync(device: Device): Promise<void> {
   console.log('🔊 Running ultrasonic auto-sync');
   return bleWrite(device, MESSAGE_TYPES.ULTRASONIC_SYNC, {});
 }
+
+export async function startupProbeBegin(device: Device, targets: string[]): Promise<void> {
+  console.log('🔊 Startup probe begin', { targets });
+  return bleWrite(device, MESSAGE_TYPES.STARTUP_PROBE_BEGIN, { targets });
+}
+
+export async function startupProbeStep(device: Device, targetId: string, speaker: string): Promise<void> {
+  return bleWrite(device, MESSAGE_TYPES.STARTUP_PROBE_STEP, { target_id: targetId, speaker });
+}
+
+export async function startupProbeFinish(device: Device): Promise<void> {
+  return bleWrite(device, MESSAGE_TYPES.STARTUP_PROBE_FINISH, {});
+}

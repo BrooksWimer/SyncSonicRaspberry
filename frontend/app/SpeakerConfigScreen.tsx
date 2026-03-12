@@ -18,7 +18,15 @@ import {
   handleLatencyChange
 } from '../utils/SpeakerFunctions';
 import { useBLEContext, } from '@/contexts/BLEContext';
-import { bleConnectOne, bleDisconnectOne, setVolume, setMute, runUltrasonicSync } from '../utils/ble_functions';
+import {
+  bleConnectOne,
+  bleDisconnectOne,
+  setVolume,
+  setMute,
+  startupProbeBegin,
+  startupProbeStep,
+  startupProbeFinish,
+} from '../utils/ble_functions';
 import LottieView from 'lottie-react-native';
 import { Audio } from 'expo-av';
 import { Header } from '@/components/texts/TitleText';
@@ -26,6 +34,16 @@ import { Body } from '@/components/texts/BodyText';
 
 
 export default function SpeakerConfigScreen() {
+  const PROBE_BEGIN_SETTLE_MS = 900;
+  const PROBE_MUTE_COMMAND_GAP_MS = 140;
+  const PROBE_AFTER_MUTE_SETTLE_MS = 800;
+  const PROBE_AFTER_STEP_MARK_MS = 250;
+  const PROBE_AFTER_BEEP_MS = 2300;
+  const PROBE_AFTER_BEEP_MS_WITH_SONOS = 10000;
+  const PROBE_AFTER_FINISH_MS = 300;
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
   // Retrieve parameters from the URL
   const params = useSearchParams();
   const router = useRouter();
@@ -76,7 +94,14 @@ export default function SpeakerConfigScreen() {
   };
 
   // Use only piStatus from BLEContext
-  const { dbUpdateTrigger, connectedDevice, piStatus, lastUltrasonicSyncResult, clearUltrasonicSyncResult } = useBLEContext();
+  const {
+    dbUpdateTrigger,
+    connectedDevice,
+    piStatus,
+    lastUltrasonicSyncResult,
+    clearUltrasonicSyncResult,
+    lastProbeBeepRequest,
+  } = useBLEContext();
 
   // State to hold connected speakers (mapping from mac to name)
   const [connectedSpeakers, setConnectedSpeakers] = useState<{ [mac: string]: string }>({});
@@ -722,8 +747,15 @@ export default function SpeakerConfigScreen() {
       Alert.alert('Error', 'No BLE device connected');
       return;
     }
-    if (Object.keys(connectedSpeakers).length < 2) {
-      Alert.alert('Auto-sync', 'Need at least 2 connected speakers for ultrasonic sync.');
+    const isBluetoothMac = (id: string) => /^[0-9A-F]{2}(:[0-9A-F]{2}){5}$/i.test(id);
+    const isSonosId = (id: string) => id.toLowerCase().startsWith('sonos:');
+    // Use the same live connectivity source as the green/red dot (settings[mac].isConnected).
+    const targets = Object.keys(connectedSpeakers).filter((id) => {
+      if (!isBluetoothMac(id) && !isSonosId(id)) return false;
+      return !!settings[id]?.isConnected;
+    });
+    if (targets.length < 2) {
+      Alert.alert('Auto-sync', 'Need at least 2 connected speakers for startup probe.');
       return;
     }
     setIsUltrasonicSyncing(true);
@@ -733,9 +765,54 @@ export default function SpeakerConfigScreen() {
       ultrasonicSyncTimeoutRef.current = null;
       setIsUltrasonicSyncing(false);
       Alert.alert('Auto-sync', 'No response from Pi (timeout). Ensure USB mic is connected and try again.');
-    }, 20000);
+    }, 90000);
     try {
-      await runUltrasonicSync(connectedDevice);
+      const btMuteBaseline: Record<string, boolean> = {};
+      const sonosVolumeBaseline: Record<string, number> = {};
+      const hasSonosTarget = targets.some((id) => isSonosId(id));
+      const stepGapAfterBeepMs = hasSonosTarget ? PROBE_AFTER_BEEP_MS_WITH_SONOS : PROBE_AFTER_BEEP_MS;
+      for (const id of targets) {
+        if (isSonosId(id)) {
+          sonosVolumeBaseline[id] = Math.max(0, Math.min(100, settings[id]?.volume ?? 50));
+        } else {
+          btMuteBaseline[id] = !!sliderValues[id]?.isMuted;
+        }
+      }
+      try {
+        await startupProbeBegin(connectedDevice, targets);
+        await sleep(PROBE_BEGIN_SETTLE_MS);
+
+        for (let i = 0; i < targets.length; i++) {
+          const target = targets[i];
+          const targetName = connectedSpeakers[target] || target;
+          for (const id of targets) {
+            if (isSonosId(id)) {
+              const baselineVol = sonosVolumeBaseline[id] ?? 50;
+              const nextVol = id === target ? baselineVol : 0;
+              await setVolume(connectedDevice, id, nextVol, 0.5);
+            } else {
+              await setMute(connectedDevice, id, id !== target);
+            }
+            await sleep(PROBE_MUTE_COMMAND_GAP_MS);
+          }
+          await sleep(PROBE_AFTER_MUTE_SETTLE_MS);
+          await startupProbeStep(connectedDevice, target, targetName);
+          await sleep(PROBE_AFTER_STEP_MARK_MS);
+          await playSound();
+          await sleep(stepGapAfterBeepMs);
+        }
+        await startupProbeFinish(connectedDevice);
+        await sleep(PROBE_AFTER_FINISH_MS);
+      } finally {
+        for (const id of targets) {
+          if (isSonosId(id)) {
+            const baselineVol = sonosVolumeBaseline[id] ?? 50;
+            await setVolume(connectedDevice, id, baselineVol, 0.5);
+          } else {
+            await setMute(connectedDevice, id, btMuteBaseline[id]);
+          }
+        }
+      }
     } catch (e) {
       ultrasonicSyncTimeoutRef.current && clearTimeout(ultrasonicSyncTimeoutRef.current);
       ultrasonicSyncTimeoutRef.current = null;
@@ -743,6 +820,12 @@ export default function SpeakerConfigScreen() {
       Alert.alert('Error', (e as Error)?.message ?? 'Failed to start auto-sync');
     }
   };
+
+  useEffect(() => {
+    // Retained only for backward compatibility with backend-driven probe cueing.
+    if (!isUltrasonicSyncing) return;
+    if (!lastProbeBeepRequest?.play_beep) return;
+  }, [lastProbeBeepRequest?.seq, isUltrasonicSyncing]);
 
   const handleMuteToggle = async (mac: string) => {
     const isCurrentlyMuted = sliderValues[mac]?.isMuted || false;

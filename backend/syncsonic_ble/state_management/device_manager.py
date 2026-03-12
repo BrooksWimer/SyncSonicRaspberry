@@ -15,6 +15,7 @@ from syncsonic_ble.utils.constants import (
 )
 from syncsonic_ble.helpers.pulseaudio_helpers import create_loopback, remove_loopback_for_device
 from syncsonic_ble.helpers.adapter_helpers import extract_mac, connected_devices_on_adapter, adapter_prefix_from_path
+from syncsonic_ble.helpers.device_labels import register_device_label, format_device_label
 import re
 
 log = get_logger(__name__)
@@ -90,7 +91,7 @@ class DeviceManager:
         if not mac:
             return
 
-        log.info("[BlueZ] %s is now %s", mac,
+        log.info("[BlueZ] %s is now %s", format_device_label(mac),
                  "✓ CONNECTED" if connected else "✗ DISCONNECTED")
 
         if connected:
@@ -99,7 +100,10 @@ class DeviceManager:
             self._handle_disconnection(mac)
 
         # push status update -------------------------------------------------
-        alias = changed.get("Alias", mac)
+        alias = str(changed.get("Alias", "") or "").strip()
+        if alias:
+            register_device_label(mac, alias)
+        alias = alias or mac
         self._status[mac] = {"alias": alias, "connected": connected}
         if self._char:
             self._char.push_status({"connected": list(self._all_connected())})
@@ -111,6 +115,14 @@ class DeviceManager:
 
         dev_obj   = self.bus.get_object(BLUEZ_SERVICE_NAME, path)
         dev_props = dbus.Interface(dev_obj, DBUS_PROP_IFACE)
+        alias = ""
+        try:
+            alias = str(dev_props.Get(DEVICE_INTERFACE, "Alias") or "").strip()
+        except Exception:
+            alias = ""
+        if alias:
+            register_device_label(mac, alias)
+        speaker_label = format_device_label(mac)
 
         
         # A2DP check ---------------------------------------------------------
@@ -119,7 +131,7 @@ class DeviceManager:
         except Exception:
             uuids = []
         if not any("110b" in u.lower() for u in uuids):
-            log.info("%s lacks A2DP – skipping", mac)
+            log.info("%s lacks A2DP - skipping", speaker_label)
             return
 
         adapter_prefix = adapter_prefix_from_path(path)
@@ -130,7 +142,12 @@ class DeviceManager:
             dbus.Interface(dev_obj, DEVICE_INTERFACE).Disconnect()
             from syncsonic_ble.state_change.action_functions import remove_device_dbus
             remove_device_dbus(other_path, self.bus)
-            log.warning("%s tried adapter %s but %s is already there. Disconnecting and removing", mac, adapter_prefix, others[0])
+            log.warning(
+                "%s tried adapter %s but %s is already there. Disconnecting and removing",
+                speaker_label,
+                adapter_prefix,
+                format_device_label(others[0]),
+            )
             return
 
 
@@ -139,7 +156,7 @@ class DeviceManager:
 
         # pass to the flow state management ---------------------------
         self.connected.add(mac)
-        log.info("Tracking %s as connected — loopback deferred to FSM", mac)
+        log.info("Tracking %s as connected - loopback deferred to FSM", speaker_label)
         from syncsonic_ble.state_management.connection_manager import Intent
         from syncsonic_ble.state_management.connection_manager import work_q
         work_q.put((Intent.LOOPBACK_SYNC, {"mac": mac, "connected": True}))
@@ -148,7 +165,7 @@ class DeviceManager:
         if mac not in self.connected:
             return
         self.connected.remove(mac)
-        log.info("Tracking %s as disconnected — loopback removal deferred to FSM", mac)
+        log.info("Tracking %s as disconnected - loopback removal deferred to FSM", format_device_label(mac))
         from syncsonic_ble.state_management.connection_manager import Intent
         from syncsonic_ble.state_management.connection_manager import work_q
         work_q.put((Intent.LOOPBACK_SYNC, {"mac": mac, "connected": False}))
@@ -179,6 +196,8 @@ class DeviceManager:
             obj = self.bus.get_object(BLUEZ_SERVICE_NAME, path)
             props = dbus.Interface(obj, DBUS_PROP_IFACE)
             name = props.Get(DEVICE_INTERFACE, "Alias") or props.Get(DEVICE_INTERFACE, "Name")
+            if name:
+                register_device_label(mac, str(name))
             paired = bool(props.Get(DEVICE_INTERFACE, "Paired"))
             device_info = {"mac": mac, "name": name, "paired": paired}
             log.info("→ [SCAN STREAM] Discovered %s (%s), paired=%s", name, mac, paired)
@@ -197,5 +216,4 @@ class DeviceManager:
         props_iface = dbus.Interface(obj, DBUS_PROP_IFACE)
         dev_iface   = dbus.Interface(obj, DEVICE_INTERFACE)
         self.devices[path] = {"device": obj, "props": props_iface, "iface": dev_iface}
-        log.info("Registered expected speaker %s at %s", mac, path)
-
+        log.info("Registered expected speaker %s at %s", format_device_label(mac), path)

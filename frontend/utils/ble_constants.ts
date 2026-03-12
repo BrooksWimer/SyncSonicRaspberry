@@ -25,6 +25,9 @@ export const MESSAGE_TYPES = {
   START_CLASSIC_PAIRING: 0x66,
   // Ultrasonic auto-sync (Pi runs one sync cycle; result via notification)
   ULTRASONIC_SYNC: 0x67,
+  STARTUP_PROBE_BEGIN: 0x68,
+  STARTUP_PROBE_STEP: 0x69,
+  STARTUP_PROBE_FINISH: 0x6A,
   // Connection Status Update
   CONNECTION_STATUS_UPDATE: 0x70,  // General connection status update
   SCAN_DEVICES      : 0x43,

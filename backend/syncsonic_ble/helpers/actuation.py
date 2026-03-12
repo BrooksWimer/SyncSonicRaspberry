@@ -5,6 +5,7 @@ from threading import Lock
 from typing import Dict, Optional
 
 from syncsonic_ble.helpers.actuation_backends import get_actuation_backend
+from syncsonic_ble.helpers.device_labels import format_device_label
 from syncsonic_ble.utils.logging_conf import get_logger
 
 log = get_logger(__name__)
@@ -41,6 +42,7 @@ class ActuationManager:
         self._lock = Lock()
         self._states: Dict[str, OutputActuationState] = {}
         self._backend = get_actuation_backend()
+        log.info("Actuation backend selected: %s", self._backend.name)
 
     def ensure_output(self, mac: str, initial_delay_ms: float = 100.0) -> OutputActuationState:
         mac = mac.upper()
@@ -197,10 +199,19 @@ class ActuationManager:
                 state.control_path = result.control_path
                 state.backend_reason = result.reason
                 state.shadow_fallback = result.shadow_fallback
+            log.info(
+                "[ACT] speaker=%s backend=%s mode=%s delay=%.1fms rate=%.1fppm reason=%s",
+                format_device_label(mac),
+                result.backend,
+                mode,
+                float(result.applied_delay_ms or target_delay),
+                float(result.applied_rate_ppm),
+                result.reason,
+            )
         else:
             log.warning(
                 "Actuation control apply failed for %s -> %.2f ms / %.2f ppm via %s (%s)",
-                mac,
+                format_device_label(mac),
                 target_delay,
                 target_rate_ppm,
                 result.backend,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Dict, Optional, Any
 
 from syncsonic_ble.helpers.device_type_helpers import is_sonos
@@ -168,4 +169,19 @@ def get_transport_info(device_id: str) -> Optional[Dict[str, Any]]:
         return dict(info) if info else None
     except Exception as e:
         log.debug("[Sonos] get_transport_info failed: %s", e)
+        return None
+
+
+def get_volume(device_id: str) -> Optional[int]:
+    """Get current Sonos volume (0-100)."""
+    uid = _uid_from_device_id(device_id)
+    if not uid:
+        return None
+    speaker = _get_speaker_for_uid(uid)
+    if not speaker:
+        return None
+    try:
+        return int(getattr(speaker, "volume"))
+    except Exception as e:
+        log.debug("[Sonos] get_volume failed for %s: %s", device_id, e)
         return None

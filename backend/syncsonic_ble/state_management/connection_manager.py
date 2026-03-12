@@ -45,6 +45,7 @@ from syncsonic_ble.utils.constants import (
 from dbus import Interface
 from syncsonic_ble.state_management.device_manager import DeviceManager
 from syncsonic_ble.helpers.adapter_helpers import extract_mac, device_path_on_adapter
+from syncsonic_ble.helpers.device_labels import register_device_label, format_device_label
 from syncsonic_ble.state_change.action_planning import analyze_device
 
 logger = get_logger(__name__)
@@ -273,6 +274,9 @@ class ConnectionService:
 
             elif intent is Intent.CONNECT_ONE:
                 mac   = payload["mac"].upper()
+                friendly_name = str(payload.get("friendly_name") or "").strip()
+                if friendly_name:
+                    register_device_label(mac, friendly_name)
                 allow = [m.upper() for m in payload["allowed"]]
                 requested_settings = payload.get("settings") or {}
 
@@ -297,7 +301,7 @@ class ConnectionService:
                     dev_obj = self.bus.get_object(BLUEZ_SERVICE_NAME, device_path)
                     dev_iface = Interface(dev_obj, DEVICE_INTERFACE)
 
-                    logger.info(f"→ [DEBUG] Asking BlueZ to connect A2DP on {device_path}")
+                    logger.info(f"→ [DEBUG] Asking BlueZ to connect A2DP on {device_path} for {format_device_label(mac)}")
                     try:
                         dev_iface.ConnectProfile(A2DP_UUID)
                         logger.info("→ [DEBUG] ConnectProfile(A2DP) succeeded")
@@ -314,7 +318,7 @@ class ConnectionService:
 
                     if mac not in self.loopbacks:
                         if self._ensure_output_actuation(mac, requested_settings.get("latency")):
-                            logger.info(f"✅ Loopback created for already-connected {mac}")
+                            logger.info(f"✅ Loopback created for already-connected {format_device_label(mac)}")
                     self._apply_requested_settings(mac, requested_settings, apply_delay=False)
                     # we're done; nothing else to do for this intent
                     continue
@@ -349,11 +353,11 @@ class ConnectionService:
 
                 if connected and mac not in self.loopbacks:
                     if self._ensure_output_actuation(mac):
-                        logger.info(f"✅ Loopback autoprovisioned for {mac}")
+                        logger.info(f"✅ Loopback autoprovisioned for {format_device_label(mac)}")
                 elif not connected and mac in self.loopbacks:
                     self.actuation.remove_output(mac)
                     self.loopbacks.remove(mac)
-                    logger.info(f"🗑️  Loopback removed after disconnect for {mac}")
+                    logger.info(f"🗑️  Loopback removed after disconnect for {format_device_label(mac)}")
 
             elif intent is Intent.TEST_LATENCY:
                 macs = payload["macs"]
@@ -383,7 +387,7 @@ class ConnectionService:
     # -----------------------------
 
     def _try_reconnect(self, adapter_mac: str, dev_mac: str, requested_settings: Optional[Dict] = None):
-        logger.info(f"FSM: reconnect {dev_mac} via {adapter_mac}")
+        logger.info(f"FSM: reconnect {format_device_label(dev_mac)} via {adapter_mac}")
 
         # NEW → ask the object tree what still needs doing
         state = analyze_device(self.bus, adapter_mac, dev_mac)
@@ -493,9 +497,9 @@ class ConnectionService:
                     dev_iface = Interface(dev_obj, DEVICE_INTERFACE)
 
                     # wait for MediaTransport1 to appear
-                    logger.info(f"→ Waiting for MediaTransport1 for {dev_mac} before ConnectProfile...")
+                    logger.info(f"→ Waiting for MediaTransport1 for {format_device_label(dev_mac)} before ConnectProfile...")
                     if not self.wait_for_media_transport(dev_mac):
-                        logger.warning(f"❌ MediaTransport1 never appeared for {dev_mac} after Device.Connect()")
+                        logger.warning(f"❌ MediaTransport1 never appeared for {format_device_label(dev_mac)} after Device.Connect()")
                         attempt += 1
                         remove_device_dbus(device_path, self.bus)
                         state = "run_discovery"
@@ -505,7 +509,7 @@ class ConnectionService:
                     time.sleep(1)
 
                     # Now attempt A2DP ConnectProfile
-                    logger.info(f"→ [DEBUG] Asking BlueZ to connect A2DP on {device_path}")
+                    logger.info(f"→ [DEBUG] Asking BlueZ to connect A2DP on {device_path} for {format_device_label(dev_mac)}")
                     try:
                         dev_iface.ConnectProfile(A2DP_UUID)
                         logger.info("→ [DEBUG] ConnectProfile(A2DP) succeeded")
@@ -519,7 +523,7 @@ class ConnectionService:
                                 dev_iface.ConnectProfile(A2DP_UUID)
                                 logger.info("→ [DEBUG] ConnectProfile(A2DP) succeeded on retry")
                             except Exception as e2:
-                                logger.error(f"❌ ConnectProfile failed on retry for {dev_mac}: {e2}")
+                                logger.error(f"❌ ConnectProfile failed on retry for {format_device_label(dev_mac)}: {e2}")
                                 if self._char:
                                     self._char.send_notification(
                                         Msg.CONNECTION_STATUS_UPDATE,
@@ -527,7 +531,7 @@ class ConnectionService:
                                     )
                                 continue
                         else:
-                            logger.error(f"❌ ConnectProfile failed for {dev_mac}: {e}")
+                            logger.error(f"❌ ConnectProfile failed for {format_device_label(dev_mac)}: {e}")
                             if self._char:
                                 self._char.send_notification(
                                     Msg.CONNECTION_STATUS_UPDATE,
@@ -564,7 +568,7 @@ class ConnectionService:
                 state = "run_discovery"
                 attempt += 1
 
-        logger.info(f"    ❌ failed to reconnect {dev_mac}")
+        logger.info(f"    ❌ failed to reconnect {format_device_label(dev_mac)}")
 
     def _disconnect_everywhere(self, mac: str):
         om = Interface(self.bus.get_object("org.bluez", "/"), DBUS_OM_IFACE)

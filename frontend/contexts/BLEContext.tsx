@@ -20,6 +20,16 @@ export type UltrasonicSyncResult = {
   message?: string;
 } | null;
 
+export type ProbeBeepRequest = {
+  target_id: string;
+  speaker: string;
+  index: number;
+  total: number;
+  play_beep: true;
+  source?: string;
+  seq: number;
+} | null;
+
 type BLECtx = ReturnType<typeof useBLE> & {
   /** payload last pushed by the Raspberry Pi (e.g. {connected:[…]}) */
   piStatus: any;
@@ -28,6 +38,8 @@ type BLECtx = ReturnType<typeof useBLE> & {
   /** Last ultrasonic sync result (set when Pi sends sync-done notification) */
   lastUltrasonicSyncResult: UltrasonicSyncResult;
   clearUltrasonicSyncResult: () => void;
+  /** Per-step request from Pi to play probe beep on phone during auto-sync */
+  lastProbeBeepRequest: ProbeBeepRequest;
 };
 
 const Ctx = createContext<BLECtx | null>(null);
@@ -41,6 +53,7 @@ export function BLEProvider({ children }: { children: ReactNode }) {
   const triggerDbUpdate = () => setDbUpdateTrigger(v => v + 1);
   const [lastUltrasonicSyncResult, setLastUltrasonicSyncResult] = useState<UltrasonicSyncResult>(null);
   const clearUltrasonicSyncResult = () => setLastUltrasonicSyncResult(null);
+  const [lastProbeBeepRequest, setLastProbeBeepRequest] = useState<ProbeBeepRequest>(null);
 
   function handleNotify(err: BleError | null, chr: Characteristic | null) {
     if (err || !chr?.value) return;
@@ -56,6 +69,18 @@ export function BLEProvider({ children }: { children: ReactNode }) {
         message: json.message,
       });
     }
+    if (type === MESSAGE_TYPES.SUCCESS && json?.probe_beep_request) {
+      const step = json.probe_beep_request;
+      setLastProbeBeepRequest({
+        target_id: String(step.target_id ?? ""),
+        speaker: String(step.speaker ?? ""),
+        index: Number(step.index ?? 0),
+        total: Number(step.total ?? 0),
+        play_beep: true,
+        source: String(step.source ?? ""),
+        seq: Date.now(),
+      });
+    }
   }
 
   const ble = useBLE(handleNotify);
@@ -67,6 +92,7 @@ export function BLEProvider({ children }: { children: ReactNode }) {
     triggerDbUpdate,
     lastUltrasonicSyncResult,
     clearUltrasonicSyncResult,
+    lastProbeBeepRequest,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

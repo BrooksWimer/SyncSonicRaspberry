@@ -70,6 +70,8 @@ class PipeWireDspRuntime:
     def _render_output(self, mac: str, raw: Dict[str, Any]) -> Dict[str, Any]:
         delay_line_ms = max(0.0, float(raw.get("delay_line_ms", 0.0)))
         applied_rate_ppm = float(raw.get("applied_rate_ppm", 0.0))
+        baseline_latency_raw = raw.get("baseline_latency_ms")
+        observed_latency_raw = raw.get("observed_latency_ms")
         return {
             "mac": mac,
             "mode": str(raw.get("mode", "idle")),
@@ -81,6 +83,21 @@ class PipeWireDspRuntime:
             "target_rate_ppm": round(float(raw.get("target_rate_ppm", 0.0)), 3),
             "relock_events": int(raw.get("relock_events", 0)),
             "correction_events": int(raw.get("correction_events", 0)),
+            "health_state": str(raw.get("health_state", "unknown")),
+            "alignment_confidence": round(float(raw.get("alignment_confidence", 0.0)), 3),
+            "baseline_latency_ms": (
+                round(float(baseline_latency_raw), 3) if baseline_latency_raw is not None else None
+            ),
+            "observed_latency_ms": (
+                round(float(observed_latency_raw), 3) if observed_latency_raw is not None else None
+            ),
+            "auto_trim_ms": round(float(raw.get("auto_trim_ms", 0.0)), 3),
+            "drift_observed_ms": round(float(raw.get("drift_observed_ms", 0.0)), 3),
+            "dropout_events": int(raw.get("dropout_events", 0)),
+            "reconnect_events": int(raw.get("reconnect_events", 0)),
+            "remeasure_required": bool(raw.get("remeasure_required", False)),
+            "route_ok": bool(raw.get("route_ok", True)),
+            "route_failure_count": int(raw.get("route_failure_count", 0)),
         }
 
     def _publish_metadata(self, mac: str, spec: Dict[str, Any]) -> None:

@@ -6,6 +6,7 @@ from typing import Dict, Any
 from syncsonic_ble.utils.constants import Msg, DBUS_PROP_IFACE, DBUS_OM_IFACE, DEVICE_INTERFACE, BLUEZ_SERVICE_NAME, ADAPTER_INTERFACE
 from syncsonic_ble.helpers.actuation import get_actuation_manager
 from syncsonic_ble.helpers.pipewire_control_plane import get_transport_base_ms, publish_output_mix
+from syncsonic_ble.helpers.device_labels import register_device_label, format_device_label
 from syncsonic_ble.helpers.device_type_helpers import is_sonos
 from syncsonic_ble.utils.logging_conf import get_logger
 from syncsonic_ble.state_management.scan_manager import ScanManager
@@ -38,6 +39,8 @@ def _compact_actuation_payload(details: Dict[str, Any]) -> Dict[str, Any]:
         "applied",
         "setup_done",
         "target_onset_ms",
+        "data_only",
+        "counts",
     ):
         if key in details:
             compact[key] = details[key]
@@ -53,10 +56,43 @@ def _compact_actuation_payload(details: Dict[str, Any]) -> Dict[str, Any]:
     measured = details.get("measured")
     if isinstance(measured, list):
         compact["measured_count"] = len(measured)
+    detections = details.get("detections")
+    if isinstance(detections, list):
+        compact["detection_count"] = len(detections)
+    paired = details.get("paired")
+    if isinstance(paired, list):
+        compact["paired_count"] = len(paired)
+    relative = details.get("relative")
+    if isinstance(relative, list):
+        compact["relative_count"] = len(relative)
 
     failed = details.get("failed")
     if isinstance(failed, list):
         compact["failed_count"] = len(failed)
+
+    artifacts = details.get("artifacts")
+    if isinstance(artifacts, dict):
+        compact["artifact_files"] = {
+            "wav": os.path.basename(str(artifacts.get("wav_path", ""))),
+            "png": os.path.basename(str(artifacts.get("png_path", ""))),
+            "json": os.path.basename(str(artifacts.get("json_path", ""))),
+        }
+
+    # Keep BLE notify payload bounded to avoid truncation/parse failures.
+    try:
+        encoded = json.dumps(compact, separators=(",", ":"), sort_keys=True)
+        if len(encoded) > 420:
+            compact = {
+                "reason": compact.get("reason"),
+                "setup_done": compact.get("setup_done"),
+                "data_only": compact.get("data_only"),
+                "counts": compact.get("counts"),
+                "artifact_files": compact.get("artifact_files"),
+                "detection_count": compact.get("detection_count"),
+                "paired_count": compact.get("paired_count"),
+            }
+    except Exception:
+        pass
 
     return compact
 
@@ -99,6 +135,8 @@ def handle_connect_one(char, data):
         "allowed": data.get("allowed", []),
         "settings": data.get("settings", {}).get(mac, {}),
     }
+    if payload["friendly_name"]:
+        register_device_label(mac, payload["friendly_name"])
     logger.info("Queuing CONNECT_ONE %s", payload)
     if service:
         service.submit(Intent.CONNECT_ONE, payload)
@@ -124,6 +162,7 @@ def handle_set_latency(char, data):
     latency = data.get("latency")
     if mac is None or latency is None:
         return _encode(Msg.ERROR, {"error": "Missing mac/latency"})
+    label = format_device_label(mac)
     if is_sonos(mac):
         # Sonos: store desired latency for future use; no-op for v1
         return _encode(Msg.SUCCESS, {"latency": latency})
@@ -134,7 +173,7 @@ def handle_set_latency(char, data):
     if ok:
         if char.connection_service:
             char.connection_service.loopbacks.add(mac)
-            logger.info("✅ Added %s to loopbacks set after latency update", mac)
+            logger.info("✅ Added %s to loopbacks set after latency update", label)
         return _encode(Msg.SUCCESS, {"latency": latency, "actuation": _compact_single_output_snapshot(snapshot)})
     return _encode(Msg.ERROR, {"error": "stage delay update failed"})
 
@@ -250,19 +289,30 @@ def handle_wifi_scan_start(char, _):
 
 
 def _run_ultrasonic_sync_worker(char):
-    """Run end-to-end setup calibration in background and notify when done."""
+    """Run startup probe phase-1 (data-only) in background and notify when done."""
     try:
-        from syncsonic_ble.helpers.latency_setup import run_end_to_end_setup
+        from syncsonic_ble.helpers.latency_setup import run_startup_probe_phase1
 
-        ok, details = run_end_to_end_setup()
+        connected_ids = []
+        if getattr(char, "device_manager", None):
+            connected_ids = list(char.device_manager._all_connected())
+        
+        def _request_phone_beep(step: dict) -> bool:
+            char.send_notification(Msg.SUCCESS, {"probe_beep_request": step})
+            return True
+
+        ok, details = run_startup_probe_phase1(
+            connected_ids=connected_ids,
+            playback_callback=_request_phone_beep,
+        )
         char.send_notification(Msg.SUCCESS, {
             "ultrasonic_sync_done": True,
             "success": ok,
-            "message": "Setup calibration completed." if ok else "Setup calibration failed.",
+            "message": "Startup probe completed." if ok else "Startup probe completed with gaps.",
             "actuation": _compact_actuation_payload(details),
         })
     except Exception as e:
-        logger.exception("End-to-end setup calibration failed: %s", e)
+        logger.exception("Startup probe phase-1 failed: %s", e)
         char.send_notification(Msg.SUCCESS, {
             "ultrasonic_sync_done": True,
             "success": False,
@@ -274,7 +324,55 @@ def handle_ultrasonic_sync(char, _):
     """Queue one end-to-end setup calibration cycle; result is sent via notification."""
     t = threading.Thread(target=_run_ultrasonic_sync_worker, args=(char,), daemon=True)
     t.start()
-    return _encode(Msg.SUCCESS, {"queued": True, "message": "Setup calibration started."})
+    return _encode(Msg.SUCCESS, {"queued": True, "message": "Startup probe started."})
+
+
+def handle_startup_probe_begin(_char, data):
+    from syncsonic_ble.helpers.latency_setup import begin_frontend_probe_session
+
+    raw_targets = data.get("targets", [])
+    targets = [str(x) for x in raw_targets] if isinstance(raw_targets, list) else []
+    ok, details = begin_frontend_probe_session(targets)
+    if ok:
+        return _encode(Msg.SUCCESS, {"probe_begin": True, **details})
+    return _encode(Msg.ERROR, {"probe_begin": False, **details})
+
+
+def handle_startup_probe_step(_char, data):
+    from syncsonic_ble.helpers.latency_setup import mark_frontend_probe_step
+
+    target_id = data.get("target_id")
+    speaker = data.get("speaker")
+    ok, details = mark_frontend_probe_step(str(target_id or ""), str(speaker or ""))
+    if ok:
+        return _encode(Msg.SUCCESS, {"probe_step": True, **details})
+    return _encode(Msg.ERROR, {"probe_step": False, **details})
+
+
+def _run_startup_probe_finish_worker(char):
+    from syncsonic_ble.helpers.latency_setup import finish_frontend_probe_session
+
+    try:
+        ok, details = finish_frontend_probe_session()
+        char.send_notification(Msg.SUCCESS, {
+            "ultrasonic_sync_done": True,
+            "success": ok,
+            "message": "Startup probe completed." if ok else "Startup probe completed with gaps.",
+            "actuation": _compact_actuation_payload(details),
+        })
+    except Exception as e:
+        logger.exception("Startup probe finish failed: %s", e)
+        char.send_notification(Msg.SUCCESS, {
+            "ultrasonic_sync_done": True,
+            "success": False,
+            "message": str(e),
+        })
+
+
+def handle_startup_probe_finish(char, _data):
+    t = threading.Thread(target=_run_startup_probe_finish_worker, args=(char,), daemon=True)
+    t.start()
+    return _encode(Msg.SUCCESS, {"queued": True, "message": "Startup probe finish queued."})
 
 
 # -------------------------------------------------------------------------
@@ -291,6 +389,9 @@ HANDLERS = {
     Msg.GET_PAIRED_DEVICES: handle_get_paired,
     Msg.SET_MUTE: handle_set_mute,
     Msg.ULTRASONIC_SYNC: handle_ultrasonic_sync,
+    Msg.STARTUP_PROBE_BEGIN: handle_startup_probe_begin,
+    Msg.STARTUP_PROBE_STEP: handle_startup_probe_step,
+    Msg.STARTUP_PROBE_FINISH: handle_startup_probe_finish,
     Msg.SCAN_START: _scan_start,
     Msg.SCAN_STOP: _scan_stop,
     Msg.WIFI_SCAN_START: handle_wifi_scan_start,

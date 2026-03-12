@@ -46,6 +46,7 @@ from syncsonic_ble.state_change.action_request_handlers import (
     HANDLERS as _HANDLERS,
     unknown_handler as _UNKNOWN_HANDLER,
 )
+from syncsonic_ble.helpers.device_labels import format_device_label
 
 log = get_logger(__name__)
 
@@ -187,13 +188,8 @@ class Characteristic(dbus.service.Object, DBusPathMixin):
         # 1) Encode → bytes
         data = self._encode(msg_type, payload)
 
-        # 2) Log for full visibility
-        log.info(
-            "→ [BLE Notify] type=%s(0x%02x) payload=%s",
-            msg_type.name,
-            msg_type.value,
-            payload,
-        )
+        # 2) Keep BLE notify logging compact to avoid flooding journals.
+        log.debug("→ [BLE Notify] type=%s(0x%02x)", msg_type.name, msg_type.value)
 
         # 3) Fire if client subscribes
         if self.notifying:
@@ -233,8 +229,6 @@ class Characteristic(dbus.service.Object, DBusPathMixin):
 
     @dbus.service.method(GATT_CHRC_IFACE, in_signature="aya{sv}")
     def WriteValue(self, value, options):  # noqa: N802 – DBus naming
-        log.info("💥 Backend WriteValue fired! raw value=%s options=%s", value, options)
-
         # CCCD write? (enable/disable notifications)
         if len(value) == 2 and value[0] == 0x01:
             self.notifying = (value[1] == 0x01)
@@ -248,6 +242,7 @@ class Characteristic(dbus.service.Object, DBusPathMixin):
 
         # Normal command --------------------------------------------------
         msg_type, data = self._decode(value)
+        self._log_ble_command(msg_type, data)
         handler = _HANDLERS.get(msg_type, _UNKNOWN_HANDLER)
 
         response = handler(self, data)
@@ -274,11 +269,55 @@ class Characteristic(dbus.service.Object, DBusPathMixin):
             if len(value) == 1:
                 return msg, {}
             data = json.loads(bytes(value[1:]).decode())
-            log.info("🧩 Decoded msg_type=%s, data=%s", msg, data)
             return msg, data
         except Exception as exc:
             log.error("decode error: %s", exc)
             return Msg.ERROR, {"error": str(exc)}
+
+    def _log_ble_command(self, msg_type: Msg, data: Dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            log.info("[BLE Cmd] type=%s", msg_type.name)
+            return
+        if msg_type is Msg.SET_LATENCY:
+            mac = data.get("mac")
+            log.info(
+                "[BLE Cmd] type=%s speaker=%s latency=%s",
+                msg_type.name,
+                format_device_label(mac) if mac else "",
+                data.get("latency"),
+            )
+            return
+        if msg_type is Msg.SET_VOLUME:
+            mac = data.get("mac")
+            log.info(
+                "[BLE Cmd] type=%s speaker=%s volume=%s balance=%s",
+                msg_type.name,
+                format_device_label(mac) if mac else "",
+                data.get("volume"),
+                data.get("balance"),
+            )
+            return
+        if msg_type is Msg.CONNECT_ONE:
+            target = data.get("targetSpeaker", {})
+            mac = target.get("mac") if isinstance(target, dict) else None
+            name = target.get("name") if isinstance(target, dict) else None
+            if mac:
+                label = format_device_label(mac)
+            elif name:
+                label = str(name)
+            else:
+                label = ""
+            log.info("[BLE Cmd] type=%s target=%s", msg_type.name, label)
+            return
+        if msg_type is Msg.DISCONNECT:
+            mac = data.get("mac")
+            log.info(
+                "[BLE Cmd] type=%s speaker=%s",
+                msg_type.name,
+                format_device_label(mac) if mac else "",
+            )
+            return
+        log.info("[BLE Cmd] type=%s keys=%s", msg_type.name, sorted(data.keys()))
 
     # ------------------------------------------------------------------
     # Notify start/stop ---------------------------------------------------

@@ -1,12 +1,22 @@
 from syncsonic_ble.utils.logging_conf import get_logger
 from syncsonic_ble.helpers.adapter_helpers import device_path_on_adapter
+from syncsonic_ble.helpers.device_labels import format_device_label
 import os
 import dbus
+
 logger = get_logger(__name__)
 
-reserved = os.getenv("RESERVED_HCI")
-if not reserved:
-    raise RuntimeError("RESERVED_HCI not set – cannot pick phone adapter")
+reserved_hci = (os.getenv("RESERVED_HCI") or "").strip()
+reserved_mac = (os.getenv("RESERVED_ADAPTER_MAC") or "").strip().upper()
+if not reserved_hci and not reserved_mac:
+    raise RuntimeError("Either RESERVED_ADAPTER_MAC or RESERVED_HCI must be set")
+
+
+def _is_reserved_adapter(path: str, adapter_addr: str) -> bool:
+    if reserved_mac:
+        return adapter_addr.upper() == reserved_mac
+    return path.split("/")[-1] == reserved_hci
+
 
 def connect_one_plan(target_mac: str, allowed_macs: list[str], objects: dict) -> tuple[str, str, list[tuple[str, str]]]:
     """
@@ -14,17 +24,6 @@ def connect_one_plan(target_mac: str, allowed_macs: list[str], objects: dict) ->
     - If already connected correctly, returns 'already_connected'.
     - If needs connection and a controller is available, returns 'needs_connection'.
     - If no suitable controllers are available, returns 'error'.
-
-    Args:   
-        target_mac (str): The MAC address of the target device.
-        allowed_macs (list[str]): The list of allowed speaker MACs.
-        objects (dict): The D-Bus object tree from GetManagedObjects().
-
-    Returns:
-        tuple[str, str, list[tuple[str, str]]]:
-            - Status string ('already_connected', 'needs_connection', or 'error')
-            - Controller MAC address to use (if applicable)
-            - List of (device_mac, controller_mac) tuples to disconnect
     """
     target_mac = target_mac.upper()
     allowed_macs = [mac.upper() for mac in allowed_macs]
@@ -38,13 +37,12 @@ def connect_one_plan(target_mac: str, allowed_macs: list[str], objects: dict) ->
     for path, ifaces in objects.items():
         if "org.bluez.Adapter1" in ifaces:
             addr = ifaces["org.bluez.Adapter1"].get("Address", "").upper()
-            hci_name = path.split("/")[-1]
-            if hci_name == reserved:
-                continue  # Skip reserved adapter
+            if _is_reserved_adapter(path, addr):
+                continue  # Skip reserved phone adapter
             adapters[addr] = path
 
-    logger.info(f"Planning connection for target: {target_mac}")
-    logger.info(f"Allowed MACs in config: {allowed_macs}")
+    logger.info("Planning connection for target: %s", format_device_label(target_mac))
+    logger.info("Allowed MACs in config: %s", allowed_macs)
 
     # Analyze all devices
     for path, ifaces in objects.items():
@@ -61,36 +59,46 @@ def connect_one_plan(target_mac: str, allowed_macs: list[str], objects: dict) ->
                 break
 
         if not ctrl_mac:
-            continue  # This device does not belong to a recognized adapter
+            continue
 
         if dev.get("Connected", False):
-            logger.info(f"Found connected device: {dev_mac} on {ctrl_mac}")
+            logger.info("Found connected device: %s on %s", format_device_label(dev_mac), ctrl_mac)
 
             if dev_mac in allowed_macs:
                 config_speaker_usage.setdefault(dev_mac, []).append(ctrl_mac)
 
             if dev_mac == target_mac:
                 target_connected_on.append(ctrl_mac)
-                logger.info(f"Target {dev_mac} already connected on {ctrl_mac}")
+                logger.info("Target %s already connected on %s", format_device_label(dev_mac), ctrl_mac)
 
             elif dev_mac not in allowed_macs:
                 disconnect_list.append((dev_mac, ctrl_mac))
-                logger.info(f"Out-of-config device {dev_mac} → marked for disconnection")
+                logger.info(
+                    "Out-of-config device %s -> marked for disconnection",
+                    format_device_label(dev_mac),
+                )
 
             elif dev_mac in allowed_macs:
                 used_controllers.add(ctrl_mac)
-                logger.info(f"Config speaker {dev_mac} occupies controller {ctrl_mac}")
+                logger.info(
+                    "Config speaker %s occupies controller %s",
+                    format_device_label(dev_mac),
+                    ctrl_mac,
+                )
 
-    logger.info(f"Target is currently connected on: {target_connected_on}")
-    logger.info(f"Disconnect list built: {disconnect_list}")
-    logger.info(f"Controllers in use by config devices: {used_controllers}")
+    logger.info("Target is currently connected on: %s", target_connected_on)
+    logger.info("Disconnect list built: %s", disconnect_list)
+    logger.info("Controllers in use by config devices: %s", used_controllers)
 
     # Handle multiple connections of target
     if len(target_connected_on) > 1:
         controller_to_keep = target_connected_on[0]
         for ctrl_mac in target_connected_on[1:]:
             disconnect_list.append((target_mac, ctrl_mac))
-        logger.info(f"Target connected on multiple controllers, keeping {controller_to_keep}, disconnecting others")
+        logger.info(
+            "Target connected on multiple controllers, keeping %s, disconnecting others",
+            controller_to_keep,
+        )
         return "already_connected", controller_to_keep, disconnect_list
 
     # Target connected once: ensure it's not sharing with another config speaker
@@ -99,12 +107,17 @@ def connect_one_plan(target_mac: str, allowed_macs: list[str], objects: dict) ->
         for mac, controllers in config_speaker_usage.items():
             if mac != target_mac and controller in controllers:
                 disconnect_list.append((target_mac, controller))
-                logger.info(f"Target {target_mac} shares controller {controller} with config speaker {mac}, reallocating")
+                logger.info(
+                    "Target %s shares controller %s with config speaker %s, reallocating",
+                    target_mac,
+                    controller,
+                    mac,
+                )
 
                 # Try to find a free controller
                 for new_ctrl_mac in adapters:
                     if new_ctrl_mac not in used_controllers and new_ctrl_mac != controller:
-                        logger.info(f"Assigning free controller {new_ctrl_mac} to target {target_mac}")
+                        logger.info("Assigning free controller %s to target %s", new_ctrl_mac, target_mac)
                         return "needs_connection", new_ctrl_mac, disconnect_list
 
                 # Fallback: free a duplicate
@@ -112,10 +125,10 @@ def connect_one_plan(target_mac: str, allowed_macs: list[str], objects: dict) ->
                     if len(controllers2) > 1:
                         ctrl_to_free = controllers2[1]
                         disconnect_list.append((mac2, ctrl_to_free))
-                        logger.info(f"Freeing {ctrl_to_free} from {mac2} to connect target {target_mac}")
+                        logger.info("Freeing %s from %s to connect target %s", ctrl_to_free, mac2, target_mac)
                         return "needs_connection", ctrl_to_free, disconnect_list
 
-                logger.info(f"No controller available after rebalance for target {target_mac}")
+                logger.info("No controller available after rebalance for target %s", target_mac)
                 return "error", "", disconnect_list
 
         return "already_connected", controller, disconnect_list
@@ -123,36 +136,37 @@ def connect_one_plan(target_mac: str, allowed_macs: list[str], objects: dict) ->
     # Target is not currently connected anywhere
     for ctrl_mac in adapters:
         if ctrl_mac not in used_controllers:
-            logger.info(f"Free controller {ctrl_mac} found for target {target_mac}")
+            logger.info("Free controller %s found for target %s", ctrl_mac, target_mac)
             return "needs_connection", ctrl_mac, disconnect_list
 
     for mac, controllers in config_speaker_usage.items():
         if len(controllers) > 1:
             ctrl_to_free = controllers[1]
             disconnect_list.append((mac, ctrl_to_free))
-            logger.info(f"Freeing controller {ctrl_to_free} from {mac} to connect target {target_mac}")
+            logger.info("Freeing controller %s from %s to connect target %s", ctrl_to_free, mac, target_mac)
             return "needs_connection", ctrl_to_free, disconnect_list
 
-    logger.info(f"No available controller found for target {target_mac}")
+    logger.info("No available controller found for target %s", target_mac)
     return "error", "", disconnect_list
+
 
 def analyze_device(bus, adapter_mac: str, dev_mac: str) -> str:
     om = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
     objects = om.GetManagedObjects()
 
-    # Locate the Device1 dictionary for this mac *on the chosen adapter*
+    # Locate the Device1 dictionary for this mac on the chosen adapter
     dev_path = device_path_on_adapter(bus, adapter_mac, dev_mac)
     dev = objects.get(dev_path, {}).get("org.bluez.Device1", {})
 
-    if not dev:                       # nothing there → must discover
+    if not dev:
         return "run_discovery"
 
-    paired     = dev.get("Paired",   False)
-    trusted    = dev.get("Trusted",  False)
-    connected  = dev.get("Connected",False)
-    uuids      = dev.get("UUIDs",    [])
+    paired = dev.get("Paired", False)
+    trusted = dev.get("Trusted", False)
+    connected = dev.get("Connected", False)
+    uuids = dev.get("UUIDs", [])
 
-    has_audio  = any("110b" in u.lower() for u in uuids)  # A2DP/AVRCP
+    has_audio = any("110b" in u.lower() for u in uuids)  # A2DP/AVRCP
 
     if connected and has_audio:
         return "already_connected"
@@ -163,3 +177,4 @@ def analyze_device(bus, adapter_mac: str, dev_mac: str) -> str:
     if paired and trusted and not connected:
         return "connect"
     return "run_discovery"
+

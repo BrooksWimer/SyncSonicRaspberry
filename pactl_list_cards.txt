@@ -1,0 +1,128 @@
+Card #0
+	Name: alsa_card.usb-Jieli_Technology_UACDemoV1.0_4150333035313213-00
+	Driver: module-alsa-card.c
+	Owner Module: 6
+	Properties:
+		alsa.card = "3"
+		alsa.card_name = "UACDemoV1.0"
+		alsa.long_card_name = "Jieli Technology UACDemoV1.0 at usb-0000:01:00.0-1.4, full speed"
+		alsa.driver_name = "snd_usb_audio"
+		device.bus_path = "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.4:1.0"
+		sysfs.path = "/devices/platform/scb/fd500000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0/usb1/1-1/1-1.4/1-1.4:1.0/sound/card3"
+		udev.id = "usb-Jieli_Technology_UACDemoV1.0_4150333035313213-00"
+		device.bus = "usb"
+		device.vendor.id = "4c4a"
+		device.vendor.name = "Jieli Technology"
+		device.product.id = "4155"
+		device.product.name = "UACDemoV1.0"
+		device.serial = "Jieli_Technology_UACDemoV1.0_4150333035313213"
+		device.string = "3"
+		device.description = "UACDemoV1.0"
+		module-udev-detect.discovered = "1"
+		device.icon_name = "audio-card-usb"
+	Profiles:
+		input:mono-fallback: Mono Input (sinks: 0, sources: 1, priority: 1, available: yes)
+		off: Off (sinks: 0, sources: 0, priority: 0, available: yes)
+	Active Profile: input:mono-fallback
+	Ports:
+		analog-input-mic: Microphone (type: Mic, priority: 8700, latency offset: 0 usec, availability unknown)
+			Properties:
+				device.icon_name = "audio-input-microphone"
+			Part of profile(s): input:mono-fallback
+
+Card #1
+	Name: alsa_card.platform-fe00b840.mailbox
+	Driver: module-alsa-card.c
+	Owner Module: 7
+	Properties:
+		alsa.card = "2"
+		alsa.card_name = "bcm2835 Headphones"
+		alsa.long_card_name = "bcm2835 Headphones"
+		device.bus_path = "platform-fe00b840.mailbox"
+		sysfs.path = "/devices/platform/soc/fe00b840.mailbox/bcm2835-audio/sound/card2"
+		device.form_factor = "internal"
+		device.string = "2"
+		device.description = "Built-in Audio"
+		module-udev-detect.discovered = "1"
+		device.icon_name = "audio-card"
+	Profiles:
+		output:stereo-fallback: Stereo Output (sinks: 1, sources: 0, priority: 5100, available: yes)
+		off: Off (sinks: 0, sources: 0, priority: 0, available: yes)
+	Active Profile: output:stereo-fallback
+	Ports:
+		analog-output: Analog Output (type: Analog, priority: 9900, latency offset: 0 usec, availability unknown)
+			Part of profile(s): output:stereo-fallback
+
+Card #2
+	Name: bluez_card.AC_DF_A1_52_8A_41
+	Driver: module-bluez5-device.c
+	Owner Module: 26
+	Properties:
+		device.description = "Brooks"
+		device.string = "AC:DF:A1:52:8A:41"
+		device.api = "bluez"
+		device.class = "sound"
+		device.bus = "bluetooth"
+		device.form_factor = "phone"
+		bluez.path = "/org/bluez/hci3/dev_AC_DF_A1_52_8A_41"
+		bluez.class = "0x7a020c"
+		bluez.alias = "Brooks"
+		device.icon_name = "audio-card-bluetooth"
+	Profiles:
+		a2dp_source: High Fidelity Capture (A2DP Source) (sinks: 0, sources: 1, priority: 20, available: yes)
+		off: Off (sinks: 0, sources: 0, priority: 0, available: yes)
+	Active Profile: off
+	Ports:
+		phone-output: Phone (type: Phone, priority: 0, latency offset: 0 usec, not available)
+		phone-input: Phone (type: Phone, priority: 0, latency offset: 0 usec, availability unknown)
+			Part of profile(s): a2dp_source
+
+Card #4
+	Name: bluez_card.28_FA_19_B6_0E_3B
+	Driver: module-bluez5-device.c
+	Owner Module: 30
+	Properties:
+		device.description = "JBL Flip 6"
+		device.string = "28:FA:19:B6:0E:3B"
+		device.api = "bluez"
+		device.class = "sound"
+		device.bus = "bluetooth"
+		device.form_factor = "speaker"
+		bluez.path = "/org/bluez/hci1/dev_28_FA_19_B6_0E_3B"
+		bluez.class = "0x240414"
+		bluez.alias = "JBL Flip 6"
+		device.icon_name = "audio-speakers-bluetooth"
+		bluetooth.codec = "sbc"
+	Profiles:
+		a2dp_sink: High Fidelity Playback (A2DP Sink) (sinks: 1, sources: 0, priority: 40, available: yes)
+		off: Off (sinks: 0, sources: 0, priority: 0, available: yes)
+	Active Profile: a2dp_sink
+	Ports:
+		speaker-output: Speaker (type: Speaker, priority: 0, latency offset: 120000 usec, available)
+			Part of profile(s): a2dp_sink
+		speaker-input: Bluetooth Input (type: Bluetooth, priority: 0, latency offset: 0 usec, not available)
+
+Card #5
+	Name: bluez_card.F4_6A_DD_D4_F3_C8
+	Driver: module-bluez5-device.c
+	Owner Module: 54
+	Properties:
+		device.description = "VIZIO SB2020n"
+		device.string = "F4:6A:DD:D4:F3:C8"
+		device.api = "bluez"
+		device.class = "sound"
+		device.bus = "bluetooth"
+		device.form_factor = "speaker"
+		bluez.path = "/org/bluez/hci0/dev_F4_6A_DD_D4_F3_C8"
+		bluez.class = "0x240414"
+		bluez.alias = "VIZIO SB2020n"
+		device.icon_name = "audio-speakers-bluetooth"
+		bluetooth.codec = "sbc"
+	Profiles:
+		a2dp_sink: High Fidelity Playback (A2DP Sink) (sinks: 1, sources: 0, priority: 40, available: yes)
+		off: Off (sinks: 0, sources: 0, priority: 0, available: yes)
+	Active Profile: a2dp_sink
+	Ports:
+		speaker-output: Speaker (type: Speaker, priority: 0, latency offset: 5000000 usec, available)
+			Part of profile(s): a2dp_sink
+		speaker-input: Bluetooth Input (type: Bluetooth, priority: 0, latency offset: 0 usec, not available)

@@ -13,6 +13,11 @@ multiple USB Bluetooth dongles are attached via a powered hub: one UART
 controller (embedded or on a HAT) advertises the BLE service, while the
 remaining adapters act as A2DP sinks that connect to speakers.
 
+> `foundation/neutral-minimal` intentionally strips Wi-Fi speaker support and
+> microphone-based auto-alignment so the branch can serve as a Bluetooth-only,
+> manual-delay foundation. Historical branches preserve those experiments for
+> later epic extraction.
+
 ---
 
 ## Features

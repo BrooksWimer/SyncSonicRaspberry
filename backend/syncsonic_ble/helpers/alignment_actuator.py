@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass
-from typing import Dict, Any
+from typing import Any, Dict
 
 
 @dataclass
 class OutputActuatorState:
     mac: str
     mode: str = "idle"
-    transport_delay_ms: float = 100.0
+    transport_delay_ms: float = 120.0
     delay_line_ms: float = 0.0
     target_delay_ms: float = 100.0
     applied_delay_ms: float = 100.0
@@ -21,19 +21,8 @@ class OutputActuatorState:
 
 
 class AlignmentActuatorEngine:
-    """Persistent actuator state that slews toward control targets.
+    """Translate manual delay targets into transport-base plus delay-line delay."""
 
-    This models the authoritative delay-line + bounded-rate behavior from the
-    research:
-    - relock jumps for large discontinuities
-    - bounded delay slewing during normal operation
-    - bounded rate slewing toward a small ppm target
-    """
-
-    LOCK_SLEW_MS_PER_SEC = 1.0
-    ACQUIRE_SLEW_MS_PER_SEC = 6.0
-    RATE_SLEW_PPM_PER_SEC = 120.0
-    RESYNC_THRESHOLD_MS = 30.0
     TRANSPORT_BASE_MS = 120.0
     MAX_DELAY_MS = 4000.0
 
@@ -41,7 +30,6 @@ class AlignmentActuatorEngine:
         self._states: Dict[str, OutputActuatorState] = {}
 
     def step(self, targets: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        now = time.monotonic()
         current_macs = {mac.upper() for mac in targets.keys()}
         for mac in list(self._states.keys()):
             if mac not in current_macs:
@@ -50,61 +38,25 @@ class AlignmentActuatorEngine:
         snapshots: Dict[str, Dict[str, Any]] = {}
         for mac, raw in targets.items():
             mac = mac.upper()
+            target_delay = self._clamp_delay(float(raw.get("delay_ms", self.TRANSPORT_BASE_MS)))
             state = self._states.get(mac)
             if state is None:
-                target_delay = self._clamp_delay(float(raw.get("delay_ms", self.TRANSPORT_BASE_MS)))
-                target_rate = float(raw.get("rate_ppm", 0.0))
-                state = OutputActuatorState(
-                    mac=mac,
-                    mode=str(raw.get("mode", "idle")),
-                    transport_delay_ms=self.TRANSPORT_BASE_MS,
-                    delay_line_ms=max(0.0, target_delay - self.TRANSPORT_BASE_MS),
-                    target_delay_ms=target_delay,
-                    applied_delay_ms=target_delay,
-                    target_rate_ppm=target_rate,
-                    applied_rate_ppm=target_rate,
-                    updated_at=now,
-                )
+                state = OutputActuatorState(mac=mac)
                 self._states[mac] = state
-                snapshots[mac] = asdict(state)
-                continue
 
-            dt = max(0.0, now - state.updated_at)
-            self._apply_target(state, raw, dt)
-            state.updated_at = now
+            state.mode = str(raw.get("mode", "manual"))
+            state.transport_delay_ms = self.TRANSPORT_BASE_MS
+            state.target_delay_ms = target_delay
+            state.applied_delay_ms = target_delay
+            state.delay_line_ms = max(0.0, target_delay - self.TRANSPORT_BASE_MS)
+            state.target_rate_ppm = 0.0
+            state.applied_rate_ppm = 0.0
+            state.relock_events = 0
+            state.correction_events = 0
+            state.updated_at = time.monotonic()
             snapshots[mac] = asdict(state)
 
         return snapshots
-
-    def _apply_target(self, state: OutputActuatorState, raw: Dict[str, Any], dt: float) -> None:
-        state.mode = str(raw.get("mode", state.mode))
-        target_delay = self._clamp_delay(float(raw.get("delay_ms", state.target_delay_ms)))
-        target_rate = float(raw.get("rate_ppm", state.target_rate_ppm))
-        state.target_delay_ms = target_delay
-        state.target_rate_ppm = target_rate
-
-        relock = "relock" in state.mode or abs(target_delay - state.applied_delay_ms) >= self.RESYNC_THRESHOLD_MS
-        if relock:
-            state.applied_delay_ms = target_delay
-            state.delay_line_ms = max(0.0, state.applied_delay_ms - state.transport_delay_ms)
-            state.applied_rate_ppm = target_rate
-            state.relock_events += 1
-            state.correction_events += 1
-            return
-
-        slew_rate = self.ACQUIRE_SLEW_MS_PER_SEC if "acquire" in state.mode else self.LOCK_SLEW_MS_PER_SEC
-        max_delay_step = max(0.0, dt * slew_rate)
-        delay_error = target_delay - state.applied_delay_ms
-        delay_step = max(-max_delay_step, min(max_delay_step, delay_error))
-        if abs(delay_step) > 0.0:
-            state.correction_events += 1
-        state.applied_delay_ms = self._clamp_delay(state.applied_delay_ms + delay_step)
-        state.delay_line_ms = max(0.0, state.applied_delay_ms - state.transport_delay_ms)
-
-        max_rate_step = max(0.0, dt * self.RATE_SLEW_PPM_PER_SEC)
-        rate_error = target_rate - state.applied_rate_ppm
-        rate_step = max(-max_rate_step, min(max_rate_step, rate_error))
-        state.applied_rate_ppm += rate_step
 
     def _clamp_delay(self, value: float) -> float:
         return max(self.TRANSPORT_BASE_MS, min(self.MAX_DELAY_MS, float(value)))

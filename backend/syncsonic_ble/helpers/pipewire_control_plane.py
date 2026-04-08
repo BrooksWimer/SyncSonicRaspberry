@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from typing import Dict, Any
+from typing import Any, Dict
 
 from syncsonic_ble.utils.logging_conf import get_logger
 
@@ -24,7 +24,7 @@ def _load_state() -> Dict[str, Any]:
         state.setdefault("schema", 1)
         state.setdefault("outputs", {})
         return state
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.warning("Failed to read PipeWire control state: %s", exc)
         return {"schema": 1, "outputs": {}}
 
@@ -51,31 +51,27 @@ def publish_output_control(
     current = outputs.get(mac, {})
     if not isinstance(current, dict):
         current = {}
-    current.update({
-        "delay_ms": round(float(delay_ms), 3),
-        "rate_ppm": round(float(rate_ppm), 3),
-        "mode": str(mode),
-        "active": bool(active),
-    })
+    current.update(
+        {
+            "delay_ms": round(float(delay_ms), 3),
+            "rate_ppm": 0.0,
+            "mode": str(mode),
+            "active": bool(active),
+        }
+    )
     outputs[mac] = current
     _write_state(state)
     log.info(
-        "PipeWire control-plane publish %s -> delay=%.3f ms rate=%.3f ppm mode=%s active=%s",
+        "PipeWire control publish %s -> delay=%.3f ms mode=%s active=%s",
         mac,
         float(delay_ms),
-        float(rate_ppm),
         mode,
         active,
     )
     return CONTROL_STATE_PATH
 
 
-def publish_output_mix(
-    mac: str,
-    *,
-    left_percent: int,
-    right_percent: int,
-) -> str:
+def publish_output_mix(mac: str, *, left_percent: int, right_percent: int) -> str:
     mac = mac.upper()
     state = _load_state()
     outputs = state.setdefault("outputs", {})
@@ -84,7 +80,7 @@ def publish_output_mix(
         current = {}
     current.setdefault("delay_ms", 100.0)
     current.setdefault("rate_ppm", 0.0)
-    current.setdefault("mode", "idle")
+    current.setdefault("mode", "manual")
     current.setdefault("active", True)
     current["left_percent"] = int(max(0, min(150, left_percent)))
     current["right_percent"] = int(max(0, min(150, right_percent)))
@@ -105,7 +101,7 @@ def clear_output_control(mac: str) -> str:
     outputs = state.setdefault("outputs", {})
     outputs.pop(mac, None)
     _write_state(state)
-    log.info("PipeWire control-plane cleared %s", mac)
+    log.info("PipeWire control cleared %s", mac)
     return CONTROL_STATE_PATH
 
 

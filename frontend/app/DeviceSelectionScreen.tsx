@@ -12,7 +12,7 @@ import { useRouter, useLocalSearchParams } from 'expo-router';
 import {
   create_configuration,
   addSpeaker,
-  updateSpeakerConnectionStatus
+  updateSpeakerConnectionStatus,
 } from '@/utils/database';
 import { H1, useThemeName, YStack, View } from 'tamagui';
 import { useBLEContext } from '../contexts/BLEContext';
@@ -20,8 +20,7 @@ import { BottomButton } from '@/components/buttons/BottomButton';
 import {
   startScanDevices,
   stopScanDevices,
-  startWifiScan,
-  fetchPairedDevices
+  fetchPairedDevices,
 } from '../utils/ble_functions';
 import { TopBar } from '@/components/topbar-variants/TopBar';
 import { Body } from '@/components/texts/BodyText';
@@ -34,10 +33,15 @@ type SpeakerDevice = {
 };
 
 export default function DeviceSelectionScreen() {
-  const params = useLocalSearchParams<{ configID: string; configName: string; deviceType?: string }>();
+  const params = useLocalSearchParams<{
+    configID: string;
+    configName: string;
+    deviceType?: string;
+  }>();
   const configName = params.configName || 'Unnamed Configuration';
   const configID = Number(params.configID);
-  const deviceType = (params.deviceType === 'wifi' ? 'wifi' : 'bluetooth') as 'bluetooth' | 'wifi';
+  const deviceType =
+    params.deviceType === 'wifi' ? 'wifi' : 'bluetooth';
   const isEditing = !isNaN(configID) && configID > 0;
 
   const themeName = useThemeName();
@@ -53,49 +57,56 @@ export default function DeviceSelectionScreen() {
     scannedDevices,
     wifiScannedDevices,
     clearWifiScannedDevices,
-    pairedDevices
+    pairedDevices,
   } = useBLEContext();
 
   const [scanLoading, setScanLoading] = useState(true);
   const [pairedLoading, setPairedLoading] = useState(true);
-  const [selectedScanned, setSelectedScanned] = useState<Record<string, SpeakerDevice>>({});
-  const [selectedSaved, setSelectedSaved] = useState<Record<string, SpeakerDevice>>({});
+  const [selectedScanned, setSelectedScanned] = useState<
+    Record<string, SpeakerDevice>
+  >({});
+  const [selectedSaved, setSelectedSaved] = useState<
+    Record<string, SpeakerDevice>
+  >({});
   const [scanError, setScanError] = useState<string | null>(null);
   const [pairedError, setPairedError] = useState<string | null>(null);
 
   const router = useRouter();
 
-  // Start scan on mount; stop on unmount (BT or Wi‑Fi depending on deviceType)
+  // Wi-Fi stays visible in the UI so future epic work has a home, but the
+  // neutral foundation only allows Bluetooth speaker discovery.
   const startScanning = useCallback(async () => {
     if (!connectedDevice) return;
-    
+
     setScanLoading(true);
     setScanError(null);
-    
+
+    if (deviceType === 'wifi') {
+      clearWifiScannedDevices();
+      setScanLoading(false);
+      setScanError(
+        'Wi-Fi speaker support is disabled on the neutral foundation branch.'
+      );
+      return;
+    }
+
     try {
-      if (deviceType === 'wifi') {
-        clearWifiScannedDevices();
-        console.log("Starting Wi‑Fi (Sonos) scan...");
-        await startWifiScan(connectedDevice);
-      } else {
-        console.log("Starting scan for Bluetooth devices...");
-        await startScanDevices(connectedDevice);
-      }
+      console.log('Starting scan for Bluetooth devices...');
+      await startScanDevices(connectedDevice);
     } catch (e) {
       console.error('Failed to start scan', e);
-      setScanError(deviceType === 'wifi' ? 'Could not start Wi‑Fi scan' : 'Could not start speaker scan');
+      setScanError('Could not start speaker scan');
     }
   }, [connectedDevice, deviceType, clearWifiScannedDevices]);
 
-  // Fetch paired devices (Bluetooth only)
   const fetchPairedDevicesFromPi = useCallback(async () => {
     if (!connectedDevice || deviceType === 'wifi') return;
-    
+
     setPairedLoading(true);
     setPairedError(null);
-    
+
     try {
-      console.log("Fetching paired devices...");
+      console.log('Fetching paired devices...');
       await fetchPairedDevices(connectedDevice);
     } catch (error) {
       console.error('Failed to fetch paired devices:', error);
@@ -105,10 +116,9 @@ export default function DeviceSelectionScreen() {
     }
   }, [connectedDevice, deviceType]);
 
-  // Setup notification handler and initialize
   useEffect(() => {
     if (!connectedDevice) return;
-    
+
     (async () => {
       try {
         await ensurePiNotifications(connectedDevice, handleNotification);
@@ -123,103 +133,112 @@ export default function DeviceSelectionScreen() {
         Alert.alert('Error', 'Could not set up device communication');
       }
     })();
-    
+
     return () => {
       if (connectedDevice && deviceType === 'bluetooth') {
-        stopScanDevices(connectedDevice).catch(e =>
+        stopScanDevices(connectedDevice).catch((e) =>
           console.error('Error stopping scan on unmount:', e)
         );
       }
     };
-  }, [connectedDevice, deviceType]);
+  }, [connectedDevice, deviceType, ensurePiNotifications, handleNotification, startScanning, fetchPairedDevicesFromPi]);
 
-  // When the first scan results arrive, stop loading
-  const displayScanList = deviceType === 'wifi' ? wifiScannedDevices : scannedDevices;
+  const displayScanList =
+    deviceType === 'wifi' ? wifiScannedDevices : scannedDevices;
+
   useEffect(() => {
     if (deviceType === 'wifi') {
-      if (wifiScannedDevices && wifiScannedDevices.length > 0 && scanLoading) setScanLoading(false);
-      // Also stop loading after a short delay if no devices (Wi‑Fi scan is one-shot)
-      const t = setTimeout(() => { if (scanLoading) setScanLoading(false); }, 8000);
-      return () => clearTimeout(t);
+      if (wifiScannedDevices.length > 0 && scanLoading) setScanLoading(false);
+      const timer = setTimeout(() => {
+        if (scanLoading) setScanLoading(false);
+      }, 8000);
+      return () => clearTimeout(timer);
     }
-    if (scannedDevices && scannedDevices.length > 0 && scanLoading) setScanLoading(false);
+
+    if (scannedDevices.length > 0 && scanLoading) setScanLoading(false);
   }, [deviceType, scannedDevices, wifiScannedDevices, scanLoading]);
 
-  // Stop paired loading when context updates
   useEffect(() => {
     if (pairedLoading && pairedDevices.length >= 0) {
       setPairedLoading(false);
     }
   }, [pairedDevices, pairedLoading]);
 
-  const toggleScanned = (d: SpeakerDevice) =>
-    setSelectedScanned(prev => {
-      const copy = { ...prev };
-      if (copy[d.mac]) delete copy[d.mac];
-      else copy[d.mac] = d;
-      return copy;
+  const toggleScanned = (device: SpeakerDevice) =>
+    setSelectedScanned((prev) => {
+      const next = { ...prev };
+      if (next[device.mac]) delete next[device.mac];
+      else next[device.mac] = device;
+      return next;
     });
 
-  const toggleSaved = (d: SpeakerDevice) =>
-    setSelectedSaved(prev => {
-      const copy = { ...prev };
-      if (copy[d.mac]) delete copy[d.mac];
-      else copy[d.mac] = d;
-      return copy;
+  const toggleSaved = (device: SpeakerDevice) =>
+    setSelectedSaved((prev) => {
+      const next = { ...prev };
+      if (next[device.mac]) delete next[device.mac];
+      else next[device.mac] = device;
+      return next;
     });
 
   const handleCreate = async () => {
     if (connectedDevice && deviceType === 'bluetooth') {
       await stopScanDevices(connectedDevice);
     }
+
     const combined = [
       ...Object.values(selectedScanned),
-      ...(deviceType === 'bluetooth' ? Object.values(selectedSaved) : [])
+      ...(deviceType === 'bluetooth' ? Object.values(selectedSaved) : []),
     ];
+
     if (combined.length === 0) {
       Alert.alert('No speakers', 'Please select at least one speaker.');
       return;
     }
 
-    // If we're editing an existing configuration
     if (!isNaN(configID) && configID > 0) {
-      // Add new devices to existing configuration
-      combined.forEach(device => {
+      combined.forEach((device) => {
         addSpeaker(configID, device.name, device.mac);
         updateSpeakerConnectionStatus(configID, device.mac, false);
       });
     } else {
-      // Create new configuration
       const newId = create_configuration(configName, combined);
-      // Route back to config screen with new ID
-      router.replace({ 
-        pathname: '/settings/config', 
-        params: { 
-          configID: newId.toString(), 
-          configName 
-        } 
+      router.replace({
+        pathname: '/settings/config',
+        params: {
+          configID: newId.toString(),
+          configName,
+        },
       });
       return;
     }
 
-    // For existing configuration, route back to config screen with same ID
-    router.replace({ 
-      pathname: '/settings/config', 
-      params: { 
-        configID: configID.toString(), 
-        configName 
-      } 
+    router.replace({
+      pathname: '/settings/config',
+      params: {
+        configID: configID.toString(),
+        configName,
+      },
     });
   };
 
-  const renderItem = (item: SpeakerDevice, selectedMap: Record<string, any>, toggle: (d: SpeakerDevice) => void) => {
-    const isSel = Boolean(selectedMap[item.mac]);
+  const renderItem = (
+    item: SpeakerDevice,
+    selectedMap: Record<string, SpeakerDevice>,
+    toggle: (device: SpeakerDevice) => void
+  ) => {
+    const isSelected = Boolean(selectedMap[item.mac]);
     return (
       <TouchableOpacity
         onPress={() => toggle(item)}
-        style={[styles.deviceItem, { shadowColor: tc, borderColor: tc }, isSel && { backgroundColor: pc }]}
+        style={[
+          styles.deviceItem,
+          { shadowColor: tc, borderColor: tc },
+          isSelected && { backgroundColor: pc },
+        ]}
       >
-        <Text style={[styles.deviceName, isSel && styles.selectedText]}>{item.name}</Text>
+        <Text style={[styles.deviceName, isSelected && styles.selectedText]}>
+          {item.name}
+        </Text>
       </TouchableOpacity>
     );
   };
@@ -228,28 +247,36 @@ export default function DeviceSelectionScreen() {
     <View style={{ flex: 1, backgroundColor: bg }}>
       <YStack style={{ flex: 1 }}>
         <TopBar />
-        <Header title={"Select Speaker"}/>
+        <Header title="Select Speaker" />
 
         <View style={{ padding: 10, alignItems: 'center' }}>
           <H1 style={{ color: tc, fontFamily: 'Finlandica', fontSize: 18 }}>
-            {deviceType === 'wifi' ? 'Available Wi‑Fi Speakers' : 'Available Speakers'}
+            {deviceType === 'wifi'
+              ? 'Available Wi-Fi Speakers'
+              : 'Available Speakers'}
           </H1>
         </View>
 
         <FlatList
           data={displayScanList}
-          keyExtractor={(d: SpeakerDevice) => d.mac}
-          renderItem={({ item }: { item: SpeakerDevice }) => renderItem(item, selectedScanned, toggleScanned)}
+          keyExtractor={(device: SpeakerDevice) => device.mac}
+          renderItem={({ item }: { item: SpeakerDevice }) =>
+            renderItem(item, selectedScanned, toggleScanned)
+          }
           ListEmptyComponent={
             scanLoading ? (
               <View style={{ padding: 20, alignItems: 'center' }}>
                 <ActivityIndicator size="large" color={pc} />
               </View>
             ) : scanError ? (
-              <Text style={{ color: 'red', textAlign: 'center', padding: 10 }}>{scanError}</Text>
+              <Text style={{ color: 'red', textAlign: 'center', padding: 10 }}>
+                {scanError}
+              </Text>
             ) : (
               <Text style={{ textAlign: 'center', padding: 10 }}>
-                {deviceType === 'wifi' ? 'No Wi‑Fi devices found' : 'No devices found'}
+                {deviceType === 'wifi'
+                  ? 'No Wi-Fi devices found'
+                  : 'No devices found'}
               </Text>
             )
           }
@@ -259,7 +286,9 @@ export default function DeviceSelectionScreen() {
         {deviceType === 'bluetooth' && (
           <>
             <View style={{ padding: 10, alignItems: 'center' }}>
-              <H1 style={{ color: tc, fontFamily: 'Finlandica', fontSize: 18 }}>Paired Speakers</H1>
+              <H1 style={{ color: tc, fontFamily: 'Finlandica', fontSize: 18 }}>
+                Paired Speakers
+              </H1>
             </View>
 
             {pairedLoading ? (
@@ -271,15 +300,26 @@ export default function DeviceSelectionScreen() {
             ) : (
               <FlatList
                 data={pairedDevices}
-                keyExtractor={(d: SpeakerDevice) => d.mac}
-                renderItem={({ item }: { item: SpeakerDevice }) => renderItem(item, selectedSaved, toggleSaved)}
+                keyExtractor={(device: SpeakerDevice) => device.mac}
+                renderItem={({ item }: { item: SpeakerDevice }) =>
+                  renderItem(item, selectedSaved, toggleSaved)
+                }
                 ListEmptyComponent={
-                  <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', paddingVertical: 20 }}>
+                  <View
+                    style={{
+                      flex: 1,
+                      justifyContent: 'center',
+                      alignItems: 'center',
+                      paddingVertical: 20,
+                    }}
+                  >
                     <Body>No paired speakers found</Body>
                   </View>
                 }
                 style={[styles.list, { backgroundColor: svbg, borderColor: tc }]}
-                contentContainerStyle={pairedDevices.length === 0 ? { flexGrow: 1 } : undefined}
+                contentContainerStyle={
+                  pairedDevices.length === 0 ? { flexGrow: 1 } : undefined
+                }
               />
             )}
           </>
@@ -292,7 +332,8 @@ export default function DeviceSelectionScreen() {
             disabled={
               deviceType === 'wifi'
                 ? Object.keys(selectedScanned).length === 0
-                : Object.keys(selectedScanned).length === 0 && Object.keys(selectedSaved).length === 0
+                : Object.keys(selectedScanned).length === 0 &&
+                  Object.keys(selectedSaved).length === 0
             }
           >
             <H1

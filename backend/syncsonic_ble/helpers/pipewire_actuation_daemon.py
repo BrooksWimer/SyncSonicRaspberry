@@ -12,6 +12,14 @@ from syncsonic_ble.utils.logging_conf import get_logger
 log = get_logger(__name__)
 
 POLL_INTERVAL_SEC = 0.25
+# When ensure_route fails because the bluez_output sink isn't present (the
+# typical failure mode for a disconnected or about-to-reconnect speaker),
+# don't retry for OFFLINE_BACKOFF_SEC. This eliminates the 410 ms
+# transport-sink-not-found warning storm previously observed on the Pi when a
+# control-state entry outlived its underlying sink. The first failure per
+# offline period is still logged exactly once at INFO so the operator sees
+# "this MAC went offline" without spam.
+OFFLINE_BACKOFF_SEC = 5.0
 
 
 class PipeWireActuationDaemon:
@@ -21,6 +29,7 @@ class PipeWireActuationDaemon:
         self._engine = AlignmentActuatorEngine()
         self._transport = get_pipewire_transport_manager()
         self._last_outputs: Dict[str, Dict[str, Any]] = {}
+        self._offline_until: Dict[str, float] = {}
 
     def run_forever(self) -> None:
         log.info("PipeWire actuation daemon started")
@@ -52,23 +61,44 @@ class PipeWireActuationDaemon:
             }
 
         applied_states = self._engine.step(current)
+        now = time.monotonic()
 
         for mac, cfg in current.items():
             if not cfg["active"]:
                 self._transport.remove_route(mac)
+                self._offline_until.pop(mac, None)
+                continue
+
+            offline_until = self._offline_until.get(mac, 0.0)
+            if now < offline_until:
+                # Backoff window active; skip the ensure_route call entirely so
+                # we neither do the work nor produce a log line.
                 continue
 
             applied = applied_states.get(mac, {})
-            self._transport.ensure_route(
+            ok = self._transport.ensure_route(
                 mac,
                 latency_ms=float(applied.get("delay_line_ms", 0.0)),
                 left_percent=int(cfg["left_percent"]) if cfg.get("left_percent") is not None else None,
                 right_percent=int(cfg["right_percent"]) if cfg.get("right_percent") is not None else None,
             )
+            if ok:
+                if mac in self._offline_until:
+                    log.info("Speaker %s back online; route re-established", mac)
+                    self._offline_until.pop(mac, None)
+            else:
+                if mac not in self._offline_until:
+                    log.info(
+                        "Speaker %s appears offline; backing off route attempts for %.1fs",
+                        mac,
+                        OFFLINE_BACKOFF_SEC,
+                    )
+                self._offline_until[mac] = now + OFFLINE_BACKOFF_SEC
 
         for mac in list(self._last_outputs.keys()):
             if mac not in current:
                 self._transport.remove_route(mac)
+                self._offline_until.pop(mac, None)
 
         self._last_outputs = current
 

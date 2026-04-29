@@ -1,6 +1,8 @@
 # Epic 05: Coordinated Engine — Architecture Proposal
 
-_Status: proposed; Slice 0 in progress on `epic/05-coordinated-engine`._
+_Status: Slice 0 deployed and Pi-validated 2026-04-29 EDT on
+`epic/05-coordinated-engine`. Slice 1 (telemetry) up next. See section 8 for
+the validation evidence._
 
 This document is the long-form rationale, evidence, and slice plan for
 [Epic 05](../epics/05-coordinated-engine.md). It is the source of truth
@@ -396,3 +398,136 @@ independent and reacts to stress with teardown. The pivot is to treat
 the system as one coordinated whole and ride through stress with
 bounded, inaudible adjustments. The hardware is fine. The pivot is one
 slice at a time and we will measure each one.
+
+## 8. Slice 0 Pi Validation Evidence (2026-04-29 EDT)
+
+Deployed to `syncsonic@10.0.0.89:/home/syncsonic/SyncSonicPi/backend/`
+via per-file `scp` (`pulseaudio_helpers.py`, `pipewire_actuation_daemon.py`,
+`action_request_handlers.py`, `connection_manager.py`, `device_manager.py`,
+`adapter_helpers.py`, plus the WirePlumber rule at
+`~/.config/wireplumber/bluetooth.lua.d/80-syncsonic-bt-driver-priority.lua`).
+Pre-deploy snapshot at `/tmp/syncsonic-snapshot-pre-deploy-20260428-235414.tar.gz`
+on the Pi (118 KB) for one-command rollback.
+
+### Fix D — single-source priority.driver
+
+```
+$ pactl list short modules | grep null-sink
+536870916  module-null-sink  sink_name=virtual_out sink_properties=device.description=virtual_out priority.driver=10000 priority.session=10000
+```
+
+Single value (`10000`) baked into the load-module call at sink-create
+time. No post-create `pw-cli set-param` race. The previous
+`_promote_virtual_out_to_graph_driver()` and `_find_pw_node_id()`
+helpers were dropped; their function definitions still exist on the
+deployed Pi only as orphaned code with no caller. Result confirmed clean.
+
+### Fix B — daemon backs off offline speakers
+
+Injected a stale entry for `DE:AD:BE:EF:00:00` into
+`/tmp/syncsonic_pipewire/control_state.json`. Journal evidence:
+
+```
+Apr 28 23:57:03,226 - WARNING - PipeWire transport sink not found for DE:AD:BE:EF:00:00
+Apr 28 23:57:03,226 - INFO    - Speaker DE:AD:BE:EF:00:00 appears offline; backing off route attempts for 5.0s
+Apr 28 23:57:09,856 - WARNING - PipeWire transport sink not found for DE:AD:BE:EF:00:00
+Apr 28 23:57:13,384 - WARNING - PipeWire transport sink not found for DE:AD:BE:EF:00:00
+```
+
+Warnings now ~5 s apart instead of every 250–410 ms. Approximately 11x
+reduction in warning rate (from ~800 in 6 minutes to ~70 in 6 minutes).
+The first failure per offline period emits the INFO backoff line; the
+underlying ensure_route warning still fires on each retry but at the
+backoff cadence, never the daemon poll cadence. Cleanup confirmed: when
+the JSON entry is removed, the warning loop stops within the next
+5-second window and the offline cache entry is dropped.
+
+### Fix A — phone MAC excluded from speaker control plane
+
+Initial deploy showed Fix A was **not** firing in production:
+
+```
+Apr 28 23:58:08,245 - INFO - PipeWire control publish AC:DF:A1:52:8A:41 -> delay=100.000 ms mode=provision active=True
+Apr 28 23:58:08,246 - INFO - Loopback autoprovisioned for AC:DF:A1:52:8A:41
+Apr 28 23:58:08,336 - INFO - Speaker AC:DF:A1:52:8A:41 appears offline; backing off route attempts for 5.0s
+```
+
+Root cause: the wip-branch `is_device_on_reserved_adapter` returns from
+the FIRST address match, but the phone exists at TWO BlueZ paths
+simultaneously (`/org/bluez/hci0/dev_AC_DF_A1_52_8A_41` from inquiry
+caching, plus the actual paired `/org/bluez/hci3/dev_AC_DF_A1_52_8A_41`
+on the reserved adapter). If iteration hits the hci0 entry first, the
+function falsely reports False and every Slice 0 guard inherits that bug.
+
+Fixed by landing a corrected `is_device_on_reserved_adapter` in
+`adapter_helpers.py` that scans every match and returns True if any of
+them is under the reserved prefix. Smoke test of the fixed function
+against live BlueZ:
+
+```
+AC:DF:A1:52:8A:41 (your phone)      -> on_reserved=True
+DE:AD:BE:EF:00:00 (fake)            -> on_reserved=False
+F4:6A:DD:D4:F3:C8 (VIZIO speaker)   -> on_reserved=False
+2C:FD:B4:69:46:0A (JBL speaker)     -> on_reserved=False
+```
+
+Production validation after restart: phone reconnected at 00:04:09 EDT.
+Journal shows `Tracking AC:DF:A1:52:8A:41 as connected` from
+`device_manager` (UUID-relaxation port working) and **no**
+`Loopback autoprovisioned for AC:DF:A1:52:8A:41` line. The
+`/tmp/syncsonic_pipewire/control_state.json` after the validation
+window contained only the two speaker MACs:
+
+```
+{"outputs":{"2C:FD:B4:69:46:0A":{"active":true,"delay_ms":210.0,...},"F4:6A:DD:D4:F3:C8":{"active":true,"delay_ms":210.0,...}},"schema":1}
+```
+
+Compare to before-deploy where the phone MAC was a third entry causing
+the warning storm.
+
+### Closure-bug spillover from validation
+
+The same validation window exposed a separate late-binding closure bug
+inherited from the wip-branch port: `Phone ingress not established for
+F4:6A:DD:D4:F3:C8` was logged, but F4:6A is the VIZIO speaker, not the
+phone. The phone-ingress thread was started for the phone but the
+worker's `mac` variable had been reassigned to the VIZIO by the time
+the thread's polling timed out. Fixed by binding `phone_mac` as a
+default argument on the thread's target function. Functional behavior
+was already correct (`ensure_phone_ingress_loopback` uses its own
+argument-bound name); only the follow-up warning logged the wrong MAC.
+
+### Fix C — one-shot auto-reconnect on unexpected disconnect
+
+Forced a transport failure with `bluetoothctl disconnect F4:6A:DD:D4:F3:C8`
+(bypassing the SyncSonic API so the speaker stays in `expected`).
+Journal sequence:
+
+```
+00:07:42,547 - WARN  - PipeWire transport sink not found for F4:6A:DD:D4:F3:C8
+00:07:42,548 - INFO  - Speaker F4:6A:DD:D4:F3:C8 appears offline; backing off route attempts for 5.0s   (Fix B)
+00:07:43,617 - INFO  - [BlueZ] F4:6A:DD:D4:F3:C8 is now DISCONNECTED
+00:07:43,638 - INFO  - Loopback removed after disconnect for F4:6A:DD:D4:F3:C8
+00:07:43,655 - INFO  - Speaker F4:6A:DD:D4:F3:C8 disconnected unexpectedly while expected; queuing one-shot reconnect   (Fix C)
+00:07:43,679 - INFO  - FSM: reconnect F4:6A:DD:D4:F3:C8 via 5C:F3:70:D1:25:AF
+00:07:45,943 - INFO  - [BlueZ] F4:6A:DD:D4:F3:C8 is now CONNECTED
+00:07:47,259 - INFO  - connect_success notification
+00:07:47,695 - INFO  - PipeWire delay transport established for F4:6A:DD:D4:F3:C8 ... (delay 90.0 ms)
+```
+
+Total recovery: **4.0 seconds** from disconnect to fully restored audio
+path with delay route re-established. No user app interaction required.
+Without Fix C the speaker would have stayed disconnected.
+
+### Slice 0 outcome
+
+All four Slice 0 fixes work in production. Two additional bugs
+(`is_device_on_reserved_adapter` first-match and phone-ingress closure
+late-binding) were found during validation and also fixed. The deployed
+Pi is now running an epic/05 codebase that is self-contained
+(`foundation/neutral-minimal` plus the four Slice 0 fixes plus the
+three wip-feature ports plus the two validation fixes) and behaviorally
+matches or exceeds the prior deployed wip-branch state.
+
+Slice 1 (telemetry + always-on mic capture + reproducible session
+report) is the next workstream.

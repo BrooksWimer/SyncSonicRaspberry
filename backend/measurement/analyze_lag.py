@@ -73,11 +73,54 @@ class LagEstimate:
     reference_n_samples: int
     captured_n_samples: int
     search_window_samples: Tuple[int, int]  # (min_lag, max_lag) actually searched
+    # Slice 4.4: peak SHARPNESS - the Full Width at Half Maximum of
+    # the correlation peak, in samples and ms. With all speakers
+    # aligned the mic captures one coherent sum and the peak is
+    # narrow (~5-15 ms typical). With speakers misaligned, the mic
+    # captures shifted copies that smear the peak across 30-100+ ms.
+    # Used by alignment_monitor.py as the per-cycle alignment-health
+    # signal that does NOT require per-speaker isolation.
+    peak_fwhm_samples: int = 0
+    peak_fwhm_ms: float = 0.0
 
     def to_json(self) -> str:
         d = asdict(self)
         d["search_window_samples"] = list(d["search_window_samples"])
         return json.dumps(d, indent=2)
+
+
+def _compute_peak_fwhm(window: "np.ndarray", peak_idx: int) -> int:
+    """Return the Full-Width-at-Half-Maximum of the correlation peak,
+    in samples. ``window`` is the signed correlation slice the
+    estimator searched, ``peak_idx`` is the argmax of ``|window|``.
+
+    We measure FWHM on the absolute correlation so anti-phase peaks
+    are treated symmetrically with in-phase ones (cross-correlation
+    sign depends on speaker phase response, but the peak's WIDTH is
+    physically meaningful regardless of sign).
+
+    A wide peak indicates the captured signal is a SUM of multiple
+    delayed copies (i.e. the speakers are not aligned to each other);
+    a narrow peak indicates one coherent arrival. Returning width in
+    integer samples keeps it composable with the analyzer's
+    integer-sample lag convention.
+    """
+    abs_window = np.abs(window)
+    peak_val = float(abs_window[peak_idx])
+    if peak_val <= 0.0:
+        return 0
+    half = peak_val * 0.5
+    # Walk left and right from the peak until we drop below half-max.
+    # If we never do (peak fills the whole search window), return the
+    # window length as a saturated value - the analyzer caller can
+    # interpret that as "FWHM at least this wide".
+    left = peak_idx
+    while left > 0 and abs_window[left] >= half:
+        left -= 1
+    right = peak_idx
+    while right < len(abs_window) - 1 and abs_window[right] >= half:
+        right += 1
+    return int(right - left)
 
 
 def _to_mono(signal: np.ndarray) -> np.ndarray:
@@ -194,6 +237,10 @@ def estimate_lag_samples(
     lag_samples = peak_idx_in_full - zero_lag_idx
     lag_ms = lag_samples * 1000.0 / sample_rate
 
+    # Slice 4.4: peak FWHM as alignment-health signal.
+    fwhm_samples = _compute_peak_fwhm(window, peak_idx_in_window)
+    fwhm_ms = fwhm_samples * 1000.0 / sample_rate
+
     return LagEstimate(
         lag_samples=int(lag_samples),
         lag_ms=float(lag_ms),
@@ -204,6 +251,8 @@ def estimate_lag_samples(
         reference_n_samples=len(ref),
         captured_n_samples=len(cap),
         search_window_samples=(int(min_lag_samples), int(max_lag_samples)),
+        peak_fwhm_samples=int(fwhm_samples),
+        peak_fwhm_ms=float(fwhm_ms),
     )
 
 
@@ -271,6 +320,8 @@ def _cli() -> int:
         print(f"peak correlation:     {est.peak_correlation:+.4f}  (Pearson r at best lag)")
         print(f"confidence primary:   {est.confidence_primary:.2f}x  (peak / mean,  >5 is solid)")
         print(f"confidence secondary: {est.confidence_secondary:.2f}x  (peak / 2nd-peak, >2 unambiguous)")
+        print(f"peak FWHM:            {est.peak_fwhm_samples} samples = {est.peak_fwhm_ms:.1f} ms"
+              f"  (narrow=aligned, wide=misaligned)")
         print(f"search window:        {est.search_window_samples[0]}..{est.search_window_samples[1]} samples"
               f"  ({est.search_window_samples[0]*1000.0/ref_sr:+.0f}..{est.search_window_samples[1]*1000.0/ref_sr:+.0f} ms)")
     return 0

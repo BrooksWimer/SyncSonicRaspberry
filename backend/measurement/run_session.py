@@ -56,6 +56,68 @@ from syncsonic_ble.telemetry import telemetry_root  # noqa: E402
 DEFAULT_DURATION_SEC = 30
 DEFAULT_MIC_DIR = "/run/syncsonic/mic"
 DEFAULT_REFERENCE_NAME = "reference-pinknoise-30s.wav"
+DEFAULT_TEST_VOLUME_PERCENT = 50  # safety: cap speaker volume during the test
+
+
+def _list_bluez_sink_names() -> list:
+    """Return current bluez_output sink names (one per connected BT speaker)."""
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "short", "sinks"],
+            capture_output=True, text=True, timeout=2.0,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    if result.returncode != 0:
+        return []
+    sinks = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].startswith("bluez_output."):
+            sinks.append(parts[1])
+    return sinks
+
+
+def _get_sink_volume_percents(sink: str) -> Optional[tuple]:
+    """Return (left_pct, right_pct) for a sink, or None if unreadable."""
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "sinks"],
+            capture_output=True, text=True, timeout=2.0,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+    in_block = False
+    for line in result.stdout.splitlines():
+        if f"Name: {sink}" in line:
+            in_block = True
+            continue
+        if in_block and line.startswith("\tName:"):
+            in_block = False
+        if in_block and "Volume:" in line and "%" in line:
+            # "Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: ..."
+            parts = line.split("%")
+            if len(parts) >= 2:
+                try:
+                    left = int(parts[0].split("/")[-1].strip())
+                    right = int(parts[1].split("/")[-1].strip())
+                    return (left, right)
+                except (ValueError, IndexError):
+                    return None
+    return None
+
+
+def _set_sink_volume_percent(sink: str, percent: int) -> bool:
+    try:
+        result = subprocess.run(
+            ["pactl", "set-sink-volume", sink, f"{percent}%", f"{percent}%"],
+            capture_output=True, text=True, timeout=2.0,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    return result.returncode == 0
 
 
 def _utc_iso_now_ms() -> str:
@@ -209,6 +271,9 @@ def main() -> int:
                         help="Directory holding the rolling mic segments")
     parser.add_argument("--no-play", action="store_true",
                         help="Skip playing the reference (just snapshot the live system)")
+    parser.add_argument("--volume-percent", type=int, default=DEFAULT_TEST_VOLUME_PERCENT,
+                        help="Speaker volume percent during the test (restored after). "
+                             f"Default {DEFAULT_TEST_VOLUME_PERCENT}. Set to 0 to skip volume control.")
     args = parser.parse_args()
 
     root = telemetry_root()
@@ -226,6 +291,19 @@ def main() -> int:
     bundle_name = f"{args.name}-{_safe_filename_iso()}"
     bundle_dir = sessions_dir / bundle_name
     bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    # Volume safety: if the user asked us to manage volume, snapshot
+    # current per-sink volumes so we can restore at end. Then drop all BT
+    # sinks to the requested test volume (default 50%) so the pink-noise
+    # reference does not blast a room.
+    saved_volumes: dict = {}
+    if args.volume_percent > 0 and not args.no_play:
+        for sink in _list_bluez_sink_names():
+            current = _get_sink_volume_percents(sink)
+            if current is not None:
+                saved_volumes[sink] = current
+                _set_sink_volume_percent(sink, args.volume_percent)
+                print(f"[run_session] {sink}: {current[0]}%/{current[1]}% -> {args.volume_percent}% (test)")
 
     start_wall = _utc_iso_now_ms()
     start_monotonic = time.monotonic_ns()
@@ -254,6 +332,18 @@ def main() -> int:
             play_proc.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
             play_proc.kill()
+
+    # Restore original speaker volumes
+    for sink, (left, right) in saved_volumes.items():
+        # pactl set-sink-volume <sink> L% R%
+        try:
+            subprocess.run(
+                ["pactl", "set-sink-volume", sink, f"{left}%", f"{right}%"],
+                capture_output=True, text=True, timeout=2.0, check=False,
+            )
+            print(f"[run_session] {sink}: restored to {left}%/{right}%")
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            print(f"[run_session] WARNING: failed to restore {sink} volume", file=sys.stderr)
 
     # Slice events: merge from ALL events files whose mtime overlaps the
     # session window. Each Python process (main, actuation_daemon,

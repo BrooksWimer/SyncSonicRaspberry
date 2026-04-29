@@ -52,9 +52,12 @@ class Msg(IntEnum):
     GET_PAIRED_DEVICES      = 0x64
     SET_MUTE                = 0x65
     ULTRASONIC_SYNC         = 0x67
+    # Slice 4.2: mic-driven single-speaker auto-calibration
+    CALIBRATE_SPEAKER       = 0x68
     CONNECTION_STATUS_UPDATE= 0x70
     COORDINATOR_STATE       = 0x71  # Slice 3.6: 1 Hz per-speaker health snapshot
     COORDINATOR_EVENT       = 0x72  # Slice 3.6: edge-triggered soft_mute / state-change
+    CALIBRATION_RESULT      = 0x73  # Slice 4.2: async calibration progress + final result
     SCAN_START      = 0x40
     SCAN_STOP       = 0x41
     SCAN_DEVICES    = 0x43

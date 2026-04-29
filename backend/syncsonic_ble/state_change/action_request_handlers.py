@@ -260,6 +260,80 @@ def handle_ultrasonic_sync(char, _):
     )
 
 
+def handle_calibrate_speaker(char, data):
+    """Slice 4.2: mic-driven single-speaker auto-calibration.
+
+    Spawns a daemon thread that mutes other speakers, captures
+    virtual_out.monitor + Jieli mic for ~6 s, runs the Slice 4.1
+    cross-correlation analyzer, and (if confidence is sufficient)
+    applies the resulting delay correction via the existing
+    actuation manager. Progress events are pushed back to the app
+    via Msg.CALIBRATION_RESULT notifications. The handler itself
+    returns immediately so the GLib mainloop is never blocked on
+    the capture window.
+    """
+    mac = data.get("mac")
+    if not mac:
+        return _encode(Msg.ERROR, {"error": "Missing mac"})
+    if is_sonos(mac):
+        return _feature_disabled(
+            "wifi_speakers",
+            "Wi-Fi speaker calibration is not yet supported.",
+        )
+    # Phone MAC must never enter the calibration path - the phone is
+    # an A2DP source, not an output, and calibration would ask the
+    # actuation manager to publish a delay against an adapter that
+    # has no bluez_output sink. Same guard pattern as
+    # handle_set_latency / handle_set_volume.
+    if char.bus and is_device_on_reserved_adapter(char.bus, mac):
+        logger.warning(
+            "Refusing CALIBRATE_SPEAKER for reserved-adapter device %s (phone MAC)",
+            mac,
+        )
+        return _encode(
+            Msg.ERROR,
+            {"error": "MAC is on the reserved adapter (phone), cannot calibrate"},
+        )
+
+    target_total_ms = float(data.get("target_total_ms", 500.0))
+    capture_duration_sec = float(data.get("capture_duration_sec", 6.0))
+
+    # Lazy import: keeps the GLib mainloop process startup path free
+    # of scipy / numpy cost when no calibration ever runs.
+    try:
+        from measurement.calibrate_one import calibrate_speaker_async
+    except ImportError as exc:
+        logger.exception("calibrate_speaker_async import failed")
+        return _encode(
+            Msg.ERROR,
+            {"error": f"calibration module unavailable: {exc}"},
+        )
+
+    def _push(_phase: str, payload: Dict[str, Any]) -> None:
+        # The Characteristic's send_notification is already known to
+        # be safe from worker threads (existing ConnectionService and
+        # DeviceManager use the same pattern). Failures inside the
+        # send are caught by the calibrator's own try/except, so we
+        # don't need to wrap them here.
+        char.send_notification(Msg.CALIBRATION_RESULT, payload)
+
+    calibrate_speaker_async(
+        target_mac=mac,
+        on_event=_push,
+        target_total_ms=target_total_ms,
+        capture_duration_sec=capture_duration_sec,
+    )
+    return _encode(
+        Msg.SUCCESS,
+        {
+            "queued": True,
+            "mac": mac,
+            "target_total_ms": target_total_ms,
+            "capture_duration_sec": capture_duration_sec,
+        },
+    )
+
+
 def unknown_handler(char, _):
     return _encode(Msg.ERROR, {"error": "Unknown message"})
 
@@ -273,6 +347,7 @@ HANDLERS = {
     Msg.GET_PAIRED_DEVICES: handle_get_paired,
     Msg.SET_MUTE: handle_set_mute,
     Msg.ULTRASONIC_SYNC: handle_ultrasonic_sync,
+    Msg.CALIBRATE_SPEAKER: handle_calibrate_speaker,
     Msg.SCAN_START: _scan_start,
     Msg.SCAN_STOP: _scan_stop,
     Msg.WIFI_SCAN_START: handle_wifi_scan_start,

@@ -129,6 +129,10 @@ class EventType:
     COORDINATOR_RATE_ADJUST = "coordinator_rate_adjust"
     COORDINATOR_SYSTEM_HOLD = "coordinator_system_hold"
     COORDINATOR_SOFT_MUTE = "coordinator_soft_mute"
+    # Slice 4 mic-driven calibration. One event per phase boundary
+    # (started, capturing, analyzing, applying, applied/failed) so
+    # the analyzer can replay the entire calibration trajectory.
+    CALIBRATION_RESULT = "calibration_result"
 
 
 def telemetry_root() -> Path:

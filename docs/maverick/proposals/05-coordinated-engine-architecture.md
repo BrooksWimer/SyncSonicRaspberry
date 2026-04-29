@@ -536,3 +536,106 @@ matches or exceeds the prior deployed wip-branch state.
 
 Slice 1 (telemetry + always-on mic capture + reproducible session
 report) is the next workstream.
+
+## 9. Field Experiment 2026-04-29 EDT — RSSI A/B (3-speaker stress test)
+
+Captured live during a 3-speaker stress test with the project owner
+listening to BT speakers F4..C8 (VIZIO SB2020n, hci0), 2C..0A (JBL
+Flip 6, hci1), and 45..19 (third speaker, hci2), with phone audio
+ingress on hci3. Owner subjective report after positioning change:
+"audio consistency is actually a lot better."
+
+### Method
+
+Two `hcitool rssi` 10-sample snapshots (0.5 s spacing) plus journal
+xrun count, taken before and after the owner moved the speakers
+physically closer to the Pi by ~1-2 ft. No code changes between
+snapshots. Same playlist before and after. Snapshot scripts are at
+`/tmp/rssi_snapshot2.sh` on the Pi (owner-readable evidence, not
+committed because they are throwaway tooling that Slice 1 will
+supersede).
+
+### Numbers
+
+| Metric | BEFORE move | AFTER move | Change |
+|---|---|---|---|
+| VIZIO RSSI median | -25 dBm | **-22 dBm** | +3 dB stronger |
+| VIZIO RSSI variance (10 samples) | ±2 dB | ±1.5 dB | tighter |
+| JBL RSSI median | -25 dBm | **-31 dBm** | -6 dB weaker (repositioning side-effect) |
+| new-spkr RSSI median | -14 dBm | -14 dBm | unchanged |
+| xrun rate during music | ≈ 0.8/min over prior 30-min window (mixed activity) | ≈ 0.33/min over 3-min post-move window (1 xrun) | ≈ 2-3x reduction |
+
+### Findings
+
+1. **The system is RF-limited, not CPU-limited.** A 3 dB improvement
+   on the VIZIO link cut the dropout rate noticeably. CPU usage in
+   pw-top was always a small fraction of the quantum
+   (BUSY ≈ 30-150 µs against a 10.67 ms quantum). Hardware has plenty
+   of compute headroom; stability lives or dies on the radio link, not
+   the software path. Every later slice should keep this asymmetry in
+   mind: "make the software faster" is rarely the right answer.
+2. **Speaker RF environments are interconnected.** Moving the VIZIO
+   closer to the Pi made the JBL 6 dB weaker. Positioning is a
+   system-level optimization problem, not a per-speaker one. A naive
+   "move all speakers closer" doesn't necessarily help; what helps is
+   finding the configuration where the *worst* speaker is acceptable.
+   The Slice 3 Coordinator's policy primitives need to think in
+   system-level terms (the System-wide Synchronous Hold primitive in
+   section 4.3 is the right shape; we should also evaluate whether the
+   bounded rate-adjustment threshold should scale with the worst
+   speaker's link quality rather than be a fixed ±50 ppm).
+3. **Self-inflicted xruns from slider-dragging dominated the prior
+   30-min window.** The journal showed five route rebuilds in a
+   16-second span (delay slider dragged 0 → 180 → 150 → 210 → 320 ms
+   on the new speaker), each rebuild causing a graph xrun. Just
+   stopping to listen reduced the xrun rate. This is a Slice 2 target
+   (smooth in-place delay changes via the elastic engine's IPC socket)
+   and the field evidence promotes it from "correctness improvement"
+   to "user-visible UX improvement."
+
+### Caveats and limits of this experiment
+
+- RSSI is a noisy metric. The "before" single-sample reading earlier
+  in the session showed JBL at -14 dBm and VIZIO at -23 dBm; the
+  10-sample medians put both at -25 dBm. Single samples are useless;
+  rolling medians over ~10 samples are the minimum reliable read.
+  Slice 1 telemetry must capture rolling windows, not single reads.
+- The "before" xrun count is a 30-min window that includes
+  slider-drag activity. The "after" is a 3-min window of stable
+  listening. The comparison is directionally right but the magnitude
+  is muddied by the activity difference. To do this cleanly we need
+  Slice 1's reproducible session report.
+- Subjective improvement and quantitative improvement agree
+  directionally, which is the most valuable signal we have without
+  Slice 1 in place. The owner's ears are still the ground-truth
+  oracle for now.
+
+### Implications for the rest of the roadmap
+
+- **Slice 1 telemetry plan refinement:** RSSI per speaker becomes a
+  primary metric (per-second sampling per speaker, rolling 10-second
+  median, alongside the existing BlueZ `MediaTransport1` snapshots).
+  The MediaTransport snapshot itself can stay at 5 s because Codec /
+  Volume / Configuration change rarely; RSSI changes second to second.
+  See the Slice 1 telemetry plan in section 5 for the updated spec.
+- **Slice 3 Coordinator policy refinement:** add an RF-aware
+  preemptive soft-mute rule. When a speaker's 10-second rolling-median
+  RSSI degrades by more than 5 dB from its 60-second baseline,
+  preemptively soft-mute it for ~50 ms before its queue drains, then
+  ramp back in. Converts an audible dropout into an inaudible brief
+  silence on one speaker, with the other speakers carrying the
+  experience. The exact thresholds (5 dB / 10 s / 60 s / 50 ms) are
+  starting points; Slice 1 telemetry will let us tune them with data.
+- **Frontend addition (downstream of Slice 1, before or with Slice 3):**
+  surface per-speaker RSSI as a color-coded indicator in the app
+  (green ≥ -20 dBm, yellow -20 to -30, red < -30). The owner should
+  not have to guess whether moving a speaker helped; the app should
+  tell them. Slots into the existing BLE notification stream and
+  doesn't need a separate epic.
+- **Open question closed:** the Slice 0 baseline question of "is the
+  on-board UART controller worth using for output" gets a partial
+  answer here — the on-board controller (hci3) is dedicated to BLE
+  advertising and phone A2DP source ingress; the three USB controllers
+  serve outputs. This experiment shows the bottleneck is the speakers'
+  air link, not the Pi-side adapter, so reassigning hci3 is unlikely
+  to help. Re-evaluate after Slice 1 lands.

@@ -8,6 +8,7 @@ from typing import Any, Dict
 import dbus
 
 from syncsonic_ble.helpers.actuation import get_actuation_manager
+from syncsonic_ble.helpers.adapter_helpers import is_device_on_reserved_adapter
 from syncsonic_ble.helpers.device_type_helpers import is_sonos
 from syncsonic_ble.helpers.pipewire_control_plane import publish_output_mix
 from syncsonic_ble.state_management.scan_manager import ScanManager
@@ -119,6 +120,14 @@ def handle_set_latency(char, data):
             "wifi_speakers",
             "Wi-Fi speaker latency control is disabled on the neutral foundation branch.",
         )
+    # Phone MAC must never enter the speaker delay control plane. The phone is
+    # an A2DP source via the RESERVED_HCI adapter, not an output, so a delay
+    # publish on its MAC produces a daemon poll loop that can never resolve a
+    # bluez_output sink (observed on Pi as the 410 ms transport-sink-not-found
+    # warning storm).
+    if char.bus and is_device_on_reserved_adapter(char.bus, mac):
+        logger.warning("Refusing SET_LATENCY for reserved-adapter device %s (phone MAC)", mac)
+        return _encode(Msg.ERROR, {"error": "MAC is on the reserved adapter (phone), cannot apply output delay"})
 
     latency_ms = float(latency)
     manager = get_actuation_manager()
@@ -144,6 +153,11 @@ def handle_set_volume(char, data):
             "wifi_speakers",
             "Wi-Fi speaker volume control is disabled on the neutral foundation branch.",
         )
+    # Same guard as handle_set_latency: the phone MAC is not an output, so
+    # publishing a volume against it pollutes the control plane.
+    if char.bus and is_device_on_reserved_adapter(char.bus, mac):
+        logger.warning("Refusing SET_VOLUME for reserved-adapter device %s (phone MAC)", mac)
+        return _encode(Msg.ERROR, {"error": "MAC is on the reserved adapter (phone), cannot apply output volume"})
 
     volume = int(volume)
     balance = float(data.get("balance", 0.5))

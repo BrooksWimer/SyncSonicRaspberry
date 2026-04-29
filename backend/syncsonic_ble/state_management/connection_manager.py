@@ -12,7 +12,11 @@ from typing import Dict, List, Optional, Tuple
 from dbus import Interface
 
 from syncsonic_ble.helpers.actuation import get_actuation_manager
-from syncsonic_ble.helpers.adapter_helpers import device_path_on_adapter, extract_mac
+from syncsonic_ble.helpers.adapter_helpers import (
+    device_path_on_adapter,
+    extract_mac,
+    is_device_on_reserved_adapter,
+)
 from syncsonic_ble.helpers.device_type_helpers import is_sonos
 from syncsonic_ble.helpers.pipewire_control_plane import publish_output_mix
 from syncsonic_ble.state_change.action_functions import (
@@ -76,6 +80,18 @@ class ConnectionService:
         work_q.put((intent, payload))
 
     def _ensure_output_actuation(self, mac: str, requested_delay_ms: Optional[float] = None) -> bool:
+        # Defense in depth: the phone connects to the RESERVED_HCI adapter as an
+        # A2DP source and must never be treated as a delay-controlled output. If
+        # this guard ever fires it means an upstream caller (a BLE handler or a
+        # LOOPBACK_SYNC for a reserved-adapter device) leaked a phone MAC into
+        # the speaker control plane, which would cause the actuation daemon to
+        # spin forever trying to find a non-existent bluez_output sink.
+        if is_device_on_reserved_adapter(self.bus, mac):
+            logger.warning(
+                "Refusing actuation for reserved-adapter device %s (phone MAC, not a speaker output)",
+                mac,
+            )
+            return False
         target_delay = requested_delay_ms
         if target_delay is None:
             target_delay = self.actuation.get_commanded_delay(mac)
@@ -92,6 +108,15 @@ class ConnectionService:
         apply_delay: bool = True,
     ) -> None:
         if not settings:
+            return
+
+        # Same guard as _ensure_output_actuation: reserved-adapter devices are
+        # not outputs and any settings publish on their MAC is invalid.
+        if is_device_on_reserved_adapter(self.bus, mac):
+            logger.debug(
+                "Skipping settings apply for reserved-adapter device %s (phone MAC)",
+                mac,
+            )
             return
 
         delay_ms = settings.get("latency")

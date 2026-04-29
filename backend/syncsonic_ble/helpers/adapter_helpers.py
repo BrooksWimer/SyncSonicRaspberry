@@ -105,6 +105,41 @@ def get_reserved_advertising_manager(bus):
     log.info("Advertising manager acquired on %s", adapter_path)
     return adapter_path, ad_mgr
 
+
+def is_device_on_reserved_adapter(bus, mac: str) -> bool:
+    """Return True if ``mac`` is paired or visible on the RESERVED_HCI adapter.
+
+    A single Bluetooth address can appear under MULTIPLE adapter paths in BlueZ
+    at the same time: the actual paired connection lives on one adapter, but
+    other adapters that have seen the device during inquiry retain a cached
+    Device1 record under their own path. For example, a phone paired on
+    ``/org/bluez/hci3`` can simultaneously be visible at
+    ``/org/bluez/hci0/dev_<mac>`` because hci0 saw it during a scan. The
+    deployed wip-branch implementation of this function returned from the
+    FIRST address match it encountered, which (depending on dict ordering)
+    could falsely report False for a phone genuinely paired on the reserved
+    adapter — letting the phone MAC slip past the Slice 0 Fix A guards and
+    enter the speaker control plane.
+
+    This implementation scans all matches and returns True if ANY of them is
+    under the reserved adapter prefix. Returns False only if BlueZ has no
+    record of the address at all, or if every match is under a non-reserved
+    adapter.
+    """
+    mac = mac.upper()
+    prefix = f"/org/bluez/{RESERVED_HCI}/"
+    om = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, "/"), DBUS_OM_IFACE)
+    for path, ifaces in om.GetManagedObjects().items():
+        dev = ifaces.get(DEVICE_INTERFACE)
+        if not dev:
+            continue
+        if dev.get("Address", "").upper() != mac:
+            continue
+        if path.startswith(prefix):
+            return True
+    return False
+
+
 def extract_mac(path: str) -> str | None:
     """
     Return the Bluetooth MAC (AA:BB:CC:DD:EE:FF) from a BlueZ device path.

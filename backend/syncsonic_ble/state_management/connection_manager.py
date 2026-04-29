@@ -275,22 +275,33 @@ class ConnectionService:
                 # The phone-ingress setup blocks for up to 25 s waiting for the
                 # bluez_input source to appear, so it runs on its own thread to
                 # keep the worker queue responsive.
+                #
+                # NOTE: `mac` and `phone_mac` are bound as default arguments so
+                # the closure captures the VALUE at thread-creation time, not a
+                # reference to the worker-loop-scoped name. The deployed
+                # wip-branch version had a late-binding bug here that surfaced
+                # in 00:04:34 Pi journal evidence ("Phone ingress not
+                # established for F4:6A..." referring to the VIZIO speaker MAC
+                # because the worker's `mac` had been reassigned to a later
+                # LOOPBACK_SYNC event by the time the polling thread timed out).
                 if is_device_on_reserved_adapter(self.bus, mac):
                     if connected:
-                        def _run_phone_ingress() -> None:
-                            ok = ensure_phone_ingress_loopback(mac)
+                        phone_mac = mac
+
+                        def _run_phone_ingress(phone_mac=phone_mac) -> None:
+                            ok = ensure_phone_ingress_loopback(phone_mac)
                             if ok:
-                                logger.info("Phone audio ingress ready for %s", mac)
+                                logger.info("Phone audio ingress ready for %s", phone_mac)
                             else:
                                 logger.warning(
                                     "Phone ingress not established for %s — ensure phone audio "
                                     "(A2DP) is connected to this Pi",
-                                    mac,
+                                    phone_mac,
                                 )
 
                         threading.Thread(
                             target=_run_phone_ingress,
-                            name=f"phone-ingress-{mac}",
+                            name=f"phone-ingress-{phone_mac}",
                             daemon=True,
                         ).start()
                     else:

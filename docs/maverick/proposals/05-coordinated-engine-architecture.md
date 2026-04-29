@@ -4,6 +4,11 @@ _Status: Slice 0 deployed and Pi-validated 2026-04-29 EDT on
 `epic/05-coordinated-engine`. Slice 1 (telemetry) up next. See section 8 for
 the validation evidence._
 
+_For the strategic frame this epic sits inside (the North Star, the three
+time horizons, and the design principles every slice is held to), see
+[`../ROADMAP.md`](../ROADMAP.md). This document is the engineering
+plan; ROADMAP.md is the contract with the dream._
+
 This document is the long-form rationale, evidence, and slice plan for
 [Epic 05](../epics/05-coordinated-engine.md). It is the source of truth
 for "why" we are doing this work; the epic doc is the source of truth for

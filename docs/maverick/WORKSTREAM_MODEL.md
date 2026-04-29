@@ -1,6 +1,9 @@
 # SyncSonic Maverick Workstream Model
 
 This document defines how Maverick should structure SyncSonic workstreams.
+For the long-term strategic roadmap (North Star, time horizons, design
+principles, open questions carried forward) see
+[`ROADMAP.md`](ROADMAP.md).
 
 ## Neutral Foundation
 
@@ -13,10 +16,19 @@ This document defines how Maverick should structure SyncSonic workstreams.
 
 ## Epic Merge Targets
 
-- `epic/01-pipewire-transport-stability`
-- `epic/02-startup-mic-auto-alignment`
-- `epic/03-runtime-ultrasonic-auto-alignment`
-- `epic/04-wifi-speakers-manual-alignment`
+- `epic/05-coordinated-engine` (active lane; the foundation that the
+  other four epics now build on top of — see
+  [`ROADMAP.md`](ROADMAP.md))
+- `epic/01-pipewire-transport-stability` (downstream of epic/05;
+  retrofitted with an Experiment Ledger once the Slice 1 telemetry
+  harness exists)
+- `epic/02-startup-mic-auto-alignment` (downstream of epic/05; the
+  Slice 1 always-on mic capture is the ground-truth oracle this epic
+  was missing)
+- `epic/03-runtime-ultrasonic-auto-alignment` (downstream of epic/05;
+  becomes a coordinator client once Slice 4 exists)
+- `epic/04-wifi-speakers-manual-alignment` (downstream of epic/05;
+  GCC-PHAT in the analyzer is what was missing here)
 
 Every Maverick workstream for SyncSonic should attach to one of these epic
 branches. If a request spans multiple lanes, split it into multiple

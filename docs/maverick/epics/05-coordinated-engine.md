@@ -1,5 +1,11 @@
 # Epic 05: Coordinated Engine
 
+_This epic is the active workstream of the Now horizon. The strategic
+context (why this epic exists, how it relates to the Mid and Long
+horizons, and the design principles every slice is held to) lives in
+[`../ROADMAP.md`](../ROADMAP.md). Read that first if you are starting
+or merging anything substantial here._
+
 ## Goal
 
 Make multi-Bluetooth (and later Wi-Fi) speaker playback feel seamless and

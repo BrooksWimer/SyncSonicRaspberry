@@ -1,12 +1,9 @@
 """Per-speaker state model for the Slice 3 Coordinator.
 
 A SpeakerState is a small mutable dataclass the Coordinator updates on
-every tick. Subsequent commits in Slice 3 add fields here as the
-policies that need them are added (rate_ppm history, RSSI window,
-consecutive_stress_ms, last_xrun_ts, etc.).
-
-This commit (3.1) is observation-only: only the fields populated from
-the filter's `query` socket response are tracked.
+every tick. Slice 3.1 added the observation fields populated from the
+filter's ``query`` socket response. Slice 3.2 adds the soft-mute
+state machine (HEALTHY <-> STRESSED <-> MUTED).
 """
 
 from __future__ import annotations
@@ -14,6 +11,12 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+# Health state machine (Slice 3.2).
+HEALTH_HEALTHY = "healthy"          # frames flowing in == out, no recent stress
+HEALTH_STRESSED = "stressed"        # frames_in flowing but frames_out lagging; about to soft-mute
+HEALTH_MUTED = "muted"              # we soft-muted the speaker; waiting for transport to recover
 
 
 @dataclass
@@ -36,15 +39,27 @@ class SpeakerState:
     ring_capacity: int = 0
 
     # Derived per-tick: difference of frames_in_total since last tick.
-    # Used by Slice 3.2's PI controller to detect input/output rate
-    # imbalance independently of the filter's self-reported queue depth.
+    # The Slice 3.2 stress detector uses these directly: a stressed
+    # speaker has delta_frames_in > IN_THRESHOLD (audio still flowing
+    # in from virtual_out) AND delta_frames_out < OUT_THRESHOLD
+    # (BlueZ has stopped consuming).
     last_frames_in_total: int = 0
     last_frames_out_total: int = 0
     delta_frames_in: int = 0
     delta_frames_out: int = 0
 
-    # Health bookkeeping populated by Slice 3.3+. Default zero.
-    consecutive_stress_ms: int = 0
+    # Slice 3.2 gain state from query response.
+    target_gain_x1000: int = 1000
+    current_gain_x1000: int = 1000
+    gain_ramp_samples: int = 0
+
+    # Slice 3.2 health state machine.
+    health: str = HEALTH_HEALTHY
+    consecutive_stress_ticks: int = 0
+    consecutive_recovery_ticks: int = 0
+    health_state_entered_monotonic_ns: int = 0
+
+    # General bookkeeping
     n_consecutive_query_failures: int = 0
 
     # Last query response that failed to parse / connect; useful for
@@ -66,7 +81,9 @@ class SpeakerState:
         self.queue_depth_samples = int(resp.get("queue_depth_samples", 0))
         self.frames_in_total = int(resp.get("frames_in_total", 0))
         self.frames_out_total = int(resp.get("frames_out_total", 0))
-        self.mute_ramp_remaining = int(resp.get("mute_ramp_remaining", 0))
+        self.target_gain_x1000 = int(resp.get("target_gain_x1000", 1000))
+        self.current_gain_x1000 = int(resp.get("current_gain_x1000", 1000))
+        self.gain_ramp_samples = int(resp.get("gain_ramp_samples", 0))
         self.ring_capacity = int(resp.get("ring_capacity", 0))
 
         self.delta_frames_in = max(0, self.frames_in_total - self.last_frames_in_total)
@@ -95,7 +112,10 @@ class SpeakerState:
             "frames_out_total": self.frames_out_total,
             "delta_frames_in": self.delta_frames_in,
             "delta_frames_out": self.delta_frames_out,
-            "mute_ramp_remaining": self.mute_ramp_remaining,
-            "consecutive_stress_ms": self.consecutive_stress_ms,
+            "target_gain_x1000": self.target_gain_x1000,
+            "current_gain_x1000": self.current_gain_x1000,
+            "health": self.health,
+            "consecutive_stress_ticks": self.consecutive_stress_ticks,
+            "consecutive_recovery_ticks": self.consecutive_recovery_ticks,
             "n_consecutive_query_failures": self.n_consecutive_query_failures,
         }

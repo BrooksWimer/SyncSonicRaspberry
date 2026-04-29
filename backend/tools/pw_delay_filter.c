@@ -80,15 +80,23 @@
 struct shared_state {
     atomic_uint target_delay_samples;     // where current_delay_samples slews toward
     atomic_int  rate_ppm;                 // signed; clamped to ±MAX_RATE_PPM
-    atomic_uint mute_ramp_total;          // total samples in current ramp
-    atomic_uint mute_ramp_remaining;      // counts down to 0; 0 means full volume
     atomic_int  shutdown_requested;       // control thread asks audio thread to quit
+
+    // Slice 3.2 gain control (soft-mute / unmute / partial dim).
+    // target_gain_x1000 is the destination on a 0..1000 = 0.0..1.0 scale.
+    // gain_ramp_samples is the wall-clock distance (in audio samples)
+    // a FULL 0->1 transition would take. Partial transitions take
+    // proportionally less time (slew rate is 1.0/gain_ramp_samples
+    // per sample). gain_ramp_samples=0 means instant snap (clicks!).
+    atomic_int  target_gain_x1000;
+    atomic_int  gain_ramp_samples;
 
     // Stats - audio thread writes, control thread reads
     atomic_ullong frames_in_total;
     atomic_ullong frames_out_total;
     atomic_uint   queue_depth_samples;    // current_delay_samples integer part
     atomic_uint   current_delay_samples_x100;  // *100 for centi-sample precision
+    atomic_int    current_gain_x1000;     // for query introspection
 };
 
 // -----------------------------------------------------------------------
@@ -101,6 +109,7 @@ struct audio_state {
     uint32_t write_index;             // shared between channels
     float    current_delay_samples;   // float for fractional interpolation
     double   rate_phase_acc;          // accumulator for ±ppm rate
+    float    current_gain;            // 0.0..1.0; slews toward target each sample
 };
 
 // -----------------------------------------------------------------------
@@ -199,8 +208,21 @@ static void on_process(void *userdata, struct spa_io_position *position) {
     int      rate   = atomic_load_explicit(&data->shared.rate_ppm,             memory_order_relaxed);
     if (target > data->audio.ring_capacity - 1) target = data->audio.ring_capacity - 1;
 
-    uint32_t mute_remaining = atomic_load_explicit(&data->shared.mute_ramp_remaining, memory_order_relaxed);
-    uint32_t mute_total     = atomic_load_explicit(&data->shared.mute_ramp_total,     memory_order_relaxed);
+    // Slice 3.2 soft-mute: read target gain (0..1) and ramp sample
+    // distance. We compute a per-sample gain step inside the loop so
+    // a target change mid-callback takes effect on the very next
+    // sample, not on the next callback boundary.
+    int target_gain_int = atomic_load_explicit(&data->shared.target_gain_x1000, memory_order_relaxed);
+    if (target_gain_int < 0)    target_gain_int = 0;
+    if (target_gain_int > 1000) target_gain_int = 1000;
+    const float target_gain = (float)target_gain_int * 0.001f;
+    int ramp_samples = atomic_load_explicit(&data->shared.gain_ramp_samples, memory_order_relaxed);
+    if (ramp_samples < 0) ramp_samples = 0;
+    // step magnitude per sample for a full 0->1 transition over
+    // ramp_samples; partial transitions take proportionally less
+    // time. ramp_samples=0 -> instant snap (Coordinator should never
+    // send 0 because it clicks).
+    const float gain_step_full = (ramp_samples > 0) ? (1.0f / (float)ramp_samples) : 1.0f;
 
     const double ppm_per_frame = (double)rate * 1.0e-6;
     const float  cur_target    = (float)target;
@@ -208,6 +230,7 @@ static void on_process(void *userdata, struct spa_io_position *position) {
     double       phase_acc     = data->audio.rate_phase_acc;
     uint32_t     w             = data->audio.write_index;
     const uint32_t cap         = data->audio.ring_capacity;
+    float        gain          = data->audio.current_gain;
 
     for (uint32_t i = 0; i < n_samples; i++) {
         // 1. Write input into both rings at the shared write index.
@@ -223,30 +246,25 @@ static void on_process(void *userdata, struct spa_io_position *position) {
         cur_delay += diff;
 
         // 3. Read at fractional position w - cur_delay + rate_phase_acc.
-        //    rate_phase_acc accumulates fractional-sample drift per frame.
         phase_acc += ppm_per_frame;
         float read_pos = (float)w - cur_delay - (float)phase_acc;
         float y_fl = ring_read_lerp(data->audio.ring_fl, cap, read_pos);
         float y_fr = ring_read_lerp(data->audio.ring_fr, cap, read_pos);
 
-        // 4. Apply mute ramp if active. Ramp shape is linear; total
-        //    samples is mute_total; remaining counts down. When
-        //    remaining > 0 the gain is (mute_total - remaining)
-        //    / mute_total -> ramps from 0 to 1 over `mute_total`. To
-        //    *mute*, the control thread sets remaining to mute_total +
-        //    (negative amount); we let it count below 0 to mean "stay
-        //    silent until further notice." For Slice 2 we just
-        //    implement linear unmute-ramp; full mute is "set
-        //    target_delay_samples to a value that quickly
-        //    starves and let the system fade naturally" - good enough
-        //    until Slice 3 needs sharper control.
-        float gain = 1.0f;
-        if (mute_remaining > 0 && mute_total > 0) {
-            float t = (float)(mute_total - mute_remaining) / (float)mute_total;
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            gain = t;
-            mute_remaining--;
+        // 4. Slew current gain toward target_gain. Step size is fixed
+        //    by gain_step_full; we clamp so we never overshoot. A
+        //    target change of 1.0 (full mute or full unmute) takes
+        //    exactly ramp_samples samples; smaller changes finish
+        //    proportionally sooner.
+        float gain_diff = target_gain - gain;
+        if (gain_diff > 0.0f) {
+            float step = gain_step_full;
+            if (step > gain_diff) step = gain_diff;
+            gain += step;
+        } else if (gain_diff < 0.0f) {
+            float step = -gain_step_full;
+            if (step < gain_diff) step = gain_diff;
+            gain += step;
         }
 
         out_fl[i] = y_fl * gain;
@@ -256,8 +274,9 @@ static void on_process(void *userdata, struct spa_io_position *position) {
     }
 
     data->audio.current_delay_samples = cur_delay;
-    data->audio.rate_phase_acc = phase_acc;
-    data->audio.write_index    = w;
+    data->audio.rate_phase_acc        = phase_acc;
+    data->audio.write_index           = w;
+    data->audio.current_gain          = gain;
 
     // Publish stats.
     atomic_fetch_add_explicit(&data->shared.frames_in_total,  n_samples, memory_order_relaxed);
@@ -265,7 +284,8 @@ static void on_process(void *userdata, struct spa_io_position *position) {
     atomic_store_explicit(&data->shared.queue_depth_samples, (uint32_t)cur_delay, memory_order_relaxed);
     atomic_store_explicit(&data->shared.current_delay_samples_x100,
                           (uint32_t)(cur_delay * 100.0f), memory_order_relaxed);
-    atomic_store_explicit(&data->shared.mute_ramp_remaining, mute_remaining, memory_order_relaxed);
+    atomic_store_explicit(&data->shared.current_gain_x1000,
+                          (int)(gain * 1000.0f + 0.5f), memory_order_relaxed);
 }
 
 static const struct pw_filter_events filter_events = {
@@ -292,7 +312,7 @@ static int read_line(int fd, char *buf, size_t n) {
 }
 
 static void handle_query(struct app_data *data, int client_fd) {
-    char json[512];
+    char json[640];
     int n = snprintf(
         json, sizeof(json),
         "{\"ok\":true,"
@@ -302,7 +322,9 @@ static void handle_query(struct app_data *data, int client_fd) {
         "\"queue_depth_samples\":%u,"
         "\"frames_in_total\":%llu,"
         "\"frames_out_total\":%llu,"
-        "\"mute_ramp_remaining\":%u,"
+        "\"target_gain_x1000\":%d,"
+        "\"current_gain_x1000\":%d,"
+        "\"gain_ramp_samples\":%d,"
         "\"ring_capacity\":%u}\n",
         atomic_load(&data->shared.target_delay_samples),
         atomic_load(&data->shared.current_delay_samples_x100),
@@ -310,7 +332,9 @@ static void handle_query(struct app_data *data, int client_fd) {
         atomic_load(&data->shared.queue_depth_samples),
         (unsigned long long)atomic_load(&data->shared.frames_in_total),
         (unsigned long long)atomic_load(&data->shared.frames_out_total),
-        atomic_load(&data->shared.mute_ramp_remaining),
+        atomic_load(&data->shared.target_gain_x1000),
+        atomic_load(&data->shared.current_gain_x1000),
+        atomic_load(&data->shared.gain_ramp_samples),
         data->audio.ring_capacity
     );
     if (n > 0) (void)write(client_fd, json, (size_t)n);
@@ -341,17 +365,30 @@ static void handle_command(struct app_data *data, int client_fd, char *line) {
         char ack[64];
         int n = snprintf(ack, sizeof(ack), "{\"ok\":true,\"rate_ppm\":%d}\n", v);
         (void)write(client_fd, ack, (size_t)n);
-    } else if (strcmp(cmd, "set_mute_ramp_ms") == 0) {
-        char *arg = strtok(NULL, " \t");
-        if (!arg) { (void)write(client_fd, "{\"ok\":false,\"err\":\"missing_ms\"}\n", 32); return; }
-        int ms = atoi(arg);
-        if (ms < 0) ms = 0;
-        if (ms > 5000) ms = 5000;
-        uint32_t total = (uint32_t)((ms * SAMPLE_RATE) / 1000);
-        atomic_store(&data->shared.mute_ramp_total,     total);
-        atomic_store(&data->shared.mute_ramp_remaining, total);
-        char ack[64];
-        int n = snprintf(ack, sizeof(ack), "{\"ok\":true,\"mute_total\":%u}\n", total);
+    } else if (strcmp(cmd, "mute_to") == 0) {
+        // Slice 3.2: mute_to <gain_x1000> <ramp_ms>
+        // Set target gain (0..1000 = silent..full) over <ramp_ms>.
+        // The audio thread slews current_gain toward target one
+        // sample at a time at rate 1.0/ramp_samples per sample.
+        char *arg_g = strtok(NULL, " \t");
+        char *arg_r = strtok(NULL, " \t");
+        if (!arg_g || !arg_r) {
+            (void)write(client_fd, "{\"ok\":false,\"err\":\"usage:mute_to <gain_x1000> <ramp_ms>\"}\n", 59);
+            return;
+        }
+        int gain = atoi(arg_g);
+        int ms   = atoi(arg_r);
+        if (gain < 0)    gain = 0;
+        if (gain > 1000) gain = 1000;
+        if (ms < 0)      ms   = 0;
+        if (ms > 5000)   ms   = 5000;
+        int ramp_samples = (ms * SAMPLE_RATE) / 1000;
+        atomic_store(&data->shared.target_gain_x1000,  gain);
+        atomic_store(&data->shared.gain_ramp_samples,  ramp_samples);
+        char ack[96];
+        int n = snprintf(ack, sizeof(ack),
+                         "{\"ok\":true,\"target_gain_x1000\":%d,\"ramp_samples\":%d}\n",
+                         gain, ramp_samples);
         (void)write(client_fd, ack, (size_t)n);
     } else if (strcmp(cmd, "query") == 0) {
         handle_query(data, client_fd);
@@ -478,9 +515,12 @@ int main(int argc, char *argv[]) {
     uint32_t initial_target = clamp_delay_samples(delay_ms);
     atomic_store(&data.shared.target_delay_samples, initial_target);
     atomic_store(&data.shared.rate_ppm, 0);
-    atomic_store(&data.shared.mute_ramp_total, 0);
-    atomic_store(&data.shared.mute_ramp_remaining, 0);
     atomic_store(&data.shared.shutdown_requested, 0);
+    // Slice 3.2: gain starts at full volume with no ramp pending so
+    // a freshly-started filter is not silent.
+    atomic_store(&data.shared.target_gain_x1000, 1000);
+    atomic_store(&data.shared.gain_ramp_samples, 0);
+    atomic_store(&data.shared.current_gain_x1000, 1000);
     atomic_store(&data.shared.frames_in_total, 0);
     atomic_store(&data.shared.frames_out_total, 0);
     atomic_store(&data.shared.queue_depth_samples, 0);
@@ -501,6 +541,7 @@ int main(int argc, char *argv[]) {
     data.audio.write_index = 0;
     data.audio.current_delay_samples = (float)initial_target;
     data.audio.rate_phase_acc = 0.0;
+    data.audio.current_gain = 1.0f;
 
     // Ignore SIGPIPE so a client closing the socket mid-write doesn't
     // kill the whole process.

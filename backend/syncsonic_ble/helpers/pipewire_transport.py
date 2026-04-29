@@ -275,6 +275,27 @@ class PipeWireTransportManager:
         resp = self._send_socket_command(sock_path, f"set_rate_ppm {int(ppm)}")
         return bool(resp and resp.get("ok"))
 
+    def set_gain_target(self, mac: str, gain_x1000: int, ramp_ms: int) -> bool:
+        """Send ``mute_to <gain_x1000> <ramp_ms>`` to the speaker's filter.
+
+        Used by Slice 3.2's soft-mute on transport failure: ``set_gain_target(mac, 0, 50)``
+        fades to silence over 50 ms; a later ``set_gain_target(mac, 1000, 50)``
+        fades back in. The C filter slews ``current_gain`` per audio sample at
+        rate 1.0/ramp_samples, so a full 0->1 (or 1->0) transition completes in
+        exactly ramp_ms wall time, mid-transition target changes redirect
+        smoothly without a click.
+        """
+        mac = mac.upper()
+        with self._lock:
+            route = self._active_routes.get(mac)
+            sock_path = route.get("socket_path") if route else None
+        if not sock_path:
+            return False
+        gain_x1000 = max(0, min(1000, int(gain_x1000)))
+        ramp_ms = max(0, min(5000, int(ramp_ms)))
+        resp = self._send_socket_command(sock_path, f"mute_to {gain_x1000} {ramp_ms}")
+        return bool(resp and resp.get("ok"))
+
     # -- socket helpers -----------------------------------------------------
 
     def _send_set_delay(self, sock_path: str, delay_ms: float) -> bool:

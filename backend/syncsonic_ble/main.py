@@ -28,6 +28,7 @@ from syncsonic_ble.infra.gatt_service import (
 from syncsonic_ble.state_management.bus_manager import get_bus
 from syncsonic_ble.state_management.connection_manager import ConnectionService
 from syncsonic_ble.state_management.device_manager import DeviceManager
+from syncsonic_ble.telemetry.collector import build_default_collector, set_collector
 from syncsonic_ble.utils.constants import (
     ADAPTER_INTERFACE,
     AGENT_MANAGER_INTERFACE,
@@ -137,12 +138,30 @@ def main() -> None:
         ),
     )
 
+    # Slice 1 telemetry collector. Background daemon thread; shares the
+    # service's SystemBus so we don't open a second BlueZ connection.
+    # Failures inside the collector are isolated and never break the
+    # audio service.
+    try:
+        collector = build_default_collector(bus=bus)
+        collector.start()
+        set_collector(collector)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Telemetry collector failed to start, continuing without it: %s", exc)
+        collector = None
+
     log.info("SyncSonic BLE server ready, service UUID %s", SERVICE_UUID)
     loop = GLib.MainLoop()
     try:
         loop.run()
     except KeyboardInterrupt:
         log.info("Server stopped by user")
+    finally:
+        if collector is not None:
+            try:
+                collector.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Telemetry collector stop failed: %s", exc)
 
 
 if __name__ == "__main__":

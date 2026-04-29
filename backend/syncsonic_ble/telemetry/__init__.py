@@ -123,6 +123,12 @@ class EventType:
     BLUEZ_CONNECT = "bluez_connect"
     BLUEZ_DISCONNECT = "bluez_disconnect"
     MIC_SEGMENT_WRITTEN = "mic_segment_written"
+    # Slice 3 System Coordinator: per-tick observation summary and any
+    # actions taken (rate adjustment, system-wide hold, soft-mute).
+    COORDINATOR_TICK = "coordinator_tick"
+    COORDINATOR_RATE_ADJUST = "coordinator_rate_adjust"
+    COORDINATOR_SYSTEM_HOLD = "coordinator_system_hold"
+    COORDINATOR_SOFT_MUTE = "coordinator_soft_mute"
 
 
 def telemetry_root() -> Path:

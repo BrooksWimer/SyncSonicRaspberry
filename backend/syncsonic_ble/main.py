@@ -25,6 +25,7 @@ from syncsonic_ble.infra.gatt_service import (
     ClientConfigDescriptor,
     GattService,
 )
+from syncsonic_ble.coordinator.coordinator import build_and_start_coordinator
 from syncsonic_ble.state_management.bus_manager import get_bus
 from syncsonic_ble.state_management.connection_manager import ConnectionService
 from syncsonic_ble.state_management.device_manager import DeviceManager
@@ -150,6 +151,18 @@ def main() -> None:
         log.warning("Telemetry collector failed to start, continuing without it: %s", exc)
         collector = None
 
+    # Slice 3 System Coordinator. Daemon thread that observes every
+    # live pw_delay_filter via its Unix socket. Observation-only in
+    # commit 3.1; subsequent commits add bounded rate adjustment
+    # (3.2), system-wide hold (3.3), soft-mute on transport failure
+    # (3.4), and RSSI-aware preemptive soft-mute (3.5). Like the
+    # collector, failure here must never break the audio service.
+    try:
+        coordinator = build_and_start_coordinator()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Coordinator failed to start, continuing without it: %s", exc)
+        coordinator = None
+
     log.info("SyncSonic BLE server ready, service UUID %s", SERVICE_UUID)
     loop = GLib.MainLoop()
     try:
@@ -157,6 +170,11 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("Server stopped by user")
     finally:
+        if coordinator is not None:
+            try:
+                coordinator.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Coordinator stop failed: %s", exc)
         if collector is not None:
             try:
                 collector.stop()

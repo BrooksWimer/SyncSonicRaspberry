@@ -70,6 +70,11 @@ class ConnectionService:
 
         self.expected: set[str] = set()
         self.loopbacks: set[str] = set()
+        # Per-MAC last-auto-reconnect timestamp (CLOCK_MONOTONIC). Used to
+        # debounce one-shot reconnect attempts so duplicate Connected=False
+        # signals (the device_manager and connection_manager both subscribe
+        # to BlueZ PropertiesChanged) cannot enqueue a CONNECT_ONE storm.
+        self._last_auto_reconnect: Dict[str, float] = {}
         self.actuation = get_actuation_manager()
         self._worker = threading.Thread(target=self._run_worker, daemon=True)
         self._worker.start()
@@ -245,6 +250,12 @@ class ConnectionService:
                         )
                     continue
 
+                # User-initiated disconnect: remove the MAC from expected so the
+                # LOOPBACK_SYNC auto-reconnect logic does not immediately requeue
+                # a connect attempt. Without this, "user pressed disconnect" and
+                # "speaker dropped out" would be indistinguishable to the
+                # auto-reconnect path.
+                self.expected.discard(mac_or_id.upper())
                 self._disconnect_everywhere(mac_or_id.upper())
                 continue
 
@@ -259,6 +270,34 @@ class ConnectionService:
                     self.actuation.remove_output(mac)
                     self.loopbacks.remove(mac)
                     logger.info("Loopback removed after disconnect for %s", mac)
+
+                # Auto-reconnect: an "expected" speaker that disconnects without
+                # the user asking should attempt one CONNECT_ONE retry. The FSM
+                # (analyze_device + _try_reconnect) does its own 3-attempt
+                # internal retry on top of this single requeue; if it fails, the
+                # user can still press connect again from the app. Reserved
+                # adapter devices (the phone) are never auto-reconnected because
+                # they aren't speakers.
+                mac_u = mac.upper()
+                if (
+                    not connected
+                    and mac_u in self.expected
+                    and not is_device_on_reserved_adapter(self.bus, mac)
+                ):
+                    now = time.monotonic()
+                    last = self._last_auto_reconnect.get(mac_u, 0.0)
+                    if now - last >= 2.0:
+                        self._last_auto_reconnect[mac_u] = now
+                        logger.info(
+                            "Speaker %s disconnected unexpectedly while expected; queuing one-shot reconnect",
+                            mac,
+                        )
+                        work_q.put((Intent.CONNECT_ONE, {
+                            "mac": mac,
+                            "friendly_name": "",
+                            "allowed": list(self.expected),
+                            "settings": {},
+                        }))
                 continue
 
             if intent is Intent.TEST_LATENCY:

@@ -12,6 +12,8 @@ from syncsonic_ble.helpers.adapter_helpers import is_device_on_reserved_adapter
 from syncsonic_ble.helpers.device_type_helpers import is_sonos
 from syncsonic_ble.helpers.pipewire_control_plane import publish_output_mix
 from syncsonic_ble.state_management.scan_manager import ScanManager
+from syncsonic_ble.telemetry import EventType
+from syncsonic_ble.telemetry.event_writer import emit
 from syncsonic_ble.utils.constants import (
     ADAPTER_INTERFACE,
     BLUEZ_SERVICE_NAME,
@@ -130,6 +132,7 @@ def handle_set_latency(char, data):
         return _encode(Msg.ERROR, {"error": "MAC is on the reserved adapter (phone), cannot apply output delay"})
 
     latency_ms = float(latency)
+    emit(EventType.SET_LATENCY_REQUEST, {"mac": mac, "delay_ms": latency_ms})
     manager = get_actuation_manager()
     ok, snapshot = manager.apply_control_target(mac, delay_ms=latency_ms, rate_ppm=0.0, mode="manual")
     if ok:
@@ -171,6 +174,13 @@ def handle_set_volume(char, data):
     left = min(max(left, 0), 150)
     right = min(max(right, 0), 150)
 
+    emit(EventType.SET_VOLUME_REQUEST, {
+        "mac": mac,
+        "volume": volume,
+        "balance": balance,
+        "left_percent": left,
+        "right_percent": right,
+    })
     publish_output_mix(mac, left_percent=left, right_percent=right)
     return _encode(Msg.SUCCESS, {"left": left, "right": right})
 

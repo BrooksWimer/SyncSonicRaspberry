@@ -14,6 +14,8 @@ from syncsonic_ble.helpers.adapter_helpers import (
     extract_mac,
 )
 from syncsonic_ble.state_management.bus_manager import get_bus
+from syncsonic_ble.telemetry import EventType
+from syncsonic_ble.telemetry.event_writer import emit
 from syncsonic_ble.utils.constants import (
     A2DP_UUID,
     ADAPTER_INTERFACE,
@@ -91,6 +93,10 @@ class DeviceManager:
             return
 
         log.info("[BlueZ] %s is now %s", mac, "CONNECTED" if connected else "DISCONNECTED")
+        emit(
+            EventType.BLUEZ_CONNECT if connected else EventType.BLUEZ_DISCONNECT,
+            {"mac": mac, "path": path},
+        )
 
         if connected:
             self._handle_new_connection(path, mac)

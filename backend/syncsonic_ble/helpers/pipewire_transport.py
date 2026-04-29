@@ -8,6 +8,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
+from syncsonic_ble.telemetry import EventType
+from syncsonic_ble.telemetry.event_writer import emit
 from syncsonic_ble.utils.logging_conf import get_logger
 
 log = get_logger(__name__)
@@ -155,6 +157,15 @@ class PipeWireTransportManager:
             sink_name,
             target_delay_ms,
         )
+        emit(EventType.ROUTE_CREATE, {
+            "mac": mac,
+            "sink": sink_name,
+            "node_fl": node_fl,
+            "node_fr": node_fr,
+            "delay_ms": target_delay_ms,
+            "left_percent": target_left,
+            "right_percent": target_right,
+        })
         return True
 
     def remove_route(self, mac: str) -> None:
@@ -169,6 +180,10 @@ class PipeWireTransportManager:
         self._terminate_process(route.get("proc_fl"))
         self._terminate_process(route.get("proc_fr"))
         log.info("PipeWire delay transport removed for %s", mac)
+        emit(EventType.ROUTE_TEARDOWN, {
+            "mac": mac,
+            "sink": route.get("sink", ""),
+        })
 
     def _ensure_filter_binary(self) -> bool:
         if not FILTER_SOURCE.exists():

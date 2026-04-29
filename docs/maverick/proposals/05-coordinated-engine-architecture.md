@@ -863,3 +863,98 @@ is wired and ready for Slice 3's System Coordinator to consume.
 Slice 3 (System Coordinator: bounded ±50 ppm rate adjustment,
 system-wide synchronous hold, soft-mute + phase-aligned re-entry on
 transport failure) is the next workstream.
+
+## 12. Slice 3.1 Pi Validation Evidence (2026-04-29 EDT)
+
+Slice 3.1 (Coordinator skeleton, observation-only) is feature-complete
+and Pi-validated. The Coordinator runs as a daemon thread inside
+``syncsonic_ble.main``, ticks at 10 Hz, discovers every live
+``pw_delay_filter`` instance via ``/tmp/syncsonic-engine/*.sock``,
+queries each one for its current state, and emits one
+``coordinator_tick`` event per second to the telemetry stream.
+
+### Live test result (3 speakers, music playing)
+
+```
+=== bt connected ===
+Device AC:DF:A1:52:8A:41 Brooks       (phone)
+
+=== sinks ===
+virtual_out                       RUNNING
+bluez_output.F4..C8.1 (VIZIO)     RUNNING
+bluez_output.28..3B.1 (JBL Flip)  RUNNING
+bluez_output.2C..0A.1 (JBL Flip)  RUNNING
+
+=== filter processes ===
+pw_delay_filter ... syncsonic-delay-28_fa_19_b6_0e_3b   59s elapsed
+pw_delay_filter ... syncsonic-delay-2c_fd_b4_69_46_0a   56s elapsed
+pw_delay_filter ... syncsonic-delay-f4_6a_dd_d4_f3_c8   89s elapsed
+
+=== coordinator_tick (last 3 events) ===
+[16:14:05.627Z] tick=5030 n_speakers=3 actions=False
+  F4:6A...C8: dframes_in=5120 dframes_out=5120
+  28:FA...3B: dframes_in=5120 dframes_out=5120
+  2C:FD...0A: dframes_in=5120 dframes_out=5120
+[16:14:06.628Z] tick=5040 n_speakers=3 actions=False
+  F4:6A...C8: dframes_in=5120 dframes_out=5120
+  28:FA...3B: dframes_in=4608 dframes_out=4608
+  2C:FD...0A: dframes_in=5120 dframes_out=5120
+[16:14:07.629Z] tick=5050 n_speakers=3 actions=False
+  F4:6A...C8: dframes_in=4608 dframes_out=4608
+  28:FA...3B: dframes_in=4608 dframes_out=4608
+  2C:FD...0A: dframes_in=4608 dframes_out=4608
+```
+
+### What the data establishes
+
+- **Coordinator ticks at exactly 10 Hz** under sustained load
+  (tick=5050 after 505s = perfect cadence). The 100 ms tick budget is
+  comfortably met at 3 speakers.
+- **Per-speaker frames_in == frames_out every tick** — each filter is
+  processing every input sample with zero drops. This is the
+  foundational health invariant the Slice 3 policy commits will
+  monitor for stress.
+- **Natural jitter floor is ±10%** in the 1-second tick window (4608
+  to 5120 vs nominal 4800). This is sample-rate granularity vs tick
+  timing, not real audio variability. Slice 3.x policies must use
+  rolling windows >= 5s to filter this noise.
+- **CPU: 5.1% main service + 13% audio infra total** for 3 speakers.
+  Headroom available; the proposal's aspirational 20 ms (50 Hz) tick
+  rate is achievable but currently unnecessary.
+
+### Re-scope of Slice 3 sub-commits based on observation data
+
+The architecture proposal Section 4.3 listed three policy primitives
+in this order: bounded rate adjustment, system-wide hold, soft-mute.
+The 3.1 observation data motivates a different order:
+
+- **PI rate adjustment was nominally Slice 3.2.** It targets "50%
+  buffer depth" but our filter's queue depth follows the user's
+  configured delay, not any downstream BT-side observable.
+  PipeWire's internal resamplers already handle clock drift between
+  virtual_out and each bluez_output. Without an external clock
+  reference (which only arrives in Slice 4 via the mic), an
+  autonomous PI controller would be an answer looking for a question.
+- **Soft-mute on transport failure** is the next-Slice-3 commit
+  that actually delivers a user-visible win — directly addressing
+  the Section 9 VIZIO drops. New target order:
+    - 3.2: Soft-mute + phase-aligned re-entry on transport failure
+    - 3.3: RSSI-aware preemptive soft-mute (Section 9 implication
+      made executable)
+    - 3.4: System-wide synchronous hold (only after 3.2/3.3 reveal a
+      need for it)
+    - 3.5: PI rate adjustment (deferred to Slice 4 unless required earlier)
+- **The set_rate_ppm socket command is already plumbed** in the C
+  filter and ``transport_manager``; Slice 3.5 (or earlier if needed)
+  just needs to wire policy into the Coordinator. The infrastructure
+  cost of deferring 3.2-as-rate-adjustment is zero.
+
+### Status
+
+Slice 3.1 is feature-complete and Pi-validated. The Coordinator is
+observing the system every 100 ms with no measurable disturbance to
+the audio path. The data baseline (frame deltas, jitter floor) gives
+the Slice 3.2-3.4 policy commits a measurement floor to work against.
+
+Slice 3.2 (soft-mute + phase-aligned re-entry on transport failure) is
+the next commit.

@@ -1261,3 +1261,85 @@ Slice 3.7 (forced stress validation) is the natural next slice if we
 want to capture a real soft-mute firing on demand. Slice 3.4 (system-
 wide synchronous hold) and 3.5 (PI rate adjustment) remain deferred
 per the original reorder.
+
+## 16. Slice 3.3v2: RSSI-as-amplifier (2026-04-29 EDT)
+
+Production telemetry from the day's listening session revealed that
+the original Slice 3.3 design (RSSI dip as direct mute trigger) was
+oscillating pathologically. Across roughly 35 minutes of playback,
+the VIZIO speaker (F4:6A:DD:D4:F3:C8 on hci0) accumulated **124
+soft_mute events**, clustered into 7 bursts of 4 to 50 events each,
+all with reason=``rssi_dip``, all with ``delta_frames_out`` flat at
+the healthy 4608-5120 range. The user perceived these bursts as
+"the VIZIO is cutting out".
+
+### Failure mode
+
+The detector's exit condition (``delta_frames_out >
+STRESS_FRAMES_IN_THRESHOLD``) was satisfied every single recovery
+tick because the BlueZ transport had never actually stopped pumping
+frames - only RSSI was dipped. So the cycle was:
+
+1. RSSI 10s median dips 5+ dB below 60s baseline, 2 ticks of
+   confirmation, MUTE fires (correct per the v1 spec).
+2. ``MIN_MUTED_HOLD_MS = 500`` elapses; frames are still flowing
+   (they never stopped); 5 ticks of "recovery" satisfied; UNMUTE
+   fires.
+3. RSSI median is still dipped (the 10s and 60s windows shift
+   slowly, ~1 dB per second at most), so 200 ms later we re-enter
+   the dip detection state, count to 2 ticks, MUTE again.
+4. GOTO 2.
+
+Net effect: ~700 ms cycle time, 1.4 events/second, sustained for as
+long as the RF dip lasted (5-20 seconds in observed bursts).
+
+### Root-cause realization
+
+RSSI dropping by 5 dB **does not always mean audio is about to fail**.
+Many BT links lose 5-10 dB and just renegotiate to a lower SBC
+bitpool while audio continues. We were muting on a *threat* that
+never materialized into actual frame starvation, then immediately
+unmuting because the threat was never real, then re-muting because
+the RF environment was still poor. The exit signal disagreed with
+the entry signal.
+
+### Fix: separate concerns
+
+RSSI is no longer a mute trigger. Instead it acts as a
+**sensitivity amplifier** for the existing frame-stuck detector:
+
+- Base ``STRESS_FRAMES_OUT_THRESHOLD = 500`` frames/tick (~90% below
+  nominal): catches "BlueZ has essentially stopped consuming".
+- Amplified ``STRESS_FRAMES_OUT_THRESHOLD_AMPLIFIED = 2400``
+  frames/tick (~50% below nominal): catches "BlueZ is consuming at
+  half-rate", a real degradation but still well above natural jitter
+  (the Slice 3.1 evidence floor was about 4096 / -15%).
+
+We use the amplified threshold only when ``rssi_dip_db >=
+RSSI_DIP_THRESHOLD_DB`` (5.0 dB) over the existing minimum-sample
+gates. Pure RF dips with healthy frames -> no mute. Pure frame
+stuck -> mute at base threshold (Slice 3.2 behaviour preserved
+exactly). Frame degradation under RF stress -> mute 2-3 ticks
+(200-300 ms) earlier than the base threshold would, which is the
+preemption Slice 3.3 was supposed to deliver in the first place.
+
+### Telemetry distinction
+
+The mute reason now distinguishes between:
+
+- ``frames_in_flowing_out_starved`` - clean BT environment, BlueZ
+  unilaterally stalled (the original Slice 3.2 case).
+- ``frames_starved_under_rssi_stress`` - RSSI dipped concurrently
+  with frame degradation. The amplified threshold is what actually
+  fired here.
+
+Both are real audio failures; the tag lets the analyzer correlate
+the two trigger paths against subjective listening notes when we
+do field work.
+
+### Validation expectation
+
+Replaying the same listening conditions that produced 124 oscillating
+events should produce zero or single-digit events: any event that
+fires now corresponds to actual frame degradation, not a pure RF
+dip. The next Pi validation run will append numbers here.

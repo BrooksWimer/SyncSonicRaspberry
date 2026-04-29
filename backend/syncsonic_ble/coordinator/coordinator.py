@@ -6,14 +6,23 @@ each one for its current state, refreshes per-speaker RSSI from the
 RssiSampler's shared snapshot, and emits one ``coordinator_tick``
 event per second to the telemetry stream summarising the system.
 
-Active policy as of Slice 3.3:
+Active policy (Slice 3.3v2 - RSSI-as-amplifier):
 - HEALTHY -> MUTED on N consecutive ticks of "frames_in flowing AND
-  frames_out starved" (Slice 3.2: transport-failure detector).
-- HEALTHY -> MUTED on N consecutive ticks of "10s rolling-median
-  RSSI is RSSI_DIP_THRESHOLD_DB or more below the 60s baseline"
-  (Slice 3.3: preemptive RSSI dip detector).
+  frames_out starved", where the frames_out threshold tightens
+  (500 -> 2400 frames/tick) when RSSI is dipped 5+ dB below
+  baseline. RSSI alone never mutes; RSSI just lowers the bar for
+  the frame-stuck detector.
 - MUTED -> HEALTHY on M consecutive ticks of "frames_out clearly
   flowing again" + 500 ms minimum hold to debounce.
+
+This replaces the original Slice 3.3v1 design (RSSI as direct
+mute trigger) which oscillated badly in production: a sustained
+5 dB RF dip would mute -> exit (frames never stopped) -> mute
+again in tight cycles, ~10 events/second for 5-20 second bursts.
+The user perceived this as "the speaker is cutting out". The fix:
+make RSSI a sensitivity amplifier, not a trigger - pure RF dips
+with healthy frames don't mute, while real frame degradation under
+RF stress mutes 4.8x earlier than it would on the base threshold.
 
 Why observation-only first
 --------------------------
@@ -89,22 +98,29 @@ TICKS_TO_DECLARE_RECOVERY = 5        # 500 ms of healthy flow while muted -> unm
 SOFT_MUTE_RAMP_MS = 50               # both fade-out and fade-in
 MIN_MUTED_HOLD_MS = 500              # don't unmute earlier than this after muting
 
-# Slice 3.3 RSSI-aware preemptive policy parameters. RSSI is the
-# leading indicator: by the time delta_frames_out collapses (Slice
-# 3.2's signal), the audible dropout is already in flight. RSSI
-# sampling runs at 1 Hz so the 10s rolling median is a fairly stable
-# 10-sample summary. We require RSSI_DIP_THRESHOLD_DB of degradation
-# vs the 60s baseline to fire, plus enough samples in BOTH windows
-# so the comparison is meaningful (no triggering on a half-empty
-# 60s deque immediately after a fresh connection).
+# Slice 3.3 RSSI-aware policy parameters. RSSI is now used as a
+# SENSITIVITY AMPLIFIER for the frame-stuck detector, not as an
+# independent mute trigger. The original v1 of Slice 3.3 used RSSI
+# as a direct trigger and oscillated badly in production: a sustained
+# 5 dB RF dip would mute -> exit (frames never stopped) -> mute again
+# in tight cycles, ~10 events/second for 5-20 second bursts, because
+# the 10s/60s rolling medians shift slowly and the exit condition
+# was met instantly. The current policy avoids that loop entirely:
+# RSSI alone never mutes. When RSSI is dipped, the frame-stuck
+# threshold tightens, so we catch real audio degradation earlier
+# than a pure frame-stuck detector would (typically 2-3 ticks /
+# 200-300 ms earlier).
 RSSI_DIP_THRESHOLD_DB = 5.0          # 10s median this much below 60s baseline => stress
-TICKS_TO_DECLARE_RSSI_STRESS = 2     # 200 ms of consecutive RSSI stress -> mute
 RSSI_MIN_SAMPLES_10S = 5             # 10s deque must have at least this many samples
 RSSI_MIN_SAMPLES_60S = 30            # 60s deque must have at least this many samples
-# Note: with a 1 Hz sampler, a fresh connection takes >=30 s before
-# the RSSI-dip detector is allowed to fire. That's deliberate; we
-# would rather miss the first 30 s of RSSI-stress on a brand-new
-# connection than false-mute on a deque that hasn't filled yet.
+# Stress-amplified frame-out threshold. With Slice 3.1 evidence
+# showing nominal dframes_out=4800 +/- ~200 (3-sigma), the base
+# threshold of 500 catches "essentially zero". The amplified
+# threshold of 2400 catches "half normal" - a clear frame-flow
+# degradation, but still well above natural jitter. We only flip to
+# the amplified threshold when RSSI is actually dipped, so normal
+# operation uses the conservative base threshold.
+STRESS_FRAMES_OUT_THRESHOLD_AMPLIFIED = 2400
 
 _SOCKET_NAME_RE = re.compile(r"^syncsonic-delay-([0-9a-f_]{17})\.sock$")
 
@@ -147,7 +163,7 @@ class Coordinator:
         )
         self._thread.start()
         log.info(
-            "Coordinator started (policy=soft-mute[transport+rssi], %d Hz tick)",
+            "Coordinator started (policy=soft-mute[transport-stuck;rssi-amp], %d Hz tick)",
             TICK_HZ,
         )
 
@@ -222,30 +238,30 @@ class Coordinator:
         For each speaker we run a 3-state machine:
 
           HEALTHY  - frames in == frames out, both flowing normally
-                     -> N consecutive frame-stuck ticks  -> MUTED  (Slice 3.2)
-                     -> N consecutive RSSI-dip ticks      -> MUTED  (Slice 3.3)
+                     -> N consecutive frame-stuck ticks  -> MUTED
+                     (RSSI is a sensitivity amplifier, not a trigger)
           MUTED    - we've sent mute_to 0 50, output is silent
-                     -> M consecutive recovery ticks    -> HEALTHY
+                     -> M consecutive frame-flow ticks   -> HEALTHY
                      -> stays muted indefinitely if recovery never comes
-          STRESSED - reserved for future system-hold use (Slice 3.4);
-                     not entered by current logic
+          STRESSED - reserved for future use; not entered by current logic
 
-        Detection rule 1 (Slice 3.2 - reactive, transport-failure):
-          delta_frames_in  > STRESS_FRAMES_IN_THRESHOLD  (audio still flowing in)
+        Single mute trigger, dynamic threshold:
+          delta_frames_in  > STRESS_FRAMES_IN_THRESHOLD     (audio still flowing in)
           AND
-          delta_frames_out < STRESS_FRAMES_OUT_THRESHOLD (BlueZ has stopped consuming)
+          delta_frames_out < dynamic_threshold              (BlueZ output starved)
+            where dynamic_threshold is:
+              STRESS_FRAMES_OUT_THRESHOLD            (500)  if RSSI is fine,
+              STRESS_FRAMES_OUT_THRESHOLD_AMPLIFIED (2400)  if RSSI is dipped.
 
-        Detection rule 2 (Slice 3.3 - preemptive, RSSI-dip):
-          rssi_median_60s - rssi_median_10s >= RSSI_DIP_THRESHOLD_DB
-          AND enough samples in both deques to make the comparison meaningful.
+        RSSI as amplifier (not trigger) - rationale documented in the
+        constants block above and in Section 16 of the architecture
+        proposal. Pure RF dips with healthy frames do NOT mute; pure
+        frame stuck mutes (always); frame degradation under RSSI
+        stress mutes 4.8x earlier than it would otherwise.
 
-        Either rule firing transitions HEALTHY -> MUTED. Recovery is
-        unified: only frame-flow recovery exits MUTED, since RSSI may
-        recover before BlueZ has actually drained its retransmit queue.
-
-        Pause / silence does NOT trigger rule 1 because the filter
+        Pause / silence does NOT trigger this because the filter
         still processes zero-valued samples on both sides; both
-        deltas drop together. Rule 2 is unaffected by playback state.
+        deltas drop together and stay in lockstep.
         """
         for state in self._states.values():
             self._tick_speaker_policy(state)
@@ -255,40 +271,51 @@ class Coordinator:
         if s.last_query_monotonic_ns == 0:
             return
 
-        in_flowing = s.delta_frames_in > STRESS_FRAMES_IN_THRESHOLD
-        out_starved = s.delta_frames_out < STRESS_FRAMES_OUT_THRESHOLD
-        in_starved = s.delta_frames_in < STRESS_FRAMES_OUT_THRESHOLD
-
-        # Slice 3.3 RSSI-dip detector. Only meaningful once both deques
-        # have filled enough; until then we just don't increment the
-        # counter (so a fresh connection can't false-mute itself in
-        # its first 30 seconds).
-        rssi_dip = (
+        # Slice 3.3 RSSI-dip detector, used here ONLY as an amplifier
+        # for the frame-stuck threshold. We still update
+        # consecutive_rssi_stress_ticks so the counter remains visible
+        # in coordinator_tick events (useful for after-the-fact
+        # threshold tuning), but it never directly triggers a mute.
+        rssi_dipped = (
             s.rssi_n_samples_10s >= RSSI_MIN_SAMPLES_10S
             and s.rssi_n_samples_60s >= RSSI_MIN_SAMPLES_60S
             and s.rssi_dip_db >= RSSI_DIP_THRESHOLD_DB
         )
 
+        out_threshold = (
+            STRESS_FRAMES_OUT_THRESHOLD_AMPLIFIED
+            if rssi_dipped
+            else STRESS_FRAMES_OUT_THRESHOLD
+        )
+
+        in_flowing = s.delta_frames_in > STRESS_FRAMES_IN_THRESHOLD
+        out_starved = s.delta_frames_out < out_threshold
+        in_starved = s.delta_frames_in < STRESS_FRAMES_OUT_THRESHOLD
+
         if s.health == HEALTH_HEALTHY:
-            # Frame-stuck detector (Slice 3.2)
             if in_flowing and out_starved:
                 s.consecutive_stress_ticks += 1
             else:
                 s.consecutive_stress_ticks = 0
 
-            # RSSI-dip detector (Slice 3.3)
-            if rssi_dip:
+            # RSSI-stress counter is purely informational now (kept
+            # for telemetry / threshold-tuning analysis).
+            if rssi_dipped:
                 s.consecutive_rssi_stress_ticks += 1
             else:
                 s.consecutive_rssi_stress_ticks = 0
 
-            # Whichever fires first wins; tie goes to frame-stuck since
-            # it's the more deterministic "audio is actively dying"
-            # signal.
             if s.consecutive_stress_ticks >= TICKS_TO_DECLARE_STRESS:
-                self._enter_muted(s, reason="frames_in_flowing_out_starved")
-            elif s.consecutive_rssi_stress_ticks >= TICKS_TO_DECLARE_RSSI_STRESS:
-                self._enter_muted(s, reason="rssi_dip")
+                # Tag the reason so the analyzer can distinguish "BT
+                # link was clean, BlueZ stalled" from "BT link was
+                # dipping AND audio degraded". The latter is the case
+                # the amplified threshold catches earlier.
+                reason = (
+                    "frames_starved_under_rssi_stress"
+                    if rssi_dipped
+                    else "frames_in_flowing_out_starved"
+                )
+                self._enter_muted(s, reason=reason)
 
         elif s.health == HEALTH_MUTED:
             # Recover when frames are clearly flowing through the filter

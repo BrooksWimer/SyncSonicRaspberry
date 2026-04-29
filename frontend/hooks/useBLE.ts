@@ -8,7 +8,13 @@ import {
   Characteristic,
   Device,
 } from "react-native-ble-plx";
-import { SERVICE_UUID, CHARACTERISTIC_UUID, MESSAGE_TYPES } from "@/utils/ble_constants";
+import {
+  SERVICE_UUID,
+  CHARACTERISTIC_UUID,
+  MESSAGE_TYPES,
+  CoordinatorState,
+  CoordinatorEvent,
+} from "@/utils/ble_constants";
 
 import { getConfigurations, getSpeakers, updateConnectionStatus, updateSpeakerConnectionStatus } from "@/utils/database";
 
@@ -101,6 +107,16 @@ export function useBLE(onNotification?: NotificationHandler) {
   const [wifiScannedDevices, setWifiScannedDevices] = useState<Array<{ mac: string; name: string; paired?: boolean }>>([]);
   const [pairedDevices, setPairedDevices] = useState<Array<{ mac: string; name: string; paired?: boolean }>>([]);
 
+  // Slice 3.6: live Coordinator state pushed at 1 Hz over BLE. Latest
+  // snapshot only - subscribers re-render on each tick. The periodic
+  // push intentionally does NOT log to console (1 Hz would spam),
+  // matching the journal-hygiene fix on the backend side.
+  const [coordinatorState, setCoordinatorState] = useState<CoordinatorState | null>(null);
+  // Edge-triggered Coordinator events (soft-mute, recovery). Bounded
+  // ring buffer; oldest events are dropped past the limit.
+  const COORDINATOR_EVENT_BUFFER_SIZE = 50;
+  const [coordinatorEvents, setCoordinatorEvents] = useState<CoordinatorEvent[]>([]);
+
   const clearConnectionStatus = useCallback(() => {
     setConnectionStatus(null);
   }, []);
@@ -136,7 +152,12 @@ export function useBLE(onNotification?: NotificationHandler) {
       const jsonString = rawBytes.slice(1);        // rest is JSON
       const payload = JSON.parse(jsonString);
 
-      console.log("[BLE] Received notification:", { opcode, payload });
+      // Slice 3.6: COORDINATOR_STATE arrives at 1 Hz; logging it
+      // would flood the JS console. Edge-triggered events and all
+      // other opcodes still log normally.
+      if (opcode !== MESSAGE_TYPES.COORDINATOR_STATE) {
+        console.log("[BLE] Received notification:", { opcode, payload });
+      }
 
       switch (opcode) {
         case MESSAGE_TYPES.SUCCESS:
@@ -243,6 +264,34 @@ export function useBLE(onNotification?: NotificationHandler) {
           }
           break;
         
+        case MESSAGE_TYPES.COORDINATOR_STATE: {
+          // Slice 3.6: 1 Hz audio-engine health snapshot. Just stash
+          // the latest one in state; UI components subscribe via the
+          // returned `coordinatorState` and re-render.
+          setCoordinatorState(payload as CoordinatorState);
+          break;
+        }
+
+        case MESSAGE_TYPES.COORDINATOR_EVENT: {
+          // Edge-triggered (soft_mute fire / recover). Push into a
+          // bounded ring buffer so app screens can render a timeline.
+          const evt = payload as CoordinatorEvent;
+          console.log(
+            `[Coordinator] ${evt.phase.toUpperCase()} ${evt.mac}` +
+            ` (reason=${evt.reason}` +
+            (evt.rssi_dbm !== undefined ? `, rssi=${evt.rssi_dbm}dBm` : "") +
+            (evt.rssi_dip_db !== undefined ? `, dip=${evt.rssi_dip_db}dB` : "") +
+            `)`,
+          );
+          setCoordinatorEvents(prev => {
+            const next = [...prev, evt];
+            return next.length > COORDINATOR_EVENT_BUFFER_SIZE
+              ? next.slice(next.length - COORDINATOR_EVENT_BUFFER_SIZE)
+              : next;
+          });
+          break;
+        }
+
         case MESSAGE_TYPES.ERROR:
           // Handle error messages
           if (payload.phase) {
@@ -332,7 +381,10 @@ export function useBLE(onNotification?: NotificationHandler) {
     console.log('[BLE] enabling notifications …');
     await chr.monitor((err, c) => {
       if (err) console.error('[BLE] monitor error:', err);
-      else     console.log('[BLE] NOTIFY raw:', c?.value);
+      // Per-notification raw logging removed: at the Slice 3.6
+      // 1 Hz Coordinator-state cadence it became console spam, and
+      // handleNotification already logs every non-high-freq opcode
+      // with the decoded payload.
       onNotify(err, c);
     });
   }
@@ -458,8 +510,9 @@ export function useBLE(onNotification?: NotificationHandler) {
           SERVICE_UUID,
           CHARACTERISTIC_UUID,
           (err, char) => {
-            console.log('[BLE] monitor callback fired'); 
-            console.log('[BLE] NOTIFY raw:', char?.value);
+            // Per-notification raw + callback-fired logs were dropped
+            // for the same reason as in ensurePiNotifications: at the
+            // Slice 3.6 1 Hz cadence they'd spam the JS console.
             handleNotification(err, char);   // <-- always handle it internally
             onNotification?.(err, char);     // <-- still call external handler if user passed one
           }
@@ -549,6 +602,10 @@ const waitForPi = (): Promise<Device> =>
     wifiScannedDevices,
     clearWifiScannedDevices: () => setWifiScannedDevices([]),
     pairedDevices,
+    // Slice 3.6: audio-engine policy state surfaced from the Pi.
+    coordinatorState,
+    coordinatorEvents,
+    clearCoordinatorEvents: () => setCoordinatorEvents([]),
   };
 }
 

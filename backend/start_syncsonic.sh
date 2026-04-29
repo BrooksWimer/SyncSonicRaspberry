@@ -32,6 +32,12 @@ if [ "$SYNCSONIC_AUDIO_RUNTIME" = "pipewire-headless" ]; then
   export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
   /usr/bin/pkill -u syncsonic -f /home/syncsonic/SyncSonicPi/backend/tools/pw_delay_filter 2>/dev/null || true
   rm -rf /tmp/syncsonic_pipewire
+  # Slice 3: clear stale pw_delay_filter Unix sockets. The C filter
+  # only unlinks its socket on a clean pw_main_loop exit, so SIGTERM
+  # at service-restart time leaves orphaned socket files behind. The
+  # Coordinator would otherwise spend several ticks trying to connect
+  # to ECONNREFUSED corpses before dropping their entries.
+  rm -rf /tmp/syncsonic-engine
   mkdir -p "$XDG_RUNTIME_DIR/pulse"
   rm -f "$XDG_RUNTIME_DIR/bus" "$XDG_RUNTIME_DIR/pipewire-0" "$XDG_RUNTIME_DIR/pulse/native"
 

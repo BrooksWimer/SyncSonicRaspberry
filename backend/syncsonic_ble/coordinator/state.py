@@ -2,8 +2,10 @@
 
 A SpeakerState is a small mutable dataclass the Coordinator updates on
 every tick. Slice 3.1 added the observation fields populated from the
-filter's ``query`` socket response. Slice 3.2 adds the soft-mute
-state machine (HEALTHY <-> STRESSED <-> MUTED).
+filter's ``query`` socket response. Slice 3.2 added the soft-mute
+state machine (HEALTHY <-> STRESSED <-> MUTED). Slice 3.3 adds RSSI
+fields refreshed from the RssiSampler's shared snapshot, plus a
+second stress counter for the RSSI-dip preemptive trigger.
 """
 
 from __future__ import annotations
@@ -59,6 +61,19 @@ class SpeakerState:
     consecutive_recovery_ticks: int = 0
     health_state_entered_monotonic_ns: int = 0
 
+    # Slice 3.3 RSSI tracking (refreshed each Coordinator tick from the
+    # RssiSampler's shared snapshot, NOT from the filter query). The
+    # rssi_dip_db delta is the primary stress signal: median_60s acts
+    # as the long-term baseline, median_10s as the recent state, and a
+    # positive delta means the link has degraded.
+    latest_rssi_dbm: int = 0
+    rssi_median_10s: float = 0.0
+    rssi_median_60s: float = 0.0
+    rssi_n_samples_10s: int = 0
+    rssi_n_samples_60s: int = 0
+    last_rssi_monotonic_ns: int = 0
+    consecutive_rssi_stress_ticks: int = 0
+
     # General bookkeeping
     n_consecutive_query_failures: int = 0
 
@@ -95,6 +110,19 @@ class SpeakerState:
         self.n_consecutive_query_failures += 1
         self.last_failure_reason = reason
 
+    @property
+    def rssi_dip_db(self) -> float:
+        """Positive value => recent (10s) RSSI is worse than baseline (60s).
+
+        Returns 0.0 if we don't have a meaningful baseline yet (fewer
+        than ~10 samples in the 60s deque); the Coordinator's
+        thresholding uses the sample-count check before this anyway,
+        but returning 0.0 keeps event payloads honest.
+        """
+        if self.rssi_n_samples_60s < 10:
+            return 0.0
+        return self.rssi_median_60s - self.rssi_median_10s
+
     def to_event_payload(self) -> dict:
         """Compact dict for emission as a coordinator_tick event.
 
@@ -117,5 +145,11 @@ class SpeakerState:
             "health": self.health,
             "consecutive_stress_ticks": self.consecutive_stress_ticks,
             "consecutive_recovery_ticks": self.consecutive_recovery_ticks,
+            "consecutive_rssi_stress_ticks": self.consecutive_rssi_stress_ticks,
+            "latest_rssi_dbm": self.latest_rssi_dbm,
+            "rssi_median_10s": round(self.rssi_median_10s, 1),
+            "rssi_median_60s": round(self.rssi_median_60s, 1),
+            "rssi_dip_db": round(self.rssi_dip_db, 1),
+            "rssi_n_samples_60s": self.rssi_n_samples_60s,
             "n_consecutive_query_failures": self.n_consecutive_query_failures,
         }

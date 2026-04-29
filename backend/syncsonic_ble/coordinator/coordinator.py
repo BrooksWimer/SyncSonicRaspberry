@@ -1,14 +1,19 @@
-"""Slice 3 System Coordinator (commit 3.1: observation-only skeleton).
+"""Slice 3 System Coordinator.
 
 A daemon thread that ticks at TICK_HZ, discovers every live
 ``pw_delay_filter`` instance via the Unix-socket directory, queries
-each one for its current state, and emits one ``coordinator_tick``
+each one for its current state, refreshes per-speaker RSSI from the
+RssiSampler's shared snapshot, and emits one ``coordinator_tick``
 event per second to the telemetry stream summarising the system.
 
-This commit deliberately does NOT take any policy action. The
-``apply_policy`` method is a no-op stub; subsequent Slice 3 commits
-fill it in (3.2 PI rate adjustment, 3.3 system-wide hold, 3.4 soft-
-mute on transport failure, 3.5 RSSI-aware preemptive soft-mute).
+Active policy as of Slice 3.3:
+- HEALTHY -> MUTED on N consecutive ticks of "frames_in flowing AND
+  frames_out starved" (Slice 3.2: transport-failure detector).
+- HEALTHY -> MUTED on N consecutive ticks of "10s rolling-median
+  RSSI is RSSI_DIP_THRESHOLD_DB or more below the 60s baseline"
+  (Slice 3.3: preemptive RSSI dip detector).
+- MUTED -> HEALTHY on M consecutive ticks of "frames_out clearly
+  flowing again" + 500 ms minimum hold to debounce.
 
 Why observation-only first
 --------------------------
@@ -55,6 +60,10 @@ from syncsonic_ble.coordinator.state import (
 )
 from syncsonic_ble.telemetry import EventType
 from syncsonic_ble.telemetry.event_writer import emit
+from syncsonic_ble.telemetry.samplers.rssi_sampler import (
+    RssiSnapshot,
+    get_latest_rssi,
+)
 from syncsonic_ble.utils.logging_conf import get_logger
 
 log = get_logger(__name__)
@@ -78,6 +87,23 @@ TICKS_TO_DECLARE_STRESS = 3          # 300 ms of consecutive stress -> mute
 TICKS_TO_DECLARE_RECOVERY = 5        # 500 ms of healthy flow while muted -> unmute
 SOFT_MUTE_RAMP_MS = 50               # both fade-out and fade-in
 MIN_MUTED_HOLD_MS = 500              # don't unmute earlier than this after muting
+
+# Slice 3.3 RSSI-aware preemptive policy parameters. RSSI is the
+# leading indicator: by the time delta_frames_out collapses (Slice
+# 3.2's signal), the audible dropout is already in flight. RSSI
+# sampling runs at 1 Hz so the 10s rolling median is a fairly stable
+# 10-sample summary. We require RSSI_DIP_THRESHOLD_DB of degradation
+# vs the 60s baseline to fire, plus enough samples in BOTH windows
+# so the comparison is meaningful (no triggering on a half-empty
+# 60s deque immediately after a fresh connection).
+RSSI_DIP_THRESHOLD_DB = 5.0          # 10s median this much below 60s baseline => stress
+TICKS_TO_DECLARE_RSSI_STRESS = 2     # 200 ms of consecutive RSSI stress -> mute
+RSSI_MIN_SAMPLES_10S = 5             # 10s deque must have at least this many samples
+RSSI_MIN_SAMPLES_60S = 30            # 60s deque must have at least this many samples
+# Note: with a 1 Hz sampler, a fresh connection takes >=30 s before
+# the RSSI-dip detector is allowed to fire. That's deliberate; we
+# would rather miss the first 30 s of RSSI-stress on a brand-new
+# connection than false-mute on a deque that hasn't filled yet.
 
 _SOCKET_NAME_RE = re.compile(r"^syncsonic-delay-([0-9a-f_]{17})\.sock$")
 
@@ -114,7 +140,7 @@ class Coordinator:
         )
         self._thread.start()
         log.info(
-            "Coordinator started (policy=soft-mute-on-transport-failure, %d Hz tick)",
+            "Coordinator started (policy=soft-mute[transport+rssi], %d Hz tick)",
             TICK_HZ,
         )
 
@@ -155,10 +181,14 @@ class Coordinator:
             resp = self._query_filter(sock_path)
             if resp is None:
                 state.note_query_failure("connect_or_parse")
+                # Even when the filter query fails we still refresh
+                # RSSI; otherwise the dip detector goes blind exactly
+                # when we most need it.
+                self._refresh_rssi(state)
                 continue
             state.update_from_query(resp)
+            self._refresh_rssi(state)
 
-        # Empty policy slot - subsequent commits fill this.
         self._apply_policy()
 
         # Emit a compact summary every EMIT_EVERY_N_TICKS.
@@ -167,26 +197,35 @@ class Coordinator:
             self._last_emit_tick = self._tick_count
 
     def _apply_policy(self) -> None:
-        """Slice 3.2: per-speaker soft-mute on transport failure.
+        """Per-speaker soft-mute policy.
 
         For each speaker we run a 3-state machine:
 
           HEALTHY  - frames in == frames out, both flowing normally
-                     -> on N consecutive stress ticks, mute and go MUTED
+                     -> N consecutive frame-stuck ticks  -> MUTED  (Slice 3.2)
+                     -> N consecutive RSSI-dip ticks      -> MUTED  (Slice 3.3)
           MUTED    - we've sent mute_to 0 50, output is silent
-                     -> on M consecutive recovery ticks, unmute and go HEALTHY
+                     -> M consecutive recovery ticks    -> HEALTHY
                      -> stays muted indefinitely if recovery never comes
-          STRESSED - reserved for future use (3.3 RSSI dip / 3.4 system-hold);
-                     not entered by this commit's logic
+          STRESSED - reserved for future system-hold use (Slice 3.4);
+                     not entered by current logic
 
-        The detection rule for entering MUTED:
+        Detection rule 1 (Slice 3.2 - reactive, transport-failure):
           delta_frames_in  > STRESS_FRAMES_IN_THRESHOLD  (audio still flowing in)
           AND
           delta_frames_out < STRESS_FRAMES_OUT_THRESHOLD (BlueZ has stopped consuming)
 
-        Pause / silence does NOT trigger this because the filter still
-        processes zero-valued samples on both sides; both deltas drop
-        together and stay in lockstep.
+        Detection rule 2 (Slice 3.3 - preemptive, RSSI-dip):
+          rssi_median_60s - rssi_median_10s >= RSSI_DIP_THRESHOLD_DB
+          AND enough samples in both deques to make the comparison meaningful.
+
+        Either rule firing transitions HEALTHY -> MUTED. Recovery is
+        unified: only frame-flow recovery exits MUTED, since RSSI may
+        recover before BlueZ has actually drained its retransmit queue.
+
+        Pause / silence does NOT trigger rule 1 because the filter
+        still processes zero-valued samples on both sides; both
+        deltas drop together. Rule 2 is unaffected by playback state.
         """
         for state in self._states.values():
             self._tick_speaker_policy(state)
@@ -200,13 +239,36 @@ class Coordinator:
         out_starved = s.delta_frames_out < STRESS_FRAMES_OUT_THRESHOLD
         in_starved = s.delta_frames_in < STRESS_FRAMES_OUT_THRESHOLD
 
+        # Slice 3.3 RSSI-dip detector. Only meaningful once both deques
+        # have filled enough; until then we just don't increment the
+        # counter (so a fresh connection can't false-mute itself in
+        # its first 30 seconds).
+        rssi_dip = (
+            s.rssi_n_samples_10s >= RSSI_MIN_SAMPLES_10S
+            and s.rssi_n_samples_60s >= RSSI_MIN_SAMPLES_60S
+            and s.rssi_dip_db >= RSSI_DIP_THRESHOLD_DB
+        )
+
         if s.health == HEALTH_HEALTHY:
+            # Frame-stuck detector (Slice 3.2)
             if in_flowing and out_starved:
                 s.consecutive_stress_ticks += 1
-                if s.consecutive_stress_ticks >= TICKS_TO_DECLARE_STRESS:
-                    self._enter_muted(s, reason="frames_in_flowing_out_starved")
             else:
                 s.consecutive_stress_ticks = 0
+
+            # RSSI-dip detector (Slice 3.3)
+            if rssi_dip:
+                s.consecutive_rssi_stress_ticks += 1
+            else:
+                s.consecutive_rssi_stress_ticks = 0
+
+            # Whichever fires first wins; tie goes to frame-stuck since
+            # it's the more deterministic "audio is actively dying"
+            # signal.
+            if s.consecutive_stress_ticks >= TICKS_TO_DECLARE_STRESS:
+                self._enter_muted(s, reason="frames_in_flowing_out_starved")
+            elif s.consecutive_rssi_stress_ticks >= TICKS_TO_DECLARE_RSSI_STRESS:
+                self._enter_muted(s, reason="rssi_dip")
 
         elif s.health == HEALTH_MUTED:
             # Recover when frames are clearly flowing through the filter
@@ -229,10 +291,11 @@ class Coordinator:
         s.health = HEALTH_MUTED
         s.health_state_entered_monotonic_ns = time.monotonic_ns()
         s.consecutive_stress_ticks = 0
+        s.consecutive_rssi_stress_ticks = 0
         s.consecutive_recovery_ticks = 0
         log.info(
-            "Coordinator: %s -> MUTED (reason=%s, command_ok=%s)",
-            s.mac, reason, ok,
+            "Coordinator: %s -> MUTED (reason=%s, rssi_dip_db=%.1f, command_ok=%s)",
+            s.mac, reason, s.rssi_dip_db, ok,
         )
         emit(EventType.COORDINATOR_SOFT_MUTE, {
             "mac": s.mac,
@@ -242,6 +305,10 @@ class Coordinator:
             "command_ok": ok,
             "delta_frames_in": s.delta_frames_in,
             "delta_frames_out": s.delta_frames_out,
+            "latest_rssi_dbm": s.latest_rssi_dbm,
+            "rssi_median_10s": round(s.rssi_median_10s, 1),
+            "rssi_median_60s": round(s.rssi_median_60s, 1),
+            "rssi_dip_db": round(s.rssi_dip_db, 1),
         })
 
     def _exit_muted(self, s: SpeakerState, reason: str) -> None:
@@ -249,6 +316,7 @@ class Coordinator:
         s.health = HEALTH_HEALTHY
         s.health_state_entered_monotonic_ns = time.monotonic_ns()
         s.consecutive_stress_ticks = 0
+        s.consecutive_rssi_stress_ticks = 0
         s.consecutive_recovery_ticks = 0
         log.info(
             "Coordinator: %s -> HEALTHY (reason=%s, command_ok=%s)",
@@ -262,9 +330,28 @@ class Coordinator:
             "command_ok": ok,
             "delta_frames_in": s.delta_frames_in,
             "delta_frames_out": s.delta_frames_out,
+            "latest_rssi_dbm": s.latest_rssi_dbm,
+            "rssi_dip_db": round(s.rssi_dip_db, 1),
         })
 
     # -- helpers -------------------------------------------------------------
+
+    def _refresh_rssi(self, s: SpeakerState) -> None:
+        """Pull the freshest RssiSampler snapshot for this speaker into
+        the SpeakerState. Returning silently when no sample is available
+        keeps the policy detector blind (rssi_n_samples_10s stays 0,
+        which fails the threshold check), exactly the safe behaviour we
+        want before the sampler has caught up to a fresh connection.
+        """
+        snap: Optional[RssiSnapshot] = get_latest_rssi(s.mac)
+        if snap is None:
+            return
+        s.latest_rssi_dbm = snap.latest_dbm
+        s.rssi_median_10s = snap.median_10s
+        s.rssi_median_60s = snap.median_60s
+        s.rssi_n_samples_10s = snap.n_samples_10s
+        s.rssi_n_samples_60s = snap.n_samples_60s
+        s.last_rssi_monotonic_ns = snap.last_sample_monotonic_ns
 
     def _discover_macs(self) -> List[str]:
         if not SOCKET_DIR.exists():

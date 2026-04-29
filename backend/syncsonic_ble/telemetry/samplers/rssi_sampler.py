@@ -35,8 +35,10 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from statistics import median
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -63,6 +65,51 @@ BASELINE_EMIT_INTERVAL_SEC = 10.0
 HCITOOL_TIMEOUT_SEC = 1.0
 
 _RSSI_RE = re.compile(r"RSSI return value:\s*(-?\d+)")
+
+
+@dataclass(frozen=True)
+class RssiSnapshot:
+    """Immutable per-speaker RSSI summary for in-process consumers (Slice 3.3).
+
+    The Coordinator polls this snapshot every tick to decide whether
+    a speaker's link quality has dropped enough to warrant a
+    preemptive soft-mute. Both medians are over the rolling deques
+    the sampler already maintains, so this struct adds zero work to
+    the audio path; it's a free lunch from the data the sampler is
+    collecting anyway.
+    """
+    mac: str
+    hci: str
+    latest_dbm: int
+    median_10s: float
+    median_60s: float
+    n_samples_10s: int
+    n_samples_60s: int
+    last_sample_monotonic_ns: int
+
+
+# Module-level shared state populated by the singleton RssiSampler in
+# its tick() and read by the Coordinator. Both live in the same
+# process (syncsonic_ble.main) so a plain dict + lock is the right
+# primitive; we don't need a queue or pub-sub channel.
+_LATEST_RSSI: Dict[str, RssiSnapshot] = {}
+_LATEST_RSSI_LOCK = threading.Lock()
+
+
+def get_latest_rssi(mac: str) -> Optional[RssiSnapshot]:
+    """Return the most recent RssiSnapshot for ``mac``, or None if no
+    samples have been collected yet. Thread-safe; intended for the
+    Coordinator and any future in-process consumers (e.g. the BLE
+    notification surface in Slice 3.6)."""
+    with _LATEST_RSSI_LOCK:
+        return _LATEST_RSSI.get(mac.upper())
+
+
+def get_all_latest_rssi() -> Dict[str, RssiSnapshot]:
+    """Return a snapshot copy of the latest RSSI dict. Used by tests
+    and the BLE notification surface."""
+    with _LATEST_RSSI_LOCK:
+        return dict(_LATEST_RSSI)
 
 
 class RssiSampler(Sampler):
@@ -102,11 +149,28 @@ class RssiSampler(Sampler):
             d60 = self._rolling_60.setdefault(mac, deque(maxlen=ROLLING_60S_LEN))
             d10.append(sample)
             d60.append(sample)
+            m10 = float(median(d10))
+            m60 = float(median(d60))
+            # Update shared snapshot for in-process consumers (Slice 3.3
+            # Coordinator). We do this every tick so the Coordinator
+            # always sees the freshest data, not just the every-10s
+            # baseline emit cadence.
+            with _LATEST_RSSI_LOCK:
+                _LATEST_RSSI[mac] = RssiSnapshot(
+                    mac=mac,
+                    hci=hci_name,
+                    latest_dbm=int(sample),
+                    median_10s=m10,
+                    median_60s=m60,
+                    n_samples_10s=len(d10),
+                    n_samples_60s=len(d60),
+                    last_sample_monotonic_ns=time.monotonic_ns(),
+                )
             emit(EventType.RSSI_SAMPLE, {
                 "mac": mac,
                 "hci": hci_name,
                 "rssi_dbm": sample,
-                "median_10s": float(median(d10)),
+                "median_10s": m10,
                 "n_samples_10s": len(d10),
             })
             last_baseline = self._last_baseline_emit.get(mac, 0.0)
@@ -114,8 +178,8 @@ class RssiSampler(Sampler):
                 emit(EventType.RSSI_BASELINE, {
                     "mac": mac,
                     "hci": hci_name,
-                    "median_10s": float(median(d10)),
-                    "median_60s": float(median(d60)),
+                    "median_10s": m10,
+                    "median_60s": m60,
                     "n_samples_60s": len(d60),
                 })
                 self._last_baseline_emit[mac] = now

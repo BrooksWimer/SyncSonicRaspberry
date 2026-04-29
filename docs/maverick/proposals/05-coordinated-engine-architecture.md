@@ -1053,3 +1053,101 @@ experiment; catching the dip before the queue actually starves
 reduces detection latency from ~300 ms (Slice 3.2's "frames out
 starved") to ~10-50 ms (Slice 3.3's "RSSI median dipped 5+ dB below
 60 s baseline"), which is below the threshold for an audible click.
+
+## 14. Slice 3.3 Pi Validation Evidence (2026-04-29 EDT)
+
+Slice 3.3 (RSSI-aware preemptive soft-mute) is feature-complete and
+Pi-validated for the no-false-positives criterion. The RssiSampler
+now exposes a thread-safe in-process snapshot and the Coordinator
+consumes it on every tick, adding RSSI dip as a second
+``HEALTHY -> MUTED`` trigger alongside the Slice 3.2 frame-stuck
+detector.
+
+### Architectural change recap
+
+- ``telemetry/samplers/rssi_sampler.py`` adds an immutable
+  ``RssiSnapshot`` dataclass and a process-wide
+  ``_LATEST_RSSI: Dict[mac, RssiSnapshot]`` updated under a lock at
+  the end of each sampler tick. Public ``get_latest_rssi(mac)`` and
+  ``get_all_latest_rssi()`` accessors are now the supported
+  in-process consumer surface (the BLE notification work in Slice
+  3.6 will reuse the same accessor).
+- ``coordinator/state.py`` adds ``latest_rssi_dbm``,
+  ``rssi_median_10s/60s``, sample counts, and a
+  ``consecutive_rssi_stress_ticks`` counter. A new
+  ``rssi_dip_db`` property returns ``median_60s - median_10s``,
+  guarded so a deque with fewer than 10 samples returns 0.0 and
+  cannot mistakenly trigger.
+- ``coordinator/coordinator.py`` calls a new ``_refresh_rssi(s)``
+  helper after every filter query (and explicitly on filter-query
+  failure too, so the dip detector doesn't go blind exactly when we
+  most need it). The HEALTHY-state policy now runs both detectors
+  in parallel, with independent stress counters so neither poisons
+  the other. Frame-stuck wins ties (more deterministic, "audio is
+  actively dying" signal). Recovery remains unified: only frame-flow
+  recovery exits MUTED, since RSSI may recover before BlueZ has
+  actually drained its retransmit queue.
+
+### Threshold rationale
+
+- ``RSSI_DIP_THRESHOLD_DB = 5.0`` matches the Section 9 plan: 5 dB
+  is large enough to be physically meaningful (loosely a 3x
+  amplitude change) and small enough to fire well before SBC bitpool
+  collapse at the BlueZ layer.
+- ``TICKS_TO_DECLARE_RSSI_STRESS = 2`` (200 ms): at 1 Hz RSSI
+  sampling the snapshot only updates every 10 ticks anyway, so 2 is
+  effectively "see one fresh RSSI tick of dip beyond threshold".
+- ``RSSI_MIN_SAMPLES_10S = 5``, ``RSSI_MIN_SAMPLES_60S = 30``:
+  prevent a fresh connection from false-muting itself before its
+  baseline window has filled. With a 1 Hz sampler this gates the
+  detector for the first ~30 s of any new connection. We accept
+  that gap; the alternative (premature firing on a half-empty
+  baseline) is unacceptable for a no-false-positive design.
+- Detection latency floor: ~5 s. The 10s rolling median is the
+  bottleneck - it takes about half the window length for a dip to
+  shift the median 5 dB. That's still well ahead of the
+  ~10-15 s typical lag between RSSI deterioration and audible
+  failure observed during the Section 9 field experiment.
+
+### What was validated
+
+```
+2 BT speakers, 2.5 min uptime each (post-fresh-connection)
+
+coordinator_tick (tick=111840, ~3h after Slice 3.2 restart):
+  F4:6A:DD:D4:F3:C8 (VIZIO, hci0): health=healthy gain=1000
+    frames: in=4608 out=4608  stress(transport=0, rssi=0)
+    rssi: latest=-20  m10=-25.0  m60=-24.0  dip=1.0 dB  n60=60
+  2C:FD:B4:69:46:0A (close, hci2): health=healthy gain=1000
+    frames: in=4608 out=4608  stress(transport=0, rssi=0)
+    rssi: latest=-15  m10=-15.0  m60=-14.5  dip=0.5 dB  n60=60
+
+coordinator_soft_mute events in last hour: 0
+```
+
+CPU: 3.9% on the main service (down from 4.4% in Slice 3.2; well
+within sampling variation - the new code is just a dict lookup per
+speaker per tick). Audio infra total ~6%.
+
+Per-speaker baselines reflect the real RF environment: VIZIO at
+-24.5 dBm (across-room, hci0 dongle) sits ~10 dB weaker than the
+close speaker at -14.0 dBm (hci2). The detector compares each
+speaker against its OWN baseline, not a global one, so the close
+speaker dropping to -22 dBm would fire (8 dB dip) while the same
+absolute RSSI on VIZIO would be normal.
+
+### Status
+
+Slice 3.3 is feature-complete and Pi-validated. The frame-stuck
+(Slice 3.2) and RSSI-dip (Slice 3.3) detectors run in parallel
+and trigger MUTED independently. The system has now logged 13+ min
+of uninterrupted 2- and 3-speaker playback across both detectors
+with zero false-positive soft-mutes, a 0.5-1.0 dB natural dip
+floor in normal conditions, and CPU sustained at <5%. Real
+soft-mute firings will be captured organically the next time
+interference happens, or via the Slice 3.7 stress test.
+
+Slice 3.6 (BLE notifications surface coordinator state to the app)
+or 3.7 (forced stress validation) is the natural next step. Slice
+3.4 (system-wide synchronous hold) and 3.5 (PI rate adjustment)
+remain deferred per the original reorder.

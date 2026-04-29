@@ -65,12 +65,21 @@ def setup_audio_server() -> bool:
             log.info("Sink 'virtual_out' already exists; skipping creation")
             return True
 
-        # Step 3: Create the virtual sink
+        # Step 3: Create the virtual sink.
+        #
+        # priority.driver/priority.session are baked into the load-module
+        # invocation so virtual_out wins PipeWire's graph clock election against
+        # any bluez_output node (PW default ~1010, our WirePlumber rule pins
+        # bluez to 100). A single source of truth, set at sink-create time, so
+        # there is no race against later WirePlumber re-application or against a
+        # post-create pw-cli set-param hack.
         log.info("Creating virtual sink 'virtual_out'")
         result = subprocess.run([
             "pactl", "load-module", "module-null-sink",
             "sink_name=virtual_out",
-            "sink_properties=device.description=virtual_out",
+            "sink_properties=device.description=virtual_out"
+            " priority.driver=10000"
+            " priority.session=10000",
         ], capture_output=True, text=True)
 
         if result.returncode != 0:

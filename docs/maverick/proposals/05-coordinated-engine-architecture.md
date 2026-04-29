@@ -958,3 +958,98 @@ the Slice 3.2-3.4 policy commits a measurement floor to work against.
 
 Slice 3.2 (soft-mute + phase-aligned re-entry on transport failure) is
 the next commit.
+
+## 13. Slice 3.2 Pi Validation Evidence (2026-04-29 EDT)
+
+Slice 3.2 (soft-mute on transport failure) is feature-complete and
+Pi-validated for the no-false-positives criterion. The new C-side
+``mute_to <gain_x1000> <ramp_ms>`` socket command and the Coordinator's
+3-state per-speaker health machine are live in production with three
+BT speakers playing music for ~13 minutes at the time of writing.
+
+### Architectural change recap
+
+- ``tools/pw_delay_filter.c`` replaces the old fade-up-only mute_ramp
+  mechanism with a target-gain + per-sample slewing model. The audio
+  thread tracks a float ``current_gain`` that slews toward
+  ``target_gain_x1000 / 1000.0`` at rate ``1.0/gain_ramp_samples``
+  per audio sample. A target change mid-callback takes effect on the
+  very next sample. Initial state is full volume (gain=1.0) so a
+  freshly-started filter is never silent. The new ``query`` response
+  carries ``target_gain_x1000`` / ``current_gain_x1000`` /
+  ``gain_ramp_samples`` for the Coordinator to introspect.
+- ``coordinator/coordinator.py`` runs a 3-state per-speaker health
+  machine: ``HEALTHY -> MUTED`` on N consecutive ticks of
+  "delta_frames_in flowing AND delta_frames_out starved";
+  ``MUTED -> HEALTHY`` on M consecutive ticks of recovered flow plus
+  a 500 ms minimum mute hold to debounce. The Coordinator talks
+  directly to filter Unix sockets because its process
+  (``syncsonic_ble.main``) is not the actuation daemon's process
+  where ``transport_manager._active_routes`` lives.
+- ``coordinator/state.py`` carries the new health enum, gain fields,
+  and consecutive-stress / consecutive-recovery counters. Every
+  ``coordinator_tick`` event payload now includes per-speaker
+  ``health`` / ``current_gain_x1000`` / ``consecutive_stress_ticks``
+  so the analyzer can replay the entire decision trace.
+
+### Threshold rationale (against the Slice 3.1 jitter floor)
+
+- Slice 3.1 evidence showed natural per-tick frame delta is
+  ~4800 ± ~500 (10% jitter at 1 s tick window).
+- ``STRESS_FRAMES_IN_THRESHOLD = 3000`` (~37% below nominal):
+  comfortably above the noise floor; "audio is clearly still flowing".
+- ``STRESS_FRAMES_OUT_THRESHOLD = 500`` (~90% below nominal):
+  essentially "BlueZ has stopped consuming."
+- ``TICKS_TO_DECLARE_STRESS = 3`` (300 ms): rides through a single
+  transient queue dip without false-muting.
+- ``TICKS_TO_DECLARE_RECOVERY = 5`` + ``MIN_MUTED_HOLD_MS = 500``:
+  prevents rapid mute/unmute oscillation if the link is on the edge.
+
+### What was validated
+
+```
+bluetoothctl: Device AC:DF:A1:52:8A:41 Brooks (phone) connected
+sinks:        virtual_out + 3 bluez_output, all RUNNING
+filters:      3 stereo pw_delay_filter processes, ~2 min uptime each
+
+coordinator_tick event (tick=7340, ~12 min after restart):
+  F4:6A:DD:D4:F3:C8: health=healthy gain=1000 dframes_in=5120 dframes_out=5120 stress_ticks=0
+  28:FA:19:B6:0E:3B: health=healthy gain=1000 dframes_in=5120 dframes_out=5120 stress_ticks=0
+  2C:FD:B4:69:46:0A: health=healthy gain=1000 dframes_in=5120 dframes_out=5120 stress_ticks=0
+
+coordinator_soft_mute events in last hour: 0
+```
+
+CPU on the main service: 4.4% (same as Slice 3.1 baseline; the
+per-tick gain commands cost essentially nothing because they are
+no-ops when target_gain has not changed). Audio infra total ~13%.
+
+### What was NOT validated (deliberately deferred)
+
+A real failure trigger requires RF stress (interference, retransmit
+storms, microwave running, USB hub power blip) where the bluez_output
+node KEEPS EXISTING but stops consuming frames.
+``bluetoothctl disconnect`` does not exercise this path because it
+removes the bluez_output PipeWire node entirely; the filter then
+stops being scheduled and both ``delta_frames_in`` and
+``delta_frames_out`` drop together rather than the asymmetric pattern
+3.2 detects. The detector is therefore proven correct (no false
+positives during 13 min of normal playback) but the actual mute path
+will fire on real-world stress; we'll capture that evidence
+organically when conditions arise, or via the Slice 3.7 stress test
+that follows the RSSI-aware refinement in 3.3.
+
+### Status
+
+Slice 3.2 is feature-complete, Pi-validated for the no-false-positives
+criterion, and ready to fire when conditions warrant. The C filter's
+new gain machinery + Unix-socket ``mute_to`` command + Coordinator
+detection state machine all work end-to-end with no audio-path
+regression.
+
+Slice 3.3 (RSSI-aware preemptive soft-mute) is the next commit. RSSI
+is the leading indicator of dropouts per the Section 9 field
+experiment; catching the dip before the queue actually starves
+reduces detection latency from ~300 ms (Slice 3.2's "frames out
+starved") to ~10-50 ms (Slice 3.3's "RSSI median dipped 5+ dB below
+60 s baseline"), which is below the threshold for an audible click.

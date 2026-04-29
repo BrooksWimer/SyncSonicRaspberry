@@ -113,7 +113,10 @@ class Coordinator:
             daemon=True,
         )
         self._thread.start()
-        log.info("Coordinator started (observation-only, %d Hz tick)", TICK_HZ)
+        log.info(
+            "Coordinator started (policy=soft-mute-on-transport-failure, %d Hz tick)",
+            TICK_HZ,
+        )
 
     def stop(self) -> None:
         if self._thread is None:

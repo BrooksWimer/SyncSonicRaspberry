@@ -52,9 +52,14 @@ class Collector:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        # Force the EventWriter to open the file *before* the lifecycle
+        # event is emitted, so collector_start.data.telemetry_path
+        # actually carries the path the rest of the events will be in.
+        writer = get_event_writer()
+        writer.ensure_open()
         emit(EventType.COLLECTOR_START, {
             "samplers": [{"name": s.name, "interval_sec": s.interval_sec} for s in self._samplers],
-            "telemetry_path": str(get_event_writer().path) if get_event_writer().path else None,
+            "telemetry_path": str(writer.path) if writer.path else None,
         })
         for s in self._samplers:
             try:

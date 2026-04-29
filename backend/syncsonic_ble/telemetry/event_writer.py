@@ -81,6 +81,16 @@ class EventWriter:
     def path(self) -> Optional[Path]:
         return self._path
 
+    def ensure_open(self) -> bool:
+        """Force-open the events file now (non-lazy). Returns True on success.
+
+        Useful when a caller needs ``self.path`` to be populated *before*
+        the first emit (e.g. so the collector_start lifecycle event can
+        report it). Safe and idempotent; reuses the existing lock.
+        """
+        with self._lock:
+            return self._ensure_open_locked()
+
     @property
     def n_emitted(self) -> int:
         return self._n_emitted

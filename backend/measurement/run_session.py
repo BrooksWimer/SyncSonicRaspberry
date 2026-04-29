@@ -96,32 +96,64 @@ def _generate_reference(path: Path, duration: int) -> bool:
     return True
 
 
-def _find_active_events_file(root: Path) -> Optional[Path]:
+def _find_active_events_files(root: Path, since_unix: float = 0.0) -> list:
+    """Return all events jsonl files whose mtime is >= since_unix.
+
+    Each Python process under syncsonic.service has its own EventWriter
+    (the syncsonic_ble.main service, the pipewire_actuation_daemon, and
+    the measurement.mic_capture process all open separate files). For a
+    session window we need to merge events from every file that was
+    being written into during the window, not just the most recent.
+    """
     events_dir = root / "events"
     if not events_dir.exists():
-        return None
-    candidates = sorted(events_dir.glob("syncsonic-events-*.jsonl"), key=lambda p: p.stat().st_mtime)
-    return candidates[-1] if candidates else None
+        return []
+    out = []
+    for p in events_dir.glob("syncsonic-events-*.jsonl"):
+        try:
+            if p.stat().st_mtime >= since_unix:
+                out.append(p)
+        except OSError:
+            continue
+    return out
 
 
-def _slice_events(events_file: Path, start_iso: str, end_iso: str, dest: Path) -> int:
-    """Copy events in [start_iso, end_iso] (lexicographic on wall_iso) into dest."""
-    n_kept = 0
-    with open(events_file, "r", encoding="ascii") as fin, open(dest, "w", encoding="ascii") as fout:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            wall = obj.get("wall_iso", "")
-            # ISO-8601 strings sort correctly lexicographically when same TZ.
-            if start_iso <= wall <= end_iso:
-                fout.write(line + "\n")
-                n_kept += 1
-    return n_kept
+def _slice_events_multi(
+    events_files: list, start_iso: str, end_iso: str, dest: Path
+) -> tuple:
+    """Merge events from all files in [start_iso, end_iso], sorted by wall_iso.
+
+    Returns (n_events_kept, list_of_source_files_used).
+    """
+    rows: list = []
+    sources_used: list = []
+    for ef in events_files:
+        n_from_this = 0
+        try:
+            with open(ef, "r", encoding="ascii") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    wall = obj.get("wall_iso", "")
+                    if start_iso <= wall <= end_iso:
+                        rows.append((wall, line))
+                        n_from_this += 1
+        except OSError:
+            continue
+        if n_from_this > 0:
+            sources_used.append({"path": str(ef), "events": n_from_this})
+
+    # ISO-8601 with the same TZ sorts lexicographically by time.
+    rows.sort(key=lambda r: r[0])
+    with open(dest, "w", encoding="ascii") as fout:
+        for _, line in rows:
+            fout.write(line + "\n")
+    return len(rows), sources_used
 
 
 def _snapshot_mic(mic_dir: Path, dest_dir: Path) -> dict:
@@ -223,14 +255,21 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             play_proc.kill()
 
-    # Slice events
-    events_file = _find_active_events_file(root)
+    # Slice events: merge from ALL events files whose mtime overlaps the
+    # session window. Each Python process (main, actuation_daemon,
+    # mic_capture) has its own writer/file; we want the union.
+    # Use the start_unix - 60s as the file-mtime cutoff so we don't miss
+    # files that were last touched just before our window opened.
+    start_unix = time.time() - args.duration  # close enough; mtime not micro-precise
+    events_files = _find_active_events_files(root, since_unix=start_unix - 60.0)
     n_events = 0
-    if events_file is not None:
-        try:
-            n_events = _slice_events(events_file, start_wall, end_wall, bundle_dir / "events.jsonl")
-        except OSError as exc:
-            print(f"[run_session] events slice failed: {exc}", file=sys.stderr)
+    sources_used: list = []
+    try:
+        n_events, sources_used = _slice_events_multi(
+            events_files, start_wall, end_wall, bundle_dir / "events.jsonl"
+        )
+    except OSError as exc:
+        print(f"[run_session] events slice failed: {exc}", file=sys.stderr)
 
     # Snapshot mic
     mic_info = _snapshot_mic(Path(args.mic_dir), bundle_dir / "mic")
@@ -244,7 +283,7 @@ def main() -> int:
         "start_monotonic_ns": start_monotonic,
         "end_monotonic_ns": end_monotonic,
         "reference_wav": str(reference_path) if not args.no_play else None,
-        "events_source_file": str(events_file) if events_file else None,
+        "events_sources": sources_used,
         "events_kept": n_events,
         "mic_snapshot": mic_info,
         "bundle_dir": str(bundle_dir),

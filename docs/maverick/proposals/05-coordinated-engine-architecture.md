@@ -763,3 +763,103 @@ appended to this section as Section 10's reproducibility addendum.
 Slice 2 (stereo elastic delay engine + IPC, the one that finally
 makes manual latency adjustments stop causing xruns) is the next
 workstream.
+
+## 11. Slice 2 Pi Validation Evidence (2026-04-29 EDT)
+
+Slice 2 is feature-complete and Pi-validated. The original Slice 2
+success criterion was "continuously adjust the slider with music
+playing; session report shows zero xruns. Today every adjustment
+xruns." The Pi-side test below produces zero route_create, zero
+route_teardown, zero pw_xrun events across 11 latency changes
+spanning 80 ms → 200 ms → 80 ms → 180 ms during music playback
+through two BT speakers.
+
+### Architectural change recap
+
+- `tools/pw_delay_filter.c` rewritten as a stereo elastic engine. One
+  process per speaker (down from two), four DSP ports
+  (`input_FL` / `input_FR` / `output_FL` / `output_FR`), shared write
+  index across two ring buffers, fractional read pointer with linear
+  interpolation, atomic shared state for cross-thread updates, POSIX
+  control thread bound to a Unix socket at
+  `/tmp/syncsonic-engine/<node_name>.sock`.
+- `pipewire_transport.py` rewritten so that `ensure_route()` has a
+  fast path: when a delay change arrives for a healthy already-running
+  filter, it sends `set_delay <ms>` over the socket instead of
+  killing and respawning the process. The slow path (full route
+  rebuild) only runs on first connect, after a process crash, or when
+  the underlying `bluez_output` sink changed.
+- Build invocation gained `-pthread` (control thread) and `-latomic`
+  (8-byte atomic ops on aarch64 require libatomic; we hit the linker
+  error on first deploy and fixed it in `4f37765`).
+
+### Live test result
+
+```
+window starts: 2026-04-29T15:40:44.000Z
+speakers under test: 2C:FD:B4:69:46:0A  F4:6A:DD:D4:F3:C8
+
+sending latency sequence: 80 120 160 200 160 120 80 100 140 180 100
+
+window ends:   2026-04-29T15:40:59.999Z
+
+event_type counts:
+    30  rssi_sample
+    15  pw_node_snapshot
+     8  mic_segment_written
+     4  bluez_transport_snapshot
+     2  rssi_baseline
+
+SLICE 2 SUCCESS CHECK:
+  route_create   : 0 (expected 0)
+  route_teardown : 0 (expected 0)
+  pw_xrun        : 0 (expected 0 from this driver; ambient xruns possible from RF stress)
+
+PASS
+```
+
+(The driver wrote latency targets directly into
+``/tmp/syncsonic_pipewire/control_state.json`` rather than going
+through the BLE handler, which is why ``set_latency_request`` is
+missing from the event-type counts. The actuation daemon picks up
+JSON changes and calls ``transport.ensure_route``, which is the same
+downstream path the BLE handler reaches; the only difference is the
+telemetry hook on the BLE side.)
+
+### Filter introspection via socket
+
+After the test, querying both filters confirms they were running and
+processing every input frame with no drops:
+
+```
+syncsonic-delay-2c_fd_b4_69_46_0a.sock:  frames_in=7,248,896  frames_out=7,248,896
+syncsonic-delay-f4_6a_dd_d4_f3_c8.sock:  frames_in=9,176,064  frames_out=9,176,064
+```
+
+A targeted slew test against the live VIZIO filter (sending
+`set_delay 100` while music played) showed `current_delay_samples`
+arriving at 4800 (= 100 ms) within the first 100 ms polling
+window. No pop, no click, music kept playing.
+
+### Known follow-up: slew rate is too aggressive
+
+`SLEW_SAMPLES_PER_FRAME = 4` produces a 5x time compression of audio
+during slew. For a 100 ms delay change this is a ~25 ms transient
+"chirp" that is acceptable on broadband music but audible on tonal
+content. Trivial fix: change the constant to a float (~0.5) so the
+slew takes ~200 ms wall time, well under the perceptual threshold for
+pitch-shift artifacts on any content. Tagged as a Slice 2 polish
+follow-up; does not block Slice 3.
+
+### Status
+
+Slice 2 is feature-complete in code and Pi-validated against the
+stated success criterion. Manual slider adjustments no longer rebuild
+the route or xrun the graph. Slice 1's events stream picked up the
+test cleanly; Slice 1's filter introspection (via the new
+`query_filter` / `set_rate_ppm` methods on `PipeWireTransportManager`)
+is wired and ready for Slice 3's System Coordinator to consume.
+
+Slice 3 (System Coordinator: bounded ±50 ppm rate adjustment,
+system-wide synchronous hold, soft-mute + phase-aligned re-entry on
+transport failure) is the next workstream.

@@ -26,6 +26,10 @@ from syncsonic_ble.state_change.action_functions import (
     remove_device_dbus,
     trust_device_dbus,
 )
+from syncsonic_ble.helpers.pulseaudio_helpers import (
+    ensure_phone_ingress_loopback,
+    remove_phone_ingress_loopback,
+)
 from syncsonic_ble.state_change.action_planning import analyze_device, connect_one_plan
 from syncsonic_ble.state_management.bus_manager import get_bus
 from syncsonic_ble.state_management.scan_manager import ScanManager
@@ -262,6 +266,36 @@ class ConnectionService:
             if intent is Intent.LOOPBACK_SYNC:
                 mac = payload["mac"]
                 connected = payload["connected"]
+
+                # Reserved-adapter device (the phone): A2DP source -> Pi sink.
+                # Audio enters PipeWire as bluez_input and must be copied into
+                # virtual_out via the phone-ingress loopback. This is *not* a
+                # speaker output and must never reach _ensure_output_actuation
+                # (the same bug that Slice 0 Fix A guards against from above).
+                # The phone-ingress setup blocks for up to 25 s waiting for the
+                # bluez_input source to appear, so it runs on its own thread to
+                # keep the worker queue responsive.
+                if is_device_on_reserved_adapter(self.bus, mac):
+                    if connected:
+                        def _run_phone_ingress() -> None:
+                            ok = ensure_phone_ingress_loopback(mac)
+                            if ok:
+                                logger.info("Phone audio ingress ready for %s", mac)
+                            else:
+                                logger.warning(
+                                    "Phone ingress not established for %s — ensure phone audio "
+                                    "(A2DP) is connected to this Pi",
+                                    mac,
+                                )
+
+                        threading.Thread(
+                            target=_run_phone_ingress,
+                            name=f"phone-ingress-{mac}",
+                            daemon=True,
+                        ).start()
+                    else:
+                        remove_phone_ingress_loopback(mac)
+                    continue
 
                 if connected and mac not in self.loopbacks:
                     if self._ensure_output_actuation(mac):

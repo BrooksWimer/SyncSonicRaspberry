@@ -113,9 +113,14 @@ class DeviceManager:
             uuids = dev_props.Get(DEVICE_INTERFACE, "UUIDs")
         except Exception:  # noqa: BLE001
             uuids = []
+        # Do not skip when the UUID list omits A2DP-sink (0x110b): phones often
+        # publish only A2DP-source (0x110a) and only expose 0x110b after the
+        # BR/EDR link comes up. We still need to track the connection so the
+        # LOOPBACK_SYNC reserved-adapter branch in ConnectionService can drive
+        # phone-ingress; without this relaxation, the phone never reaches that
+        # branch and phone audio depends solely on WirePlumber autoconnect.
         if not any("110b" in uuid.lower() for uuid in uuids):
-            log.info("%s lacks A2DP, skipping", mac)
-            return
+            log.info("%s: no A2DP UUID in list yet (will still track for phone ingress)", mac)
 
         adapter_prefix = adapter_prefix_from_path(path)
         others = [other for other in self._devices_on_adapter(adapter_prefix) if other != mac]
@@ -135,6 +140,18 @@ class DeviceManager:
 
         self.connected.add(mac)
         log.info("Tracking %s as connected, loopback deferred to FSM", mac)
+        # Nudge BlueZ to actually negotiate A2DP. Phones in particular often
+        # need an explicit ConnectProfile after the BR/EDR link comes up
+        # before they expose their A2DP source. Best-effort: failure here is
+        # not fatal because the LOOPBACK_SYNC handler will still try to set
+        # things up, and the phone may already have A2DP up via another path.
+        try:
+            dev_iface = dbus.Interface(dev_obj, DEVICE_INTERFACE)
+            dev_iface.ConnectProfile(A2DP_UUID)
+            log.info("Requested A2DP profile for %s", mac)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ConnectProfile(A2DP) for %s: %s", mac, exc)
+
         from syncsonic_ble.state_management.connection_manager import Intent, work_q
 
         work_q.put((Intent.LOOPBACK_SYNC, {"mac": mac, "connected": True}))

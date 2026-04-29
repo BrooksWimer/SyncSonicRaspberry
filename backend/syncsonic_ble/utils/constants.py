@@ -53,6 +53,8 @@ class Msg(IntEnum):
     SET_MUTE                = 0x65
     ULTRASONIC_SYNC         = 0x67
     CONNECTION_STATUS_UPDATE= 0x70
+    COORDINATOR_STATE       = 0x71  # Slice 3.6: 1 Hz per-speaker health snapshot
+    COORDINATOR_EVENT       = 0x72  # Slice 3.6: edge-triggered soft_mute / state-change
     SCAN_START      = 0x40
     SCAN_STOP       = 0x41
     SCAN_DEVICES    = 0x43

@@ -182,20 +182,25 @@ class Characteristic(dbus.service.Object, DBusPathMixin):
     # Notification helpers
     # ------------------------------------------------------------------
 
+    # Message types that are emitted at high frequency (1 Hz or more).
+    # Their authoritative record already lives in the telemetry events
+    # stream, so writing duplicate per-tick lines to the journal is
+    # pure noise. We send the BLE notification but skip the per-call
+    # log; edge-triggered, low-volume types still log at INFO.
+    _HIGH_FREQ_NOTIFY_TYPES = {Msg.COORDINATOR_STATE}
+
     def send_notification(self, msg_type: Msg, payload: Dict[str, Any]):
         """Encode *payload* and emit a BLE notification if enabled."""
-        # 1) Encode → bytes
         data = self._encode(msg_type, payload)
 
-        # 2) Log for full visibility
-        log.info(
-            "→ [BLE Notify] type=%s(0x%02x) payload=%s",
-            msg_type.name,
-            msg_type.value,
-            payload,
-        )
+        if msg_type not in self._HIGH_FREQ_NOTIFY_TYPES:
+            log.info(
+                "→ [BLE Notify] type=%s(0x%02x) payload=%s",
+                msg_type.name,
+                msg_type.value,
+                payload,
+            )
 
-        # 3) Fire if client subscribes
         if self.notifying:
             self.PropertiesChanged(
                 GATT_CHRC_IFACE,

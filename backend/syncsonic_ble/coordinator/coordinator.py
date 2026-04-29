@@ -50,7 +50,7 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from syncsonic_ble.coordinator.state import (
     HEALTH_HEALTHY,
@@ -64,6 +64,7 @@ from syncsonic_ble.telemetry.samplers.rssi_sampler import (
     RssiSnapshot,
     get_latest_rssi,
 )
+from syncsonic_ble.utils.constants import Msg
 from syncsonic_ble.utils.logging_conf import get_logger
 
 log = get_logger(__name__)
@@ -128,6 +129,12 @@ class Coordinator:
         self._stop = threading.Event()
         self._tick_count: int = 0
         self._last_emit_tick: int = 0
+        # Slice 3.6: optional BLE / external notification sink. Wired by
+        # main.py to the GATT Characteristic.send_notification method.
+        # Kept as a callback rather than a direct dependency so the
+        # Coordinator never imports BLE machinery; same separation lets
+        # tests inject a recorder without standing up D-Bus.
+        self._notification_sink: Optional[Callable[[Msg, Dict[str, Any]], None]] = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -151,6 +158,19 @@ class Coordinator:
         self._thread.join(timeout=2.0)
         self._thread = None
         log.info("Coordinator stopped")
+
+    def set_notification_sink(
+        self,
+        sink: Optional[Callable[[Msg, Dict[str, Any]], None]],
+    ) -> None:
+        """Wire (or unwire) a BLE notification sink. The callback is
+        invoked from the Coordinator thread for both the 1 Hz state
+        summary and edge-triggered events. Failures inside the sink
+        are caught and logged so a flaky BLE link never breaks the
+        Coordinator."""
+        self._notification_sink = sink
+        log.info("Coordinator notification sink %s",
+                 "wired" if sink is not None else "cleared")
 
     # -- main loop -----------------------------------------------------------
 
@@ -310,6 +330,15 @@ class Coordinator:
             "rssi_median_60s": round(s.rssi_median_60s, 1),
             "rssi_dip_db": round(s.rssi_dip_db, 1),
         })
+        self._push_ble_event({
+            "type": "soft_mute",
+            "phase": "mute",
+            "mac": s.mac,
+            "reason": reason,
+            "ramp_ms": SOFT_MUTE_RAMP_MS,
+            "rssi_dbm": s.latest_rssi_dbm,
+            "rssi_dip_db": round(s.rssi_dip_db, 1),
+        })
 
     def _exit_muted(self, s: SpeakerState, reason: str) -> None:
         ok = self._send_command(s.socket_path, f"mute_to 1000 {SOFT_MUTE_RAMP_MS}")
@@ -332,6 +361,14 @@ class Coordinator:
             "delta_frames_out": s.delta_frames_out,
             "latest_rssi_dbm": s.latest_rssi_dbm,
             "rssi_dip_db": round(s.rssi_dip_db, 1),
+        })
+        self._push_ble_event({
+            "type": "soft_mute",
+            "phase": "unmute",
+            "mac": s.mac,
+            "reason": reason,
+            "ramp_ms": SOFT_MUTE_RAMP_MS,
+            "rssi_dbm": s.latest_rssi_dbm,
         })
 
     # -- helpers -------------------------------------------------------------
@@ -408,6 +445,46 @@ class Coordinator:
             "policy_actions_enabled": True,  # Slice 3.2: soft-mute live
             "speakers": speakers,
         })
+
+        # Slice 3.6: BLE clients see the same per-second cadence the
+        # telemetry log uses, but with a trimmed payload sized for ATT
+        # MTU constraints (no internal counters, just the user-visible
+        # state).
+        self._push_ble_state(speakers)
+
+    def _push_ble_state(self, speakers_full: List[Dict[str, Any]]) -> None:
+        if self._notification_sink is None:
+            return
+        speakers_trim: List[Dict[str, Any]] = []
+        for s in speakers_full:
+            speakers_trim.append({
+                "mac": s["mac"],
+                "health": s["health"],
+                "gain": s["current_gain_x1000"],
+                "rssi_dbm": s.get("latest_rssi_dbm", 0),
+                "rssi_dip_db": s.get("rssi_dip_db", 0.0),
+                "delay_samples": s["target_delay_samples"],
+            })
+        try:
+            self._notification_sink(Msg.COORDINATOR_STATE, {
+                "tick": self._tick_count,
+                "n_speakers": len(speakers_trim),
+                "speakers": speakers_trim,
+            })
+        except Exception as exc:  # noqa: BLE001
+            # A flaky BLE link must not be allowed to break the
+            # coordinator's audio policy loop.
+            log.debug("Coordinator BLE state push failed: %s", exc)
+
+    def _push_ble_event(self, payload: Dict[str, Any]) -> None:
+        """Edge-triggered notification (soft_mute, health change). Same
+        safety contract as _push_ble_state."""
+        if self._notification_sink is None:
+            return
+        try:
+            self._notification_sink(Msg.COORDINATOR_EVENT, payload)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Coordinator BLE event push failed: %s", exc)
 
 
 # Process-wide singleton

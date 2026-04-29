@@ -1151,3 +1151,113 @@ Slice 3.6 (BLE notifications surface coordinator state to the app)
 or 3.7 (forced stress validation) is the natural next step. Slice
 3.4 (system-wide synchronous hold) and 3.5 (PI rate adjustment)
 remain deferred per the original reorder.
+
+## 15. Slice 3.6 Pi Validation Evidence (2026-04-29 EDT)
+
+Slice 3.6 (BLE notifications surface coordinator state to the app)
+is feature-complete and Pi-validated. The Coordinator now pushes a
+1 Hz per-speaker health snapshot (``Msg.COORDINATOR_STATE``, 0x71)
+and an edge-triggered soft-mute event (``Msg.COORDINATOR_EVENT``,
+0x72) to the existing GATT Characteristic; the mobile app sees the
+same per-second cadence the telemetry log uses, plus an immediate
+notification the moment the policy fires.
+
+### Architectural change recap
+
+- ``utils/constants.py`` defines two new ``Msg`` enum values:
+  ``COORDINATOR_STATE = 0x71`` (periodic snapshot) and
+  ``COORDINATOR_EVENT = 0x72`` (edge-triggered soft-mute).
+- ``coordinator/coordinator.py`` exposes a thin
+  ``set_notification_sink(callback)`` hook so the Coordinator can
+  push BLE messages without importing BLE / D-Bus machinery. The
+  callback is invoked from the Coordinator thread; the existing
+  ConnectionService and DeviceManager pattern (call
+  ``send_notification`` from a worker thread) is reused. Failures
+  in the sink are caught and logged at DEBUG so a flaky link can
+  never break the policy loop.
+- ``main.py`` wires the sink to ``char.send_notification`` after both
+  the Characteristic and the Coordinator are constructed.
+- ``infra/gatt_service.py`` learns about a ``_HIGH_FREQ_NOTIFY_TYPES``
+  set (currently ``{Msg.COORDINATOR_STATE}``); BLE notifications of
+  those types still fire on the wire but skip the per-call
+  ``log.info`` line. Their authoritative record already lives in
+  the telemetry events stream (``coordinator_tick``), so duplicating
+  to the journal at 1 Hz is pure noise.
+
+### BLE payload shape
+
+Periodic state push (``Msg.COORDINATOR_STATE``):
+```
+{
+  "tick":        <int>,                    // tick_count (analyzer can detect drops)
+  "n_speakers":  <int>,
+  "speakers": [
+    {
+      "mac":           "F4:6A:DD:D4:F3:C8",
+      "health":        "healthy" | "muted" | "stressed",
+      "gain":          1000,                // current_gain_x1000 (1000 = full)
+      "rssi_dbm":      -24,                 // latest sample, NOT median
+      "rssi_dip_db":   -0.5,                // median_60s - median_10s
+      "delay_samples": 0                    // current target delay
+    }
+  ]
+}
+```
+
+Edge-triggered event push (``Msg.COORDINATOR_EVENT``):
+```
+{
+  "type":        "soft_mute",
+  "phase":       "mute" | "unmute",
+  "mac":         "F4:6A:DD:D4:F3:C8",
+  "reason":      "frames_in_flowing_out_starved" |
+                 "rssi_dip" |
+                 "frames_out_recovered",
+  "ramp_ms":     50,
+  "rssi_dbm":    -32,                       // at trigger time
+  "rssi_dip_db": 6.5                        // mute side only
+}
+```
+
+### What was validated
+
+```
+2 speakers connected, music playing, tick=10060 (~16 min steady state)
+
+Live state push payload (292 bytes):
+  tick=10060, n_speakers=2
+  F4:6A:DD:D4:F3:C8 - health=healthy gain=1000 rssi=-24 dip=-0.5 delay=0
+  2C:FD:B4:69:46:0A - health=healthy gain=1000 rssi=-17 dip=-2.0 delay=0
+
+INFO-level COORDINATOR_STATE journal lines in last 10 s: 0
+(BLE payload still emitted - just not duplicated to the journal log)
+```
+
+292 bytes fits in 2-3 BLE notifications at a typical 100-byte ATT MTU,
+or in a single notification once the BLE stack negotiates a larger MTU
+(modern stacks default to 247 bytes after ATT_MTU_REQ exchange). The
+edge-triggered ``COORDINATOR_EVENT`` payload is much smaller (~150 bytes)
+and always fits in one notification.
+
+### Negative ``rssi_dip_db`` values are normal
+
+The validation snapshot shows ``rssi_dip_db = -0.5`` and ``-2.0`` for
+the two speakers. Negative values mean the recent 10 s median is
+STRONGER than the 60 s baseline, which happens when conditions are
+improving or from natural ±1-2 dB jitter. The detector compares
+``median_60s - median_10s`` against ``RSSI_DIP_THRESHOLD_DB = +5.0``,
+so negative values can never trigger.
+
+### Status
+
+Slice 3.6 is feature-complete and Pi-validated. The Coordinator's
+state and events are now surfaced to BLE clients (the SyncSonic
+app and any other GATT subscriber). The frontend integration -
+parsing the new ``Msg.COORDINATOR_STATE`` / ``Msg.COORDINATOR_EVENT``
+in the React Native app - is a separate frontend workstream and
+not part of this slice's backend acceptance criteria.
+
+Slice 3.7 (forced stress validation) is the natural next slice if we
+want to capture a real soft-mute firing on demand. Slice 3.4 (system-
+wide synchronous hold) and 3.5 (PI rate adjustment) remain deferred
+per the original reorder.

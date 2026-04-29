@@ -152,13 +152,19 @@ def main() -> None:
         collector = None
 
     # Slice 3 System Coordinator. Daemon thread that observes every
-    # live pw_delay_filter via its Unix socket. Observation-only in
-    # commit 3.1; subsequent commits add bounded rate adjustment
-    # (3.2), system-wide hold (3.3), soft-mute on transport failure
-    # (3.4), and RSSI-aware preemptive soft-mute (3.5). Like the
-    # collector, failure here must never break the audio service.
+    # live pw_delay_filter via its Unix socket and applies the
+    # soft-mute policy (Slice 3.2 transport-failure detector + Slice
+    # 3.3 RSSI-dip detector). Like the telemetry collector, failure
+    # here must never break the audio service.
     try:
         coordinator = build_and_start_coordinator()
+        # Slice 3.6: BLE clients see Coordinator state at 1 Hz plus
+        # any edge-triggered soft_mute event the moment it fires. We
+        # wire the sink after both objects exist; the Characteristic
+        # already serializes notifications safely (existing
+        # ConnectionService and DeviceManager call send_notification
+        # from worker threads on the same pattern).
+        coordinator.set_notification_sink(char.send_notification)
     except Exception as exc:  # noqa: BLE001
         log.warning("Coordinator failed to start, continuing without it: %s", exc)
         coordinator = None

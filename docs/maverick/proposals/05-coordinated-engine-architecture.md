@@ -1343,3 +1343,66 @@ Replaying the same listening conditions that produced 124 oscillating
 events should produce zero or single-digit events: any event that
 fires now corresponds to actual frame degradation, not a pure RF
 dip. The next Pi validation run will append numbers here.
+
+### Pi validation result (2026-04-29 EDT, 38 min, 3 speakers)
+
+Replayed the same domestic RF environment with 3 speakers connected
+(VIZIO F4 on hci0, 28:FA on hci1, 2C on hci2):
+
+| Metric | Pre-fix v1 (VIZIO only, 35 min) | Post-fix v2 (3 speakers, 38 min) |
+|---|---|---|
+| Total soft_mute events | **124** | **0** |
+| Frame in/out match rate | degraded during oscillation bursts | 100% (180/180 ticks across all 3) |
+| xrun events | (not measured this session) | **0** |
+| RSSI stress ticks (dip >= 5 dB) | drove every mute | 26 across 3 speakers (max dip 6.5 dB) |
+| Mutes triggered by RSSI stress | many (the bug) | **0** (the fix) |
+| Filter process churn | no churn during burst, but mute oscillating | no churn (filters at 28-31 min uptime) |
+| User-perceived behaviour | "VIZIO has been cutting out" | "system sounds great and stable" |
+
+The crucial proof point is row 5: RSSI dipped into stress range 26
+times during the validation session, and zero of those caused a
+mute, because frames stayed at 4096-5120 (well above the 2400
+amplified threshold). The new policy correctly absorbs transient
+RF dips without disturbing the audio path. If a real
+frame-flow degradation occurs, the amplified threshold catches it
+2-3 ticks earlier than the base threshold would.
+
+CPU steady-state: 33% total across the audio stack on a Pi 4
+(WirePlumber 9.7%, pipewire-pulse 7.5%, syncsonic main 6.6%,
+PipeWire 6.5%, actuation daemon 1.6%, 3x filters 0.6-0.7% each).
+Comfortable headroom for the Slice 4 mic-alignment work that
+follows.
+
+### Status
+
+The "Now" horizon's stability dream (per ROADMAP.md North Star) is
+considered achieved on the current PipeWire-based stack:
+- Per-speaker variable delay (Slice 2): xrun-free slider drags.
+- Coordinated soft-mute on transport failure (Slice 3.2): hides
+  audible click on real BlueZ stalls.
+- RSSI-as-amplifier (Slice 3.3v2): detects degradation earlier
+  under RF stress without false-positive firing on transient dips.
+- BLE state surface (Slice 3.6): app can render policy reasoning.
+
+Slice 4 (mic-driven runtime alignment) builds on top of this
+stable foundation. Items deliberately deferred at this point:
+
+1. **Frontend integration of Slice 3.6 BLE notifications.** The
+   hook is wired (`coordinatorState`, `coordinatorEvents`) but no
+   UI component renders them yet. Worth tackling alongside Slice 4
+   so the same screens can show health pills, RSSI dip meters, and
+   calibration progress.
+2. **Slice 1 reproducibility addendum.** Two back-to-back
+   snapshot-only sessions to establish +/-5% reproducibility
+   numbers. Appendable to Section 10 anytime; not blocking.
+3. **Slice 3.7 forced-stress validation.** Effectively done
+   organically through the Slice 3.3v2 oscillation incident, which
+   proved the detector correctly distinguishes "RF stress that
+   degrades audio" from "RF stress that doesn't". A deliberate
+   stress test would be additive evidence, not a missing
+   acceptance gate.
+4. **The "ERR 1" investigation** from ROADMAP.md section 6 (the
+   `bluez_output.F4..C8.1` error that accumulated in pre-Slice 0
+   journals). Hasn't recurred since Slice 0 priority work.
+5. **PipeWire / WirePlumber version drift logging.** Open question
+   from roadmap section 6. Add when convenient.

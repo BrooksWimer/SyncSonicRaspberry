@@ -275,19 +275,34 @@ honest.
 - One jsonl per session at `/var/log/syncsonic/session-<ts>.jsonl` with
   structured events (`pw_xrun`, `bluez_transport_error`,
   `delay_filter_queue_depth`, `route_create`, `route_teardown`,
-  `set_latency_request`, `mic_rms_window`), all timestamped with
-  `CLOCK_MONOTONIC`.
+  `set_latency_request`, `mic_rms_window`, `rssi_sample`,
+  `rssi_baseline`), all timestamped with `CLOCK_MONOTONIC`.
 - Pipe `pw-mon` (or periodic `pw-cli ls Node` snapshots) every 1 s into
   the same stream so we capture priority.driver changes, codec changes,
   and bluez node states.
 - BlueZ `MediaTransport1` property snapshots (Codec, Volume, Delay,
-  Configuration) every 5 s.
+  Configuration) every 5 s. These properties change rarely so a slow
+  poll is fine.
+- **Per-speaker RSSI sampling every 1 s per connected output** via
+  `hcitool -i <hci> rssi <mac>` (or the equivalent BlueZ D-Bus
+  property if available without privilege escalation). For each
+  speaker, maintain in process: the latest sample, a 10-second rolling
+  median, and a 60-second rolling baseline median. All three are
+  emitted to the jsonl as `rssi_sample` (every 1 s) and
+  `rssi_baseline` (every 10 s). These are the leading indicator of
+  dropouts — the field experiment in section 9 (2026-04-29) confirms
+  the system is RF-limited and that RSSI moves seconds before the
+  audible dropout. Single-sample RSSI is too noisy to be useful;
+  rolling medians are the minimum reliable read.
 - One command (`make session NAME=test1`) plays a fixed 30 s music
   sample, captures everything, produces a single-page report: dropout
-  count, inter-speaker drift, codec changes, xrun count.
+  count, inter-speaker drift, codec changes, xrun count, **per-speaker
+  RSSI median + variance, and RSSI-vs-xrun temporal correlation**
+  (does dropout cluster within N seconds of an RSSI dip?).
 
 **Success criterion (Pi-validated):** `make session` twice with no code
-changes produces reproducible numbers within ±5%.
+changes produces reproducible numbers within ±5% on every primary
+metric, **including the RSSI-vs-xrun correlation coefficient**.
 
 ### Slice 2: Stereo elastic delay engine + IPC (2 weeks)
 

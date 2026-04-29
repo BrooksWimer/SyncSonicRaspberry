@@ -15,6 +15,7 @@ fi
 
 cleanup() {
   /usr/bin/pkill -u syncsonic -f /home/syncsonic/SyncSonicPi/backend/tools/pw_delay_filter 2>/dev/null || true
+  if [ -n "${SYNCSONIC_MIC_CAPTURE_PID:-}" ]; then kill "$SYNCSONIC_MIC_CAPTURE_PID" 2>/dev/null || true; fi
   if [ -n "${SYNCSONIC_ACTUATION_DAEMON_PID:-}" ]; then kill "$SYNCSONIC_ACTUATION_DAEMON_PID" 2>/dev/null || true; fi
   if [ -n "${SYNCSONIC_PIPEWIRE_PULSE_PID:-}" ]; then kill "$SYNCSONIC_PIPEWIRE_PULSE_PID" 2>/dev/null || true; fi
   if [ -n "${SYNCSONIC_WIREPLUMBER_PID:-}" ]; then kill "$SYNCSONIC_WIREPLUMBER_PID" 2>/dev/null || true; fi
@@ -44,6 +45,13 @@ if [ "$SYNCSONIC_AUDIO_RUNTIME" = "pipewire-headless" ]; then
 
   python3 -u -m syncsonic_ble.helpers.pipewire_actuation_daemon &
   SYNCSONIC_ACTUATION_DAEMON_PID=$!
+
+  # Slice 1 mic capture: continuous USB-mic recording into tmpfs
+  # rolling segments (no SD card wear). Independent process so a crash
+  # here cannot affect audio playback or the BLE control plane.
+  mkdir -p "$XDG_RUNTIME_DIR/mic"
+  python3 -u -m measurement.mic_capture &
+  SYNCSONIC_MIC_CAPTURE_PID=$!
 
   trap cleanup EXIT
 

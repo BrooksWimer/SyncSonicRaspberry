@@ -317,12 +317,13 @@ class PipeWireTransportManager:
         if not needs_build:
             return os.access(FILTER_BINARY, os.X_OK)
 
-        # -pthread for the new control thread; keeps the rest of the
-        # build invocation identical to the pre-Slice-2 path.
+        # -pthread  for the new control thread / Unix-socket surface
+        # -latomic  gcc on aarch64 emits libatomic calls for 8-byte
+        #           atomic ops used by frames_in_total / frames_out_total
         compile_cmd = (
             f"gcc -O2 -Wall -Wextra -pthread -o {shlex.quote(str(FILTER_BINARY))} "
             f"{shlex.quote(str(FILTER_SOURCE))} "
-            "$(/usr/bin/pkg-config --cflags --libs libpipewire-0.3)"
+            "$(/usr/bin/pkg-config --cflags --libs libpipewire-0.3) -latomic"
         )
         result = subprocess.run(
             ["/bin/sh", "-lc", compile_cmd],

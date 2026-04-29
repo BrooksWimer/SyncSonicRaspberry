@@ -10,10 +10,11 @@ export SYNCSONIC_ACTUATION_BACKEND="${SYNCSONIC_ACTUATION_BACKEND:-pipewire-node
 export SYNCSONIC_AUDIO_RUNTIME="${SYNCSONIC_AUDIO_RUNTIME:-pipewire-headless}"
 
 if [ -f tools/pw_delay_filter.c ] && { [ ! -x tools/pw_delay_filter ] || [ tools/pw_delay_filter.c -nt tools/pw_delay_filter ]; }; then
-  # Slice 2: -pthread is required for the new control-thread / Unix-socket
-  # surface in pw_delay_filter.c. Keep the rest of the invocation
-  # identical to the pre-Slice-2 build line.
-  gcc -O2 -Wall -Wextra -pthread -o tools/pw_delay_filter tools/pw_delay_filter.c $(/usr/bin/pkg-config --cflags --libs libpipewire-0.3)
+  # Slice 2:
+  #   -pthread     for the new control-thread / Unix-socket surface
+  #   -latomic     gcc on aarch64 emits libatomic calls for 8-byte
+  #                atomic ops (used by frames_in_total / frames_out_total)
+  gcc -O2 -Wall -Wextra -pthread -o tools/pw_delay_filter tools/pw_delay_filter.c $(/usr/bin/pkg-config --cflags --libs libpipewire-0.3) -latomic
 fi
 
 cleanup() {

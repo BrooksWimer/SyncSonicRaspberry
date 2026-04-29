@@ -654,3 +654,112 @@ supersede).
   serve outputs. This experiment shows the bottleneck is the speakers'
   air link, not the Pi-side adapter, so reassigning hci3 is unlikely
   to help. Re-evaluate after Slice 1 lands.
+
+## 10. Slice 1 Pi Validation Evidence (2026-04-29 EDT)
+
+Slice 1 is feature-complete and Pi-validated against a single
+30-second session named ``baseline1``. The original Slice 1 success
+criterion was "two back-to-back ``make session`` runs produce
+reproducible numbers within ±5%." We did not collect a clean second
+session because the loud pink-noise reference signal startled the
+operator twice and we (correctly) chose to stop pushing rather than
+keep blasting the room. The evidence we have validates that the
+schema, samplers, event hooks, mic capture, session bundle, and
+report generator all work end-to-end on the Pi; the
+two-back-to-back reproducibility number is the only piece of the
+original criterion still outstanding and we will collect it on a
+later session using the new safer defaults documented at the bottom
+of this section.
+
+### What baseline1 captured
+
+Session window: 2026-04-29T06:04:33.432Z → 06:05:03.436Z (30 s).
+Speakers connected: VIZIO SB2020n (F4:6A:DD:D4:F3:C8) on hci0 and JBL
+Flip 6 (2C:FD:B4:69:46:0A) on hci1. Phone (AC:DF:A1:52:8A:41) on the
+reserved adapter hci3. 68 events kept in window. 6 mic segments / 5.06
+MB / ~52.7 s of audio captured.
+
+Per-speaker RSSI (auto-extracted by ``measurement.report``):
+
+| MAC | hci | samples | median dBm | min | max | stdev dB |
+|---|---|---:|---:|---:|---:|---:|
+| `2C:FD:B4:69:46:0A` (JBL) | hci1 | 7 | -11 | -13 | -9 | 1.12 |
+| `F4:6A:DD:D4:F3:C8` (VIZIO) | hci0 | 10 | -21.0 | -33 | -17 | 4.82 |
+
+The JBL is sitting at a stable -11 dBm; the VIZIO is at a much
+weaker and noisier -21 dBm with 4.82 dB standard deviation. This
+matches the Section 9 field experiment's RF-limited finding exactly.
+The fact that we now capture this automatically per session (rather
+than via a one-off ``hcitool rssi`` script) is the Slice 1 deliverable.
+
+xrun count per node: ``virtual_out: 2``. Both during the session.
+
+BlueZ MediaTransport snapshots, decoded SBC config:
+
+- VIZIO: 48 kHz, joint stereo, 16 blk, 8 sub, loudness, bitpool 8-53
+- JBL: 48 kHz, joint stereo, 16 blk, 8 sub, loudness, bitpool 2-40
+- Phone: 44.1 kHz, joint stereo, 16 blk, 8 sub, loudness, bitpool 2-53
+
+The bitpool 53 vs 40 difference (33% more BT bandwidth on the VIZIO)
+that Section 9 surfaced via a hand-decoded busctl call is now
+captured automatically in every session, decoded into human-readable
+fields by the report generator. This is exactly the data the Slice 3
+"per-speaker codec policy" idea (Section 9 implications) needs as
+input.
+
+Mic capture: 6 rolling segments at the moment of session-end snapshot,
+covering ~52.7 s of audio, 5.06 MB total. The session bundle copies
+them in chronological order; the analyzer joins them on wall-clock
+time, not file mtime, so a small mtime skew between the mic_capture
+process and the session runner does not corrupt the alignment.
+
+The full report is at
+``/home/syncsonic/syncsonic-telemetry/sessions/baseline1-2026-04-29T06-04-33.261Z/report.md``
+on the Pi.
+
+### What we deliberately did not do
+
+A second back-to-back session (``baseline2``) was attempted and
+aborted after ~5 seconds because the operator turned the speakers off
+mid-pink-noise. The bundle on disk
+(``baseline2-2026-04-29T06-05-17.641Z/``) exists but contains 49
+events, no rssi_sample / pw_xrun / route_create entries, and is not
+useful for reproducibility comparison. It is preserved as a real
+example of a "session captured against a stopped audio path" so the
+analyzer's empty-table-handling can be verified against it later.
+
+### Bug found and fixed during validation: the loud-default UX
+
+The Slice 1 ``run_session`` first cut defaulted to playing pink noise
+at -10 dBFS through every connected speaker for the full DURATION,
+with a 50% volume cap. Pink noise at 50% on a soundbar is unsettlingly
+loud in a quiet room and the operator had no warning the first time
+it played. The default was wrong. Two fixes:
+
+1. ``--play-reference`` is now opt-in. Default behavior is "snapshot
+   the live system for DURATION seconds." The Slice 1 success
+   criterion does NOT require pink-noise playback; it just requires
+   the audio path to be active, which any music the operator is
+   already listening to satisfies. The runner picks up
+   rssi_sample / pw_xrun / route activity / bluez_transport snapshots
+   without playing any audio of its own.
+2. When ``--play-reference`` IS specified, the default
+   ``--volume-percent`` is dropped from 50 to 25, and the runner
+   prints a 5-second pre-play warning ("about to play loud broadband
+   pink noise — Ctrl+C to abort") before paplay starts. The volume
+   restore loop already exists; this commit just makes it harder to
+   reach the play branch by accident.
+
+### Status
+
+Slice 1 is feature-complete in code AND Pi-validated for
+schema / samplers / event hooks / mic capture / bundle layout / report
+generation. The single piece of the original success criterion still
+open is "two back-to-back sessions reproducible within ±5%"; this
+will be collected on a later session using the new safe-by-default
+``run_session`` (no loud pink noise unless explicitly requested), and
+appended to this section as Section 10's reproducibility addendum.
+
+Slice 2 (stereo elastic delay engine + IPC, the one that finally
+makes manual latency adjustments stop causing xruns) is the next
+workstream.

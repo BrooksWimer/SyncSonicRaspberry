@@ -56,7 +56,15 @@ from syncsonic_ble.telemetry import telemetry_root  # noqa: E402
 DEFAULT_DURATION_SEC = 30
 DEFAULT_MIC_DIR = "/run/syncsonic/mic"
 DEFAULT_REFERENCE_NAME = "reference-pinknoise-30s.wav"
-DEFAULT_TEST_VOLUME_PERCENT = 50  # safety: cap speaker volume during the test
+# Safety: cap speaker volume during the test if the operator opts in to
+# the reference-signal play. Default chosen conservatively so we don't
+# ever blast a room by default. The Slice 1 success criterion does NOT
+# require pink-noise playback - it just needs the audio path to be
+# active. Operators who already have music playing should omit
+# --play-reference entirely; the runner will simply snapshot the live
+# events stream during whatever audio is already flowing.
+DEFAULT_TEST_VOLUME_PERCENT = 25
+PRE_PLAY_WARNING_SEC = 5
 
 
 def _list_bluez_sink_names() -> list:
@@ -269,12 +277,27 @@ def main() -> int:
     parser.add_argument("--reference", default=None, help="Path to reference WAV (auto-generated if omitted)")
     parser.add_argument("--mic-dir", default=os.environ.get("SYNCSONIC_MIC_DIR", DEFAULT_MIC_DIR),
                         help="Directory holding the rolling mic segments")
+    # Default behavior is "snapshot the live system for DURATION seconds":
+    # if you are already listening to music, the audio path is already
+    # exercised and the events-side metrics (RSSI, xruns, route activity)
+    # populate just fine. Playing the reference signal is now opt-in via
+    # --play-reference; when omitted, --no-play is implied.
+    parser.add_argument("--play-reference", action="store_true",
+                        help="Opt-in: play the pink-noise reference WAV through the speakers "
+                             "for the session duration. WARNING: pink noise is loud broadband "
+                             "stimulus; the runner will print a 5-second pre-play warning. Default "
+                             "is to NOT play - just snapshot the live system, which works fine "
+                             "if you already have music playing.")
     parser.add_argument("--no-play", action="store_true",
-                        help="Skip playing the reference (just snapshot the live system)")
+                        help="Force snapshot-only mode (also the default if --play-reference "
+                             "is omitted). Kept as an explicit flag for clarity in scripts.")
     parser.add_argument("--volume-percent", type=int, default=DEFAULT_TEST_VOLUME_PERCENT,
                         help="Speaker volume percent during the test (restored after). "
-                             f"Default {DEFAULT_TEST_VOLUME_PERCENT}. Set to 0 to skip volume control.")
+                             f"Default {DEFAULT_TEST_VOLUME_PERCENT}. Set to 0 to skip volume control. "
+                             "Only takes effect when --play-reference is set.")
     args = parser.parse_args()
+    # Treat omission of --play-reference as --no-play.
+    args.no_play = args.no_play or not args.play_reference
 
     root = telemetry_root()
     sessions_dir = root / "sessions"
@@ -312,6 +335,29 @@ def main() -> int:
     # Play reference (background) and wait
     play_proc: Optional[subprocess.Popen] = None
     if not args.no_play:
+        # Loud-broadband warning: give the operator a chance to abort
+        # before paplay starts. The default reference is pink noise at
+        # -10 dBFS which is intentionally arresting in a quiet room.
+        print(
+            f"[run_session] WARNING: about to play '{reference_path.name}' at "
+            f"{args.volume_percent}% volume through every connected BT speaker. "
+            f"Pink noise sounds like loud broadband 'shhhhh'. "
+            f"Ctrl+C within {PRE_PLAY_WARNING_SEC}s to abort.",
+            flush=True,
+        )
+        try:
+            time.sleep(PRE_PLAY_WARNING_SEC)
+        except KeyboardInterrupt:
+            print("[run_session] aborted by operator before play", file=sys.stderr)
+            for sink, (left, right) in saved_volumes.items():
+                try:
+                    subprocess.run(
+                        ["pactl", "set-sink-volume", sink, f"{left}%", f"{right}%"],
+                        capture_output=True, text=True, timeout=2.0, check=False,
+                    )
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    pass
+            return 4
         try:
             play_proc = _play_reference_async(reference_path)
         except FileNotFoundError:

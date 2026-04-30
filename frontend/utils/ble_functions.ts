@@ -326,3 +326,61 @@ export async function runUltrasonicSync(device: Device): Promise<void> {
   console.log('🔊 Running ultrasonic auto-sync');
   return bleWrite(device, MESSAGE_TYPES.ULTRASONIC_SYNC, {});
 }
+
+export type CalibrationModeBle = 'music' | 'startup_tune';
+
+/**
+ * Slice 4.2: queue mic calibration for one speaker. Listen for
+ * CALIBRATION_RESULT (0x73) notifications for progress.
+ */
+export async function calibrateSpeaker(
+  device: Device,
+  mac: string,
+  options?: {
+    calibration_mode?: CalibrationModeBle;
+    target_total_ms?: number;
+    capture_duration_sec?: number;
+  },
+): Promise<void> {
+  const payload: Record<string, unknown> = { mac };
+  if (options?.calibration_mode !== undefined) {
+    payload.calibration_mode = options.calibration_mode;
+  }
+  if (options?.target_total_ms !== undefined) {
+    payload.target_total_ms = options.target_total_ms;
+  }
+  if (options?.capture_duration_sec !== undefined) {
+    payload.capture_duration_sec = options.capture_duration_sec;
+  }
+  console.log('CALIBRATE_SPEAKER', payload);
+  return bleWrite(device, MESSAGE_TYPES.CALIBRATE_SPEAKER, payload);
+}
+
+/**
+ * Slice 4.3: queue sequential calibration for every connected engine output.
+ */
+export async function calibrateAllSpeakers(
+  device: Device,
+  options?: {
+    calibration_mode?: CalibrationModeBle;
+    target_total_ms?: number;
+    capture_duration_sec?: number;
+    continue_on_failure?: boolean;
+  },
+): Promise<void> {
+  const payload: Record<string, unknown> = {};
+  if (options?.calibration_mode !== undefined) {
+    payload.calibration_mode = options.calibration_mode;
+  }
+  if (options?.target_total_ms !== undefined) {
+    payload.target_total_ms = options.target_total_ms;
+  }
+  if (options?.capture_duration_sec !== undefined) {
+    payload.capture_duration_sec = options.capture_duration_sec;
+  }
+  if (options?.continue_on_failure !== undefined) {
+    payload.continue_on_failure = options.continue_on_failure;
+  }
+  console.log('CALIBRATE_ALL_SPEAKERS', payload);
+  return bleWrite(device, MESSAGE_TYPES.CALIBRATE_ALL_SPEAKERS, payload);
+}

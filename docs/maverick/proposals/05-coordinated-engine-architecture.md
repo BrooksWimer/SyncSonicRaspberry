@@ -1,8 +1,8 @@
 # Epic 05: Coordinated Engine — Architecture Proposal
 
-_Status: Slice 0 deployed and Pi-validated 2026-04-29 EDT on
-`epic/05-coordinated-engine`. Slice 1 (telemetry) up next. See section 8 for
-the validation evidence._
+_Status: Slices 0–3 deployed and Pi-validated on `epic/05-coordinated-engine`.
+**Slice 4** (mic calibration, startup chirp, sequential align-all) is in
+progress—see §360+. Evidence sections 8–16 remain the Pi audit trail._
 
 _For the strategic frame this epic sits inside (the North Star, the three
 time horizons, and the design principles every slice is held to), see

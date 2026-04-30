@@ -81,13 +81,13 @@ slice-by-slice implementation plan live in
 
 ## Slice Plan
 
-| Slice | Outcome | Approximate effort |
-|---|---|---|
-| 0 | Bug-fix triage (phone-MAC guard, no-spin on offline speakers, single-source priority.driver, one-shot auto-reconnect) and ship the WirePlumber rule to foundation | 1 day |
-| 1 | Telemetry layer + always-on mic capture + reproducible session report | 1 week |
-| 2 | Stereo elastic delay engine with Unix-socket IPC; smooth in-place delay/rate changes with no xrun | 2 weeks |
-| 3 | System Coordinator with bounded rate adjustment, system-wide hold, soft-mute + phase-aligned re-entry | 2 weeks |
-| 4 | Mic-driven runtime alignment as a coordinator client | 2 weeks |
+| Slice | Outcome | Approximate effort | Status (2026-04-30) |
+|---|---|---|---|
+| 0 | Bug-fix triage (phone-MAC guard, no-spin on offline speakers, single-source priority.driver, one-shot auto-reconnect) and ship the WirePlumber rule to foundation | 1 day | Done |
+| 1 | Telemetry layer + always-on mic capture + reproducible session report | 1 week | Done |
+| 2 | Stereo elastic delay engine with Unix-socket IPC; smooth in-place delay/rate changes with no xrun | 2 weeks | Done |
+| 3 | System Coordinator with bounded rate adjustment, system-wide hold, soft-mute + phase-aligned re-entry | 2 weeks | Done (3.4 hold / 3.5 rate PI still deferred) |
+| 4 | Mic-driven alignment (single + sequential + startup tune); Wi‑Fi path next | 2 weeks | In progress |
 
 ## Validation Expectations
 

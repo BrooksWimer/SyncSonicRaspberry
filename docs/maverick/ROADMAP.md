@@ -29,23 +29,16 @@ that delivers the experience above on the existing Raspberry Pi 4 +
 beyond that is optional and gated on whether the owner decides to take
 it to market later.
 
-## 2. Where We Are Today (2026-04-29 EDT)
+## 2. Where We Are Today (2026-04-30 EDT)
 
 - Active branch: [`epic/05-coordinated-engine`](epics/05-coordinated-engine.md),
   forked from `foundation/neutral-minimal`.
-- **Slice 0 deployed and Pi-validated** on `syncsonic@10.0.0.89`.
-  Evidence in section 8 of
-  [the architecture proposal](proposals/05-coordinated-engine-architecture.md#8-slice-0-pi-validation-evidence-2026-04-29-edt).
-- Hardware reality: Pi 4 with 4 BT controllers (1 UART on-board for
-  advertising + 3 USB for output), 1 USB measurement microphone (Jieli
-  UAC) currently `SUSPENDED`. Pi-CM-class custom carrier is plausible
-  but not in scope until the dream is achieved on the current
-  hardware.
-- Architecture pivot in progress: from per-speaker, fixed-delay,
-  teardown-on-stress to one coordinated elastic-buffer engine driven
-  by a system-wide policy that holds all outputs accountable to each
-  other. See the architecture proposal for the rationale and seven
-  documented root-cause failure modes.
+- **Slices 0–3 shipped and Pi-validated** (telemetry, elastic engine,
+  coordinator soft-mute + RSSI amplifier + BLE state notifications).
+  **Slice 4** (mic calibration + startup chirp + sequential BLE) is
+  **in progress** with user-facing controls landing in the mobile app.
+- Primary validation Pi: `syncsonic@10.0.0.89` — evidence cross-linked from
+  the architecture proposal (sections 8–16).
 
 The four pre-existing epic lanes (01 PipeWire transport stability, 02
 startup mic auto-alignment, 03 runtime ultrasonic auto-alignment, 04
@@ -96,17 +89,16 @@ This is the only horizon with active commitments. Detailed in
 | Slice | Outcome | Status |
 |---|---|---|
 | 0 | Bug-fix triage (phone-MAC guard, no-spin on offline, single-source priority.driver, one-shot auto-reconnect) + ship the WirePlumber rule to foundation | **DONE, Pi-validated 2026-04-29** |
-| 1 | Telemetry layer + always-on mic capture + reproducible session report | next |
-| 2 | Stereo elastic delay engine (replaces `pw_delay_filter.c`) with Unix-socket IPC; smooth in-place delay/rate changes with no xrun | pending |
-| 3 | System Coordinator with bounded ±50 ppm rate adjustment, system-wide synchronous hold, soft-mute + phase-aligned re-entry on transport failure | pending |
-| 4 | Mic-driven alignment: analyzer + per-speaker sequential calibration + optional startup chirp + multi-speaker BLE sequence; mixed-signal alignment monitor (Slice 4.4) deprecated — removed after git commit `f66aad5` | **in progress** |
+| 1 | Telemetry layer + always-on mic capture + reproducible session report | **DONE**, Pi-validated (see architecture §10) |
+| 2 | Stereo elastic delay engine (`pw_delay_filter` elastic path) + Unix-socket IPC; smooth delay/gain without graph xruns | **DONE**, Pi-validated (architecture §11) |
+| 3 | System Coordinator (soft-mute + RSSI-as-amplifier + BLE state/events at 1 Hz) | **DONE**, Pi-validated (architecture §12–16) |
+| 4 | Mic-driven alignment: analyzer + per-speaker sequential calibration + startup chirp + multi-speaker BLE; Slice 4.4 mixed-signal monitor deprecated (`f66aad5` record, removed `b8f92db`) | **in progress** (backend + app hooks + Speaker Config UI) |
 
 Each slice is independently deployable and produces objective evidence
-on the Slice 1 telemetry stream. The dream is considered "delivered"
-when Slice 3 lands and a 30-second session report through the
-measurement harness shows zero audible dropouts under deliberate
-stress (microwave on, BT scan in progress, USB hub power blip), with
-inter-speaker drift below the perceptual threshold.
+on the Slice 1 telemetry stream. Closing the **Now** horizon still
+requires finishing Slice 4 (full Pi validation of startup-tune + align-
+all flows), optional Slice 3.4 hold / 3.5 rate-PI only if telemetry
+demands them, then Wi‑Fi output integration as a follow-on lane.
 
 ### 3.2 Mid horizon — SyncSonic Audio Engine (SAE) (6-18 months, optional)
 

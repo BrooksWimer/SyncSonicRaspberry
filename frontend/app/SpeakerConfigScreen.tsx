@@ -18,7 +18,14 @@ import {
   handleLatencyChange
 } from '../utils/SpeakerFunctions';
 import { useBLEContext, } from '@/contexts/BLEContext';
-import { bleConnectOne, bleDisconnectOne, setVolume, setMute } from '../utils/ble_functions';
+import {
+  bleConnectOne,
+  bleDisconnectOne,
+  setVolume,
+  setMute,
+  calibrateSpeaker,
+  calibrateAllSpeakers,
+} from '../utils/ble_functions';
 import LottieView from 'lottie-react-native';
 import { Audio } from 'expo-av';
 import { Header } from '@/components/texts/TitleText';
@@ -75,8 +82,15 @@ export default function SpeakerConfigScreen() {
     }
   };
 
-  // Use only piStatus from BLEContext
-  const { dbUpdateTrigger, connectedDevice, piStatus } = useBLEContext();
+  const {
+    dbUpdateTrigger,
+    connectedDevice,
+    piStatus,
+    calibrationEvents,
+    connectionStatus: bleConnectionStatus,
+    clearConnectionStatus: bleClearConnectionStatus,
+    setConnectionStatus,
+  } = useBLEContext();
 
   // State to hold connected speakers (mapping from mac to name)
   const [connectedSpeakers, setConnectedSpeakers] = useState<{ [mac: string]: string }>({});
@@ -86,6 +100,52 @@ export default function SpeakerConfigScreen() {
 
   // State for speaker settings (volume and latency)
   const [settings, setSettings] = useState<{ [mac: string]: { volume: number; latency: number; isConnected: boolean } }>({});
+
+  const calNotificationCursorRef = useRef(0);
+
+  useEffect(() => {
+    const events = calibrationEvents;
+    while (calNotificationCursorRef.current < events.length) {
+      const ev = events[calNotificationCursorRef.current] as Record<string, unknown>;
+      calNotificationCursorRef.current += 1;
+      const phase = String(ev.phase ?? '');
+
+      if (phase === 'sequence_complete') {
+        const outcomes = ev.per_mac_outcome as Record<string, string> | undefined;
+        const summary = outcomes
+          ? Object.entries(outcomes)
+              .map(([m, st]) => `${connectedSpeakers[m] ?? m}: ${st}`)
+              .join('\n')
+          : 'Done.';
+        Alert.alert('Align all speakers', summary);
+        continue;
+      }
+
+      if (phase === 'sequence_failed') {
+        Alert.alert(
+          'Align all speakers',
+          String(ev.reason ?? 'No calibratable outputs (connect speakers to the Pi first).'),
+        );
+        continue;
+      }
+
+      if (phase === 'applied' && !ev.sequence_total) {
+        const m = String(ev.mac ?? '');
+        Alert.alert(
+          'Calibration',
+          `Updated delay for ${connectedSpeakers[m] ?? m}.`,
+        );
+        continue;
+      }
+
+      if (phase === 'failed' && !ev.sequence_total) {
+        Alert.alert(
+          'Calibration failed',
+          String(ev.detail ?? ev.reason ?? 'Unknown error'),
+        );
+      }
+    }
+  }, [calibrationEvents, connectedSpeakers]);
 
   // State for loading speakers
   const [loadingSpeakers, setLoadingSpeakers] = useState<{ 
@@ -195,8 +255,6 @@ export default function SpeakerConfigScreen() {
       isMuted: boolean;
     }
   }>({});
-
-  const { connectionStatus: bleConnectionStatus, clearConnectionStatus: bleClearConnectionStatus, setConnectionStatus } = useBLEContext();
 
   // Update slider values when settings change
   useEffect(() => {
@@ -697,6 +755,93 @@ export default function SpeakerConfigScreen() {
     );
   };
 
+  const handleAlignAllStartupTune = () => {
+    if (!connectedDevice) {
+      Alert.alert('Error', 'No Bluetooth device connected');
+      return;
+    }
+    Alert.alert(
+      'Startup tune alignment',
+      'Pause music on your phone first. The Pi will play a short chirp through connected speakers.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Continue',
+          onPress: () => {
+            void (async () => {
+              try {
+                await calibrateAllSpeakers(connectedDevice, {
+                  calibration_mode: 'startup_tune',
+                });
+              } catch (error) {
+                console.error(error);
+                Alert.alert('Error', 'Failed to send align-all command.');
+              }
+            })();
+          },
+        },
+      ],
+    );
+  };
+
+  const handleAlignAllMusic = () => {
+    if (!connectedDevice) {
+      Alert.alert('Error', 'No Bluetooth device connected');
+      return;
+    }
+    Alert.alert(
+      'Align using current audio',
+      'Uses whatever is already playing through the Pi. Works best when music is dense (not silence).',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Continue',
+          onPress: () => {
+            void (async () => {
+              try {
+                await calibrateAllSpeakers(connectedDevice, {
+                  calibration_mode: 'music',
+                });
+              } catch (error) {
+                console.error(error);
+                Alert.alert('Error', 'Failed to send align-all command.');
+              }
+            })();
+          },
+        },
+      ],
+    );
+  };
+
+  const handleSpeakerStartupTune = (mac: string) => {
+    if (!connectedDevice) {
+      Alert.alert('Error', 'No Bluetooth device connected');
+      return;
+    }
+    Alert.alert(
+      'Startup tune alignment',
+      'Pause music on your phone first. The Pi will play a short chirp while measuring this speaker.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Continue',
+          onPress: () => {
+            void (async () => {
+              try {
+                await calibrateSpeaker(connectedDevice, mac, {
+                  calibration_mode: 'startup_tune',
+                });
+              } catch (error) {
+                console.error(error);
+                Alert.alert('Error', 'Failed to send calibration command.');
+              }
+            })();
+          },
+        },
+      ],
+    );
+  };
+
   const handleMuteToggle = async (mac: string) => {
     const isCurrentlyMuted = sliderValues[mac]?.isMuted || false;
     const newMuted = !isCurrentlyMuted;
@@ -765,6 +910,9 @@ export default function SpeakerConfigScreen() {
     // You can tweak the divisor (e.g., 0.05 * screenWidth) to find the best fit
     const estimatedFontSize = Math.min(40, screenWidth / (configNameParam.length + 12));
 
+    const anyPiSpeakerConnected = Object.keys(settings).some(
+      (mac) => settings[mac]?.isConnected
+    );
 
       return (
         <YStack flex={1} backgroundColor={bg}>
@@ -776,6 +924,32 @@ export default function SpeakerConfigScreen() {
           <Header title={configNameParam}/>
           
           <ScrollView contentContainerStyle={{ paddingBottom: 15 }}>
+            {connectedDevice && anyPiSpeakerConnected && Object.keys(connectedSpeakers).length > 0 && (
+              <YStack alignSelf="center" marginTop={12} marginBottom={8} width="90%">
+                <Button
+                  backgroundColor={pc as any}
+                  color="white"
+                  onPress={handleAlignAllStartupTune}
+                >
+                  <Text fontFamily="Finlandica" color="white">
+                    Align all speakers (startup tune)
+                  </Text>
+                </Button>
+                <Button
+                  marginTop={10}
+                  backgroundColor={themeName === 'dark' ? '#3D2A55' : '#E8DCFA'}
+                  color={tc as any}
+                  onPress={handleAlignAllMusic}
+                >
+                  <Text fontFamily="Finlandica" color={tc}>
+                    Align all (use playing music)
+                  </Text>
+                </Button>
+                <Body center style={{ marginTop: 8, fontSize: 12, color: stc }}>
+                  Mic alignment runs on the Pi. Pause phone playback before startup tune so the reference signal stays clean.
+                </Body>
+              </YStack>
+            )}
             {/* Auto-sync speakers (ultrasonic) – runs one sync cycle on the Pi */}
             {Object.keys(connectedSpeakers).length >= 2 && (
               <YStack alignSelf="center" marginTop={12} marginBottom={8} width="90%">
@@ -878,6 +1052,19 @@ export default function SpeakerConfigScreen() {
                     maximumTrackTintColor="#000000"
                     thumbTintColor="white" 
                   />
+                  {settings[mac]?.isConnected && (
+                    <Button
+                      marginTop={10}
+                      size="$3"
+                      backgroundColor={pc as any}
+                      disabled={!connectedDevice}
+                      onPress={() => handleSpeakerStartupTune(mac)}
+                    >
+                      <Text fontFamily="Finlandica" color="white">
+                        Startup tune align (this speaker)
+                      </Text>
+                    </Button>
+                  )}
                   <View style={styles.soundFieldContainer}>
                     {/* Left Side */}
                     <View style={{ flexDirection: 'row', alignItems: 'center' }}>

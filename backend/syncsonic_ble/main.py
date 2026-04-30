@@ -169,20 +169,6 @@ def main() -> None:
         log.warning("Coordinator failed to start, continuing without it: %s", exc)
         coordinator = None
 
-    # Slice 4.4 alignment-quality monitor. Daemon thread that runs
-    # every 60 seconds, captures virtual_out.monitor + mic, computes
-    # cross-correlation peak FWHM as a whole-system alignment health
-    # signal. Observation-only in this commit; subsequent slices wire
-    # the metric to trigger automatic re-calibration when alignment
-    # degrades. As with the collector and coordinator, failure here
-    # must never break the audio service.
-    try:
-        from measurement.alignment_monitor import build_and_start_alignment_monitor
-        alignment_monitor = build_and_start_alignment_monitor()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("AlignmentMonitor failed to start, continuing without it: %s", exc)
-        alignment_monitor = None
-
     log.info("SyncSonic BLE server ready, service UUID %s", SERVICE_UUID)
     loop = GLib.MainLoop()
     try:
@@ -190,11 +176,6 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("Server stopped by user")
     finally:
-        if alignment_monitor is not None:
-            try:
-                alignment_monitor.stop()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("AlignmentMonitor stop failed: %s", exc)
         if coordinator is not None:
             try:
                 coordinator.stop()

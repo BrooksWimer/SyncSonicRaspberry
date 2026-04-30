@@ -73,13 +73,10 @@ class LagEstimate:
     reference_n_samples: int
     captured_n_samples: int
     search_window_samples: Tuple[int, int]  # (min_lag, max_lag) actually searched
-    # Slice 4.4: peak SHARPNESS - the Full Width at Half Maximum of
-    # the correlation peak, in samples and ms. With all speakers
-    # aligned the mic captures one coherent sum and the peak is
-    # narrow (~5-15 ms typical). With speakers misaligned, the mic
-    # captures shifted copies that smear the peak across 30-100+ ms.
-    # Used by alignment_monitor.py as the per-cycle alignment-health
-    # signal that does NOT require per-speaker isolation.
+    # Optional correlation peak width (FWHM of |corr| around argmax).
+    # Useful diagnostics for isolated-speaker captures (Slice 4.2): a
+    # narrow peak usually means an unambiguous lag; a very wide peak
+    # can indicate bleed from another source or a diffuse impulse.
     peak_fwhm_samples: int = 0
     peak_fwhm_ms: float = 0.0
 

@@ -133,10 +133,6 @@ class EventType:
     # (started, capturing, analyzing, applying, applied/failed) so
     # the analyzer can replay the entire calibration trajectory.
     CALIBRATION_RESULT = "calibration_result"
-    # Slice 4.4 continuous alignment monitor. One event per cycle
-    # (default 1/60s) carrying lag, peak FWHM, and signal levels.
-    # Phase = measured / skipped<reason>.
-    ALIGNMENT_QUALITY_SAMPLE = "alignment_quality_sample"
 
 
 def telemetry_root() -> Path:

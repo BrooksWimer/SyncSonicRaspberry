@@ -25,8 +25,14 @@ export const MESSAGE_TYPES = {
   START_CLASSIC_PAIRING: 0x66,
   // Ultrasonic auto-sync (Pi runs one sync cycle; result via notification)
   ULTRASONIC_SYNC: 0x67,
+  // Slice 4.2: single-speaker calibration (optional calibration_mode in JSON body)
+  CALIBRATE_SPEAKER: 0x68,
+  // Slice 4.3: sequential calibration for all outputs
+  CALIBRATE_ALL_SPEAKERS: 0x69,
   // Connection Status Update
   CONNECTION_STATUS_UPDATE: 0x70,  // General connection status update
+  // Slice 4.x: calibration / sequence progress from Pi (many phases per run)
+  CALIBRATION_RESULT: 0x73,
   // Slice 3.6: Coordinator (audio engine policy layer) telemetry
   COORDINATOR_STATE : 0x71,        // 1 Hz per-speaker health snapshot
   COORDINATOR_EVENT : 0x72,        // Edge-triggered soft-mute / state change
@@ -74,3 +80,8 @@ export interface CoordinatorEvent {
   rssi_dbm?: number;
   rssi_dip_db?: number;
 }
+
+/** Slice 4.x async calibration / sequence events (`CALIBRATION_RESULT`). */
+export type CalibrationResultPayload = Record<string, unknown> & {
+  phase: string;
+};

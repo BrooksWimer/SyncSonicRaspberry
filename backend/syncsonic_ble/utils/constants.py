@@ -54,6 +54,8 @@ class Msg(IntEnum):
     ULTRASONIC_SYNC         = 0x67
     # Slice 4.2: mic-driven single-speaker auto-calibration
     CALIBRATE_SPEAKER       = 0x68
+    # Slice 4.3: sequential calibration for every connected output filter
+    CALIBRATE_ALL_SPEAKERS  = 0x69
     CONNECTION_STATUS_UPDATE= 0x70
     COORDINATOR_STATE       = 0x71  # Slice 3.6: 1 Hz per-speaker health snapshot
     COORDINATOR_EVENT       = 0x72  # Slice 3.6: edge-triggered soft_mute / state-change

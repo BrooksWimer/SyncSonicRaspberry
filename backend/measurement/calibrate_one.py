@@ -1,5 +1,15 @@
 """Slice 4.2: single-speaker auto-calibration as a background process.
 
+Two reference modes:
+
+- **music** (default): correlate against whatever is already playing on
+  ``virtual_out`` (typical Spotify/A2DP ingress).
+- **startup_tune**: synthesise or reuse a short band-limited chirp WAV,
+  play it into ``virtual_out`` via ``paplay`` during the capture window,
+  and correlate against that deterministic stimulus — faster and sharper
+  peaks when phone audio is paused so the reference tap is not dominated
+  by unrelated music.
+
 Closes the Slice 4 measurement loop on a SINGLE speaker:
 
   1. Mute every OTHER speaker via the Slice 3 C-filter ``mute_to``
@@ -33,12 +43,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket as _socket
 import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from syncsonic_ble.helpers.actuation import get_actuation_manager
 from syncsonic_ble.telemetry import EventType
@@ -49,6 +60,12 @@ logger = get_logger(__name__)
 
 CAPTURE_DIR = Path("/run/syncsonic/slice4_2_calibration")
 SOCK_DIR = Path("/tmp/syncsonic-engine")
+
+CalibrationMode = Literal["music", "startup_tune"]
+CALIBRATION_MODE_MUSIC: CalibrationMode = "music"
+CALIBRATION_MODE_STARTUP_TUNE: CalibrationMode = "startup_tune"
+# Startup chirp is ~2.7 s; capture long enough for playback plus tail.
+DEFAULT_DURATION_STARTUP_SEC = 4.5
 # Cross-process source of truth for the latest user-facing delay
 # every speaker has been published with. The actuation manager keeps
 # an in-memory copy too, but this JSON file is the only thing every
@@ -182,15 +199,26 @@ def _read_published_delay_ms(mac: str) -> Optional[float]:
         return None
 
 
+def _paplay_available() -> bool:
+    return shutil.which("paplay") is not None
+
+
 def _capture_pair(
     duration_sec: float,
     out_dir: Path,
     target_mac: str,
+    *,
+    play_tune_wav: Optional[Path] = None,
 ) -> Optional[Dict[str, Path]]:
-    """Concurrently parecord ``virtual_out.monitor`` and the Jieli mic
-    for ``duration_sec`` seconds. Returns dict of paths or None on
-    failure. Both files are stereo/mono respectively, s16le, 48 kHz -
-    the analyzer mixes-down stereo as needed."""
+    """Concurrently parecord ``virtual_out.monitor`` and the Jieli mic.
+
+    When ``play_tune_wav`` is set, starts recording first, then plays that
+    WAV into ``virtual_out`` via ``paplay`` so the reference tap contains
+    the known chirp (pause phone playback for best isolation).
+
+    Otherwise sleeps ``duration_sec`` with whatever audio is already on
+    ``virtual_out`` (Slice 4.2 music-driven path).
+    """
     mic_source = _resolve_mic_source()
     if not mic_source:
         return None
@@ -201,9 +229,6 @@ def _capture_pair(
     ref_wav = out_dir / f"ref_{safe_mac}_{ts}.wav"
     mic_wav = out_dir / f"mic_{safe_mac}_{ts}.wav"
 
-    # parecord uses the existing PipeWire-Pulse server. Both processes
-    # start within a few ms of each other; the analyzer's search
-    # window comfortably absorbs the start delta.
     common = [
         "parecord", "--file-format=wav", "--rate=48000",
         "--format=s16le", "--process-time-msec=20",
@@ -216,8 +241,22 @@ def _capture_pair(
         common + [f"--device={mic_source}", "--channels=1", str(mic_wav)],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
+    t0 = time.monotonic()
     try:
-        time.sleep(duration_sec)
+        time.sleep(0.08)
+        if play_tune_wav is not None:
+            if not _paplay_available():
+                return None
+            subprocess.run(
+                ["paplay", "--device=virtual_out", str(play_tune_wav)],
+                capture_output=True,
+                timeout=max(120.0, duration_sec + 5.0),
+                check=False,
+            )
+        elapsed = time.monotonic() - t0
+        remainder = duration_sec - elapsed
+        if remainder > 0:
+            time.sleep(remainder)
     finally:
         for p in (ref_proc, mic_proc):
             try:
@@ -231,8 +270,6 @@ def _capture_pair(
     if not ref_wav.exists() or not mic_wav.exists():
         return None
     if ref_wav.stat().st_size < 1024 or mic_wav.stat().st_size < 1024:
-        # parecord may produce a tiny header-only WAV if the source
-        # disappeared mid-capture.
         return None
     return {"ref": ref_wav, "mic": mic_wav}
 
@@ -242,6 +279,10 @@ def _calibrate_blocking(
     target_total_ms: float,
     capture_duration_sec: float,
     on_event: EventCallback,
+    *,
+    calibration_mode: CalibrationMode = CALIBRATION_MODE_MUSIC,
+    sequence_index: Optional[int] = None,
+    sequence_total: Optional[int] = None,
 ) -> None:
     """The actual calibration steps. Runs on a daemon thread so the
     GLib mainloop is never blocked. ``on_event`` is invoked at each
@@ -249,7 +290,16 @@ def _calibrate_blocking(
     and we additionally mirror to the telemetry events stream."""
 
     def _emit(phase: str, **fields: Any) -> None:
-        payload = {"mac": target_mac, "phase": phase, **fields}
+        payload = {
+            "mac": target_mac,
+            "phase": phase,
+            "calibration_mode": calibration_mode,
+            **fields,
+        }
+        if sequence_index is not None:
+            payload["sequence_index"] = sequence_index
+        if sequence_total is not None:
+            payload["sequence_total"] = sequence_total
         try:
             on_event(phase, payload)
         except Exception as exc:  # noqa: BLE001
@@ -261,8 +311,30 @@ def _calibrate_blocking(
         except Exception as exc:  # noqa: BLE001
             logger.debug("calibrate telemetry emit failed: %s", exc)
 
-    _emit("started", target_total_ms=target_total_ms,
-          capture_duration_sec=capture_duration_sec)
+    tune_path: Optional[Path] = None
+    if calibration_mode == CALIBRATION_MODE_STARTUP_TUNE:
+        try:
+            from measurement.startup_tune import ensure_startup_tune_wav, wav_duration_sec
+        except ImportError as exc:
+            _emit("failed", reason="startup_tune_import_failed", error=str(exc))
+            return
+        tune_path = ensure_startup_tune_wav()
+        need_sec = float(wav_duration_sec(tune_path)) + 0.85
+        if capture_duration_sec < need_sec:
+            capture_duration_sec = need_sec
+        _emit(
+            "started",
+            target_total_ms=target_total_ms,
+            capture_duration_sec=capture_duration_sec,
+            startup_tune=str(tune_path),
+            pause_phone_audio_hint=True,
+        )
+    else:
+        _emit(
+            "started",
+            target_total_ms=target_total_ms,
+            capture_duration_sec=capture_duration_sec,
+        )
 
     target_sock = _socket_for_mac(target_mac)
     if not target_sock.exists():
@@ -281,7 +353,12 @@ def _calibrate_blocking(
     time.sleep(0.15)
 
     _emit("capturing", duration_sec=capture_duration_sec)
-    capture = _capture_pair(capture_duration_sec, CAPTURE_DIR, target_mac)
+    capture = _capture_pair(
+        capture_duration_sec,
+        CAPTURE_DIR,
+        target_mac,
+        play_tune_wav=tune_path,
+    )
 
     # Always restore the mutes, even on capture failure - we MUST NOT
     # leave the system silent.
@@ -290,7 +367,10 @@ def _calibrate_blocking(
     _emit("unmuting_others_done", n_restored=len(others))
 
     if capture is None:
-        _emit("failed", reason="capture_failed")
+        reason = "capture_failed"
+        if calibration_mode == CALIBRATION_MODE_STARTUP_TUNE and not _paplay_available():
+            reason = "paplay_not_available"
+        _emit("failed", reason=reason)
         return
 
     _emit("analyzing", ref=str(capture["ref"]), mic=str(capture["mic"]))
@@ -433,6 +513,10 @@ def calibrate_speaker_async(
     on_event: EventCallback,
     target_total_ms: float = DEFAULT_TARGET_TOTAL_MS,
     capture_duration_sec: float = DEFAULT_DURATION_SEC,
+    *,
+    calibration_mode: CalibrationMode = CALIBRATION_MODE_MUSIC,
+    sequence_index: Optional[int] = None,
+    sequence_total: Optional[int] = None,
 ) -> threading.Thread:
     """Spawn the calibration on a daemon thread and return immediately.
 
@@ -444,8 +528,15 @@ def calibrate_speaker_async(
     """
     t = threading.Thread(
         target=_calibrate_blocking,
-        args=(target_mac, float(target_total_ms),
-              float(capture_duration_sec), on_event),
+        kwargs={
+            "target_mac": target_mac,
+            "target_total_ms": float(target_total_ms),
+            "capture_duration_sec": float(capture_duration_sec),
+            "on_event": on_event,
+            "calibration_mode": calibration_mode,
+            "sequence_index": sequence_index,
+            "sequence_total": sequence_total,
+        },
         name=f"syncsonic-calibrate-{target_mac.replace(':', '_').lower()}",
         daemon=True,
     )
@@ -473,11 +564,24 @@ def _cli() -> int:
                    help="Speaker MAC, e.g. F4:6A:DD:D4:F3:C8")
     p.add_argument("--target-total-ms", type=float, default=DEFAULT_TARGET_TOTAL_MS,
                    help="alignment target in ms; correction = target - measured_lag")
-    p.add_argument("--duration", type=float, default=DEFAULT_DURATION_SEC,
-                   help="capture duration in seconds (default 6)")
+    p.add_argument(
+        "--mode",
+        choices=("music", "startup_tune"),
+        default="music",
+        help="startup_tune plays the built-in chirp into virtual_out during capture",
+    )
+    p.add_argument("--duration", type=float, default=None,
+                   help="capture window in seconds (default: 6 music / 4.5 startup_tune)")
     p.add_argument("--timeout", type=float, default=30.0,
                    help="wall-clock budget for the whole calibration (default 30s)")
     args = p.parse_args()
+
+    mode: CalibrationMode = "startup_tune" if args.mode == "startup_tune" else "music"
+    duration = args.duration
+    if duration is None:
+        duration = (
+            DEFAULT_DURATION_STARTUP_SEC if mode == CALIBRATION_MODE_STARTUP_TUNE else DEFAULT_DURATION_SEC
+        )
 
     done = threading.Event()
     final_phase = {"phase": "timeout"}
@@ -492,7 +596,8 @@ def _cli() -> int:
     calibrate_speaker_async(
         args.mac, _print_event,
         target_total_ms=args.target_total_ms,
-        capture_duration_sec=args.duration,
+        capture_duration_sec=float(duration),
+        calibration_mode=mode,
     )
     finished = done.wait(timeout=args.timeout)
     if not finished:

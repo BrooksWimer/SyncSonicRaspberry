@@ -261,16 +261,12 @@ def handle_ultrasonic_sync(char, _):
 
 
 def handle_calibrate_speaker(char, data):
-    """Slice 4.2: mic-driven single-speaker auto-calibration.
+    """Slice 4.2 / startup tune: mic-driven single-speaker calibration.
 
-    Spawns a daemon thread that mutes other speakers, captures
-    virtual_out.monitor + Jieli mic for ~6 s, runs the Slice 4.1
-    cross-correlation analyzer, and (if confidence is sufficient)
-    applies the resulting delay correction via the existing
-    actuation manager. Progress events are pushed back to the app
-    via Msg.CALIBRATION_RESULT notifications. The handler itself
-    returns immediately so the GLib mainloop is never blocked on
-    the capture window.
+    Optional JSON keys:
+      calibration_mode / mode: \"music\" (default) or \"startup_tune\"
+        \"startup_tune\" plays the built-in chirp into ``virtual_out``
+        during capture (pause phone audio first for a clean reference tap).
     """
     mac = data.get("mac")
     if not mac:
@@ -298,6 +294,14 @@ def handle_calibrate_speaker(char, data):
     target_total_ms = float(data.get("target_total_ms", 500.0))
     capture_duration_sec = float(data.get("capture_duration_sec", 6.0))
 
+    raw_mode = data.get("calibration_mode", data.get("mode", "music"))
+    if raw_mode not in ("music", "startup_tune"):
+        return _encode(
+            Msg.ERROR,
+            {"error": f"invalid calibration_mode {raw_mode!r}; use music or startup_tune"},
+        )
+    calibration_mode = "startup_tune" if raw_mode == "startup_tune" else "music"
+
     # Lazy import: keeps the GLib mainloop process startup path free
     # of scipy / numpy cost when no calibration ever runs.
     try:
@@ -322,12 +326,65 @@ def handle_calibrate_speaker(char, data):
         on_event=_push,
         target_total_ms=target_total_ms,
         capture_duration_sec=capture_duration_sec,
+        calibration_mode=calibration_mode,
     )
     return _encode(
         Msg.SUCCESS,
         {
             "queued": True,
             "mac": mac,
+            "target_total_ms": target_total_ms,
+            "capture_duration_sec": capture_duration_sec,
+            "calibration_mode": calibration_mode,
+        },
+    )
+
+
+def handle_calibrate_all_speakers(char, data):
+    """Slice 4.3: run calibration once per connected output (sequential)."""
+    try:
+        from measurement.calibrate_sequence import calibrate_all_speakers_async
+        from measurement.calibrate_one import CalibrationMode
+    except ImportError as exc:
+        logger.exception("calibrate_sequence import failed")
+        return _encode(
+            Msg.ERROR,
+            {"error": f"calibration module unavailable: {exc}"},
+        )
+
+    raw_mode = data.get("calibration_mode", data.get("mode", "startup_tune"))
+    if raw_mode not in ("music", "startup_tune"):
+        return _encode(
+            Msg.ERROR,
+            {"error": f"invalid calibration_mode {raw_mode!r}; use music or startup_tune"},
+        )
+    calibration_mode: CalibrationMode = "startup_tune" if raw_mode == "startup_tune" else "music"
+
+    target_total_ms = float(data.get("target_total_ms", 500.0))
+    capture_duration_sec = data.get("capture_duration_sec")
+    cont_raw = data.get("continue_on_failure", True)
+    continue_on_failure = cont_raw if isinstance(cont_raw, bool) else str(cont_raw).lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+    def _push(_phase: str, payload: Dict[str, Any]) -> None:
+        char.send_notification(Msg.CALIBRATION_RESULT, payload)
+
+    calibrate_all_speakers_async(
+        char.bus,
+        _push,
+        calibration_mode=calibration_mode,
+        target_total_ms=target_total_ms,
+        capture_duration_sec=float(capture_duration_sec) if capture_duration_sec is not None else None,
+        continue_on_failure=continue_on_failure,
+    )
+    return _encode(
+        Msg.SUCCESS,
+        {
+            "queued": True,
+            "calibration_mode": calibration_mode,
             "target_total_ms": target_total_ms,
             "capture_duration_sec": capture_duration_sec,
         },
@@ -348,6 +405,7 @@ HANDLERS = {
     Msg.SET_MUTE: handle_set_mute,
     Msg.ULTRASONIC_SYNC: handle_ultrasonic_sync,
     Msg.CALIBRATE_SPEAKER: handle_calibrate_speaker,
+    Msg.CALIBRATE_ALL_SPEAKERS: handle_calibrate_all_speakers,
     Msg.SCAN_START: _scan_start,
     Msg.SCAN_STOP: _scan_stop,
     Msg.WIFI_SCAN_START: handle_wifi_scan_start,

@@ -99,7 +99,7 @@ This is the only horizon with active commitments. Detailed in
 | 1 | Telemetry layer + always-on mic capture + reproducible session report | next |
 | 2 | Stereo elastic delay engine (replaces `pw_delay_filter.c`) with Unix-socket IPC; smooth in-place delay/rate changes with no xrun | pending |
 | 3 | System Coordinator with bounded ±50 ppm rate adjustment, system-wide synchronous hold, soft-mute + phase-aligned re-entry on transport failure | pending |
-| 4 | Mic-driven runtime alignment as a coordinator client | pending |
+| 4 | Mic-driven alignment: analyzer + per-speaker sequential calibration + optional startup chirp + multi-speaker BLE sequence; mixed-signal alignment monitor (Slice 4.4) deprecated — removed after git commit `f66aad5` | **in progress** |
 
 Each slice is independently deployable and produces objective evidence
 on the Slice 1 telemetry stream. The dream is considered "delivered"

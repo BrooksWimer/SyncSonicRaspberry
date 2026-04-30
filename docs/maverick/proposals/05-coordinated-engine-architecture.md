@@ -357,27 +357,31 @@ running, BT scan in progress, USB hub power blip via `uhubctl -p X -a
 dropout while the stressed speaker dipped queue, was held by the
 coordinator, and recovered without disconnect.
 
-### Slice 4: Mic-based runtime alignment (2 weeks)
+### Slice 4: Mic-driven alignment (in progress)
 
-Now that the actuator takes rate adjustments smoothly, mic alignment is
-~200 lines of Python.
+Delivered incrementally as 4.1 (offline analyzer), 4.2 (sequential mute +
+single-speaker calibration against live ``virtual_out.monitor`` audio),
+4.3 (same pipeline once per connected filter socket; BLE opcode
+``CALIBRATE_ALL_SPEAKERS``), plus a **startup tune** path (short linear
+chirp played into ``virtual_out`` during capture; BLE field
+``calibration_mode: "startup_tune"`` on ``CALIBRATE_SPEAKER``) for faster,
+cleaner correlation than sparse music — critical prep for **Wi‑Fi outputs**
+where delays exceed comfortable manual slider ranges.
 
-- Use the always-on mic capture from Slice 1.
-- Periodically (every 30 s of stable playback) cross-correlate the mic
-  signal against the `virtual_out.monitor` tap to estimate per-speaker
-  time-of-arrival relative to the system clock.
-- Compute the ideal delay per speaker based on physical position and
-  target alignment.
-- Send `target_delay_ms` to each speaker's coordinator entry. The
-  coordinator smoothly retargets the engine over a few seconds — no
-  audible artifacts.
-- "Auto-align" mode triggered from the app plays a short reference
-  signal, computes alignment in 5 s, applies smoothly. This is Epic 02
-  done correctly.
+**Deprecated:** Slice **4.4** landed briefly as an observation-only
+``AlignmentMonitor`` correlating *mixed* mic audio against
+``virtual_out.monitor``. Field trials matched the physics expectation: one
+microphone cannot attribute lag to individual speakers without isolation.
+The code was removed after commit ``f66aad5`` (historical record only).
+Optional correlation peak FWHM in ``analyze_lag`` remains as a diagnostic for
+**isolated** captures.
 
-**Success criterion (Pi-validated):** "auto-align" pressed while music is
-playing; mic correlation peaks tighten measurably; the user cannot hear
-when alignment is being applied.
+**Still ahead:** ultrasonic/Epic-style continuous correction; tighter
+integration when Wi‑Fi speakers join the same actuation surface as BT.
+
+**Success criterion (Pi-validated):** user-triggered calibration converges
+per-speaker delays toward a shared target without audible glitches; startup
+chirp produces unambiguous correlation peaks when phone playback is paused.
 
 ### Beyond Slice 4
 

@@ -14,6 +14,7 @@ import {
   MESSAGE_TYPES,
   CoordinatorState,
   CoordinatorEvent,
+  CalibrationResultPayload,
 } from "@/utils/ble_constants";
 
 import { getConfigurations, getSpeakers, updateConnectionStatus, updateSpeakerConnectionStatus } from "@/utils/database";
@@ -117,6 +118,9 @@ export function useBLE(onNotification?: NotificationHandler) {
   const COORDINATOR_EVENT_BUFFER_SIZE = 50;
   const [coordinatorEvents, setCoordinatorEvents] = useState<CoordinatorEvent[]>([]);
 
+  const CALIBRATION_EVENT_BUFFER_SIZE = 80;
+  const [calibrationEvents, setCalibrationEvents] = useState<CalibrationResultPayload[]>([]);
+
   const clearConnectionStatus = useCallback(() => {
     setConnectionStatus(null);
   }, []);
@@ -155,7 +159,10 @@ export function useBLE(onNotification?: NotificationHandler) {
       // Slice 3.6: COORDINATOR_STATE arrives at 1 Hz; logging it
       // would flood the JS console. Edge-triggered events and all
       // other opcodes still log normally.
-      if (opcode !== MESSAGE_TYPES.COORDINATOR_STATE) {
+      if (
+        opcode !== MESSAGE_TYPES.COORDINATOR_STATE &&
+        opcode !== MESSAGE_TYPES.CALIBRATION_RESULT
+      ) {
         console.log("[BLE] Received notification:", { opcode, payload });
       }
 
@@ -289,6 +296,25 @@ export function useBLE(onNotification?: NotificationHandler) {
               ? next.slice(next.length - COORDINATOR_EVENT_BUFFER_SIZE)
               : next;
           });
+          break;
+        }
+
+        case MESSAGE_TYPES.CALIBRATION_RESULT: {
+          const cal = payload as CalibrationResultPayload;
+          setCalibrationEvents((prev) => {
+            const next = [...prev, cal];
+            return next.length > CALIBRATION_EVENT_BUFFER_SIZE
+              ? next.slice(next.length - CALIBRATION_EVENT_BUFFER_SIZE)
+              : next;
+          });
+          const ph = String(cal.phase ?? "");
+          if (
+            ph === "applied" ||
+            ph === "failed" ||
+            ph.startsWith("sequence")
+          ) {
+            console.log("[Calibration]", ph, cal.mac ?? "", cal);
+          }
           break;
         }
 
@@ -606,6 +632,8 @@ const waitForPi = (): Promise<Device> =>
     coordinatorState,
     coordinatorEvents,
     clearCoordinatorEvents: () => setCoordinatorEvents([]),
+    calibrationEvents,
+    clearCalibrationEvents: () => setCalibrationEvents([]),
   };
 }
 

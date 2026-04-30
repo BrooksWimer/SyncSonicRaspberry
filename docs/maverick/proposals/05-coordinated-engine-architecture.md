@@ -1410,6 +1410,21 @@ stable foundation. Items deliberately deferred at this point:
    journals). Hasn't recurred since Slice 0 priority work.
 5. **PipeWire / WirePlumber version drift logging.** Open question
    from roadmap section 6. Add when convenient.
+6. **Mobile app UI polish pass.** Slice 4 added the top-of-screen
+   align-all buttons and an inline per-card result strip; the
+   `SpeakerConfigScreen` layout would benefit from a fuller audit
+   (button hierarchy, spacing, theming consistency, status pill
+   integration with `coordinatorState`, sequence progress placement)
+   once Wi-Fi outputs share the same screen so the audit covers BT +
+   Wi-Fi as one surface. Tracked separately from the technical lanes;
+   not blocking.
+7. **Analyzer xrun (`pw_xrun` on `virtual_out` during calibration).**
+   One 78 ms graph stall observed in the 18-min Slice 4 validation
+   session, coinciding with the sequence's `analyzing` phase. Caused
+   by FFT/numpy CPU contention with the audio graph in the same
+   process. Move the analyzer to a subprocess so calibration is
+   contention-free with playback. Targeted as a small follow-up after
+   Wi-Fi Slice W1 lands.
 
 ## 17. Slice 4 startup-tune + multi-speaker calibration: Pi deploy evidence (2026-04-30 EDT)
 

@@ -1410,3 +1410,78 @@ stable foundation. Items deliberately deferred at this point:
    journals). Hasn't recurred since Slice 0 priority work.
 5. **PipeWire / WirePlumber version drift logging.** Open question
    from roadmap section 6. Add when convenient.
+
+## 17. Slice 4 startup-tune + multi-speaker calibration: Pi deploy evidence (2026-04-30 EDT)
+
+Code state at deploy:
+
+- `b8f92db` removed the deprecated `alignment_monitor.py` (4.4 record
+  lives in `f66aad5`).
+- `b61e068` introduced
+  `backend/measurement/startup_tune.py` (band-limited 420 Hz → 3.4 kHz
+  linear chirp, 2.65 s, 70 ms raised-cosine fades, peak ≈ 0.22),
+  `backend/measurement/calibrate_sequence.py` (sequential walk of every
+  `/tmp/syncsonic-engine/syncsonic-delay-*.sock`, phone reserved-adapter
+  filtered out), and the BLE handler `handle_calibrate_all_speakers`
+  (opcode `0x69`).
+- `2d973c1` wired the mobile app: `calibrateSpeaker` /
+  `calibrateAllSpeakers` helpers, a "Startup tune align (this speaker)"
+  card-level button on `SpeakerConfigScreen`, and "Align all" buttons
+  (startup tune / current music) above the speaker list. Calibration
+  notifications stream into a 80-event ring buffer in `useBLE`, surfaced
+  to the screen via `Alert.alert` for `applied` / `failed` /
+  `sequence_complete` / `sequence_failed`.
+
+Pi deploy carried out 2026-04-30 EDT against `syncsonic@10.0.0.89`
+while `syncsonic.service` was already stopped (clean window):
+
+1. Snapshotted current backend tree to
+   `~/syncsonic-snapshots/pre-slice4-startuptune-20260430-114528/` for
+   rollback.
+2. `scp` of the 8 changed/new files into
+   `/home/syncsonic/SyncSonicPi/backend/`. No dependency installs, no
+   systemd/config mutations.
+3. `rm` of `backend/measurement/alignment_monitor.py` on the Pi.
+4. `python3 -m compileall -q syncsonic_ble measurement` returned clean.
+5. Smoke import (with `RESERVED_HCI=hci3`) confirmed:
+   - `Msg.CALIBRATE_SPEAKER = 104`, `Msg.CALIBRATE_ALL_SPEAKERS = 105`,
+     `Msg.CALIBRATION_RESULT = 115`.
+   - `startup_tune.TUNE_FILENAME = syncsonic_startup_chirp_v1.wav`,
+     `_CHIRP_DURATION_SEC = 2.65`.
+   - Both `calibration_mode` constants resolve.
+   - `import measurement.alignment_monitor` raises `ImportError` (gone).
+6. `/usr/bin/paplay` and `/usr/bin/parecord` confirmed present;
+   `pactl 16.1`. `/run/syncsonic` does not yet exist (created by
+   `start_syncsonic.sh` on next service start).
+
+Runtime end-to-end validation requires the user to:
+
+1. start `syncsonic.service`,
+2. connect the phone over BLE and connect ≥ 1 BT speaker through the
+   app,
+3. **pause phone audio**, then trigger
+   `Startup tune align (this speaker)` for the first connected speaker,
+4. with multiple speakers connected, trigger
+   `Align all speakers (startup tune)` and watch the
+   `CALIBRATION_RESULT` notifications stream the
+   `started → muting_others → capturing → analyzing → applied` phases
+   plus the per-MAC summary on `sequence_complete`.
+
+Acceptance signals:
+
+- Each individual `applied` payload reports
+  `current_user_delay_ms`, `adjustment_ms`, `new_user_delay_ms`,
+  `measurement.confidence_secondary >= 1.5`, and
+  `measurement.lag_ms` inside the search window.
+- A `sequence_complete` payload lists every connected non-phone MAC and
+  `applied` for each.
+- Backend journal: no false-positive soft-mutes from the Coordinator
+  while the chirp plays, and no `mute_to` failures restoring volume on
+  the muted-during-capture peers.
+- Speakers continue playing music (phone resumed) post-sequence with
+  noticeably tighter alignment relative to the pre-sequence baseline.
+
+If a `failed` payload's reason is `target_filter_socket_not_found`, it
+means the corresponding speaker is paired but did not finish the audio
+route; the sequence walks the socket directory at run time so this
+indicates a route-ensure failure, not a calibration bug.

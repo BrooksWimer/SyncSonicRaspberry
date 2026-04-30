@@ -100,6 +100,22 @@ requires finishing Slice 4 (full Pi validation of startup-tune + align-
 all flows), optional Slice 3.4 hold / 3.5 rate-PI only if telemetry
 demands them, then Wi‑Fi output integration as a follow-on lane.
 
+### 3.1.1 Now+ — Epic 04 Wi-Fi outputs (~2 weeks, after Slice 4 runtime)
+
+Sonos / Wi-Fi speakers re-enter the system **as peers of the elastic
+engine**, not as a parallel pipeline. They take a `pw_delay_filter`
+instance and a `/tmp/syncsonic-engine/syncsonic-delay-<token>.sock`
+just like a Bluetooth output, write into a `module-pipe-sink` that
+feeds FFmpeg → Icecast → Sonos, and participate in the same calibration
+loop. See
+[`docs/maverick/proposals/04-wifi-speakers-architecture.md`](proposals/04-wifi-speakers-architecture.md)
+for the slice plan (W1 discovery, W2 engine adapter, W3 calibration
+integration, W4 UI parity + manual fallback).
+
+The startup chirp explicitly exists for this lane — it is the only
+stimulus that gives a sharp correlation peak across the 300–1500 ms
+Wi-Fi delay window where the manual slider cannot reach.
+
 ### 3.2 Mid horizon — SyncSonic Audio Engine (SAE) (6-18 months, optional)
 
 Begin only after Slice 4 is real and the dream is achieved on the

@@ -1043,7 +1043,12 @@ export default function SpeakerConfigScreen() {
                   <Slider
                     style={styles.slider}
                     minimumValue={0}
-                    maximumValue={500}
+                    // Backend MAX_USER_DELAY_MS is 4000 (calibrate_one.py).
+                    // Wi-Fi outputs (Slice 4 + Epic 04) regularly need
+                    // 300–1500 ms; Bluetooth typically lives below 500 ms.
+                    // Detect by device id: Sonos uses the `sonos:` prefix
+                    // ([helpers/device_type_helpers.py]).
+                    maximumValue={mac.toLowerCase().startsWith('sonos:') ? 4000 : 500}
                     step={10}
                     value={settings[mac]?.latency ?? 100}
                     onValueChange={(value: number) => handleLatencyChangeWrapper(mac, value, false)}
@@ -1052,19 +1057,48 @@ export default function SpeakerConfigScreen() {
                     maximumTrackTintColor="#000000"
                     thumbTintColor="white" 
                   />
-                  {settings[mac]?.isConnected && (
-                    <Button
-                      marginTop={10}
-                      size="$3"
-                      backgroundColor={pc as any}
-                      disabled={!connectedDevice}
-                      onPress={() => handleSpeakerStartupTune(mac)}
-                    >
-                      <Text fontFamily="Finlandica" color="white">
-                        Startup tune align (this speaker)
-                      </Text>
-                    </Button>
-                  )}
+                  {settings[mac]?.isConnected && (() => {
+                    const macUp = mac.toUpperCase();
+                    let lastForMac: Record<string, unknown> | null = null;
+                    for (let i = calibrationEvents.length - 1; i >= 0; i -= 1) {
+                      const ev = calibrationEvents[i] as Record<string, unknown>;
+                      if (typeof ev.mac === 'string' && (ev.mac as string).toUpperCase() === macUp) {
+                        lastForMac = ev;
+                        break;
+                      }
+                    }
+                    const phase = lastForMac ? String(lastForMac.phase ?? '') : '';
+                    const inFlight =
+                      phase &&
+                      phase !== 'applied' &&
+                      phase !== 'failed' &&
+                      phase !== 'sequence_complete' &&
+                      phase !== 'sequence_failed';
+                    return (
+                      <YStack marginTop={10}>
+                        <Button
+                          size="$3"
+                          backgroundColor={pc as any}
+                          disabled={!connectedDevice || !!inFlight}
+                          onPress={() => handleSpeakerStartupTune(mac)}
+                        >
+                          <Text fontFamily="Finlandica" color="white">
+                            {inFlight ? `Calibrating (${phase})` : 'Startup tune align (this speaker)'}
+                          </Text>
+                        </Button>
+                        {phase === 'applied' && lastForMac && (
+                          <Body center style={{ marginTop: 6, fontSize: 12, color: stc }}>
+                            Applied {Math.round(((lastForMac.measurement as Record<string, number>)?.lag_ms ?? 0))} ms lag → {Math.round((lastForMac.new_user_delay_ms as number) ?? 0)} ms delay.
+                          </Body>
+                        )}
+                        {phase === 'failed' && lastForMac && (
+                          <Body center style={{ marginTop: 6, fontSize: 12, color: '#FF0055' }}>
+                            {String(lastForMac.detail ?? lastForMac.reason ?? 'Calibration failed')}
+                          </Body>
+                        )}
+                      </YStack>
+                    );
+                  })()}
                   <View style={styles.soundFieldContainer}>
                     {/* Left Side */}
                     <View style={{ flexDirection: 'row', alignItems: 'center' }}>

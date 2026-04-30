@@ -23,7 +23,6 @@ import {
   bleDisconnectOne,
   setVolume,
   setMute,
-  calibrateSpeaker,
   calibrateAllSpeakers,
 } from '../utils/ble_functions';
 import LottieView from 'lottie-react-native';
@@ -105,6 +104,10 @@ export default function SpeakerConfigScreen() {
 
   useEffect(() => {
     const events = calibrationEvents;
+    // Per-speaker progress is shown inline next to each speaker card and
+    // the top-level "Align all" banner shows the in-flight state. We only
+    // pop a final Alert at sequence boundaries so the user gets one
+    // unambiguous "done" confirmation instead of an N-way Alert stack.
     while (calNotificationCursorRef.current < events.length) {
       const ev = events[calNotificationCursorRef.current] as Record<string, unknown>;
       calNotificationCursorRef.current += 1;
@@ -129,21 +132,8 @@ export default function SpeakerConfigScreen() {
         continue;
       }
 
-      if (phase === 'applied' && !ev.sequence_total) {
-        const m = String(ev.mac ?? '');
-        Alert.alert(
-          'Calibration',
-          `Updated delay for ${connectedSpeakers[m] ?? m}.`,
-        );
-        continue;
-      }
-
-      if (phase === 'failed' && !ev.sequence_total) {
-        Alert.alert(
-          'Calibration failed',
-          String(ev.detail ?? ev.reason ?? 'Unknown error'),
-        );
-      }
+      // applied / failed events: surface inline next to the speaker
+      // card; do not fire a separate Alert for each.
     }
   }, [calibrationEvents, connectedSpeakers]);
 
@@ -813,34 +803,10 @@ export default function SpeakerConfigScreen() {
     );
   };
 
-  const handleSpeakerStartupTune = (mac: string) => {
-    if (!connectedDevice) {
-      Alert.alert('Error', 'No Bluetooth device connected');
-      return;
-    }
-    Alert.alert(
-      'Startup tune alignment',
-      'Pause music on your phone first. The Pi will play a short chirp while measuring this speaker.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Continue',
-          onPress: () => {
-            void (async () => {
-              try {
-                await calibrateSpeaker(connectedDevice, mac, {
-                  calibration_mode: 'startup_tune',
-                });
-              } catch (error) {
-                console.error(error);
-                Alert.alert('Error', 'Failed to send calibration command.');
-              }
-            })();
-          },
-        },
-      ],
-    );
-  };
+  // Single-speaker calibration is intentionally not surfaced as a UI
+  // button: alignment is only meaningful relative to peers, so a one-
+  // speaker action would never produce user value. The CALIBRATE_SPEAKER
+  // BLE opcode and CLI remain for diagnostics.
 
   const handleMuteToggle = async (mac: string) => {
     const isCurrentlyMuted = sliderValues[mac]?.isMuted || false;
@@ -924,32 +890,53 @@ export default function SpeakerConfigScreen() {
           <Header title={configNameParam}/>
           
           <ScrollView contentContainerStyle={{ paddingBottom: 15 }}>
-            {connectedDevice && anyPiSpeakerConnected && Object.keys(connectedSpeakers).length > 0 && (
-              <YStack alignSelf="center" marginTop={12} marginBottom={8} width="90%">
-                <Button
-                  backgroundColor={pc as any}
-                  color="white"
-                  onPress={handleAlignAllStartupTune}
-                >
-                  <Text fontFamily="Finlandica" color="white">
-                    Align all speakers (startup tune)
-                  </Text>
-                </Button>
-                <Button
-                  marginTop={10}
-                  backgroundColor={themeName === 'dark' ? '#3D2A55' : '#E8DCFA'}
-                  color={tc as any}
-                  onPress={handleAlignAllMusic}
-                >
-                  <Text fontFamily="Finlandica" color={tc}>
-                    Align all (use playing music)
-                  </Text>
-                </Button>
-                <Body center style={{ marginTop: 8, fontSize: 12, color: stc }}>
-                  Mic alignment runs on the Pi. Pause phone playback before startup tune so the reference signal stays clean.
-                </Body>
-              </YStack>
-            )}
+            {connectedDevice && anyPiSpeakerConnected && Object.keys(connectedSpeakers).length > 0 && (() => {
+              const last = calibrationEvents.length > 0
+                ? (calibrationEvents[calibrationEvents.length - 1] as Record<string, unknown>)
+                : null;
+              const lastPhase = last ? String(last.phase ?? '') : '';
+              const seqInFlight =
+                !!lastPhase &&
+                lastPhase !== 'sequence_complete' &&
+                lastPhase !== 'sequence_failed' &&
+                (last?.sequence_total !== undefined || lastPhase === 'sequence_started');
+              const seqIdx = (last?.sequence_index as number | undefined) ?? 0;
+              const seqTotal = (last?.sequence_total as number | undefined) ?? 0;
+              const seqMac = String(last?.mac ?? '');
+              const seqName = connectedSpeakers[seqMac] ?? seqMac;
+              return (
+                <YStack alignSelf="center" marginTop={12} marginBottom={8} width="90%">
+                  <Button
+                    backgroundColor={pc as any}
+                    color="white"
+                    disabled={seqInFlight}
+                    onPress={handleAlignAllStartupTune}
+                  >
+                    <Text fontFamily="Finlandica" color="white">
+                      {seqInFlight && seqTotal > 0
+                        ? `Aligning ${seqIdx}/${seqTotal} (${seqName})`
+                        : 'Align all speakers (startup tune)'}
+                    </Text>
+                  </Button>
+                  <Button
+                    marginTop={10}
+                    backgroundColor={themeName === 'dark' ? '#3D2A55' : '#E8DCFA'}
+                    color={tc as any}
+                    disabled={seqInFlight}
+                    onPress={handleAlignAllMusic}
+                  >
+                    <Text fontFamily="Finlandica" color={tc}>
+                      Align all (use playing music)
+                    </Text>
+                  </Button>
+                  <Body center style={{ marginTop: 8, fontSize: 12, color: stc }}>
+                    {seqInFlight
+                      ? `${String(lastPhase).replace(/_/g, ' ')}…`
+                      : 'Mic alignment runs on the Pi. Pause phone playback before startup tune so the reference signal stays clean.'}
+                  </Body>
+                </YStack>
+              );
+            })()}
             {/* Auto-sync speakers (ultrasonic) – runs one sync cycle on the Pi */}
             {Object.keys(connectedSpeakers).length >= 2 && (
               <YStack alignSelf="center" marginTop={12} marginBottom={8} width="90%">
@@ -1058,6 +1045,14 @@ export default function SpeakerConfigScreen() {
                     thumbTintColor="white" 
                   />
                   {settings[mac]?.isConnected && (() => {
+                    // Per-speaker calibration result strip. The
+                    // "Align all speakers (startup tune)" button at the
+                    // top of the screen is the user-facing entry point;
+                    // a single-speaker button here added no value
+                    // because alignment is only meaningful relative to
+                    // peers. We still render the per-speaker outcome
+                    // because that is what the user actually needs to
+                    // see after pressing Align all.
                     const macUp = mac.toUpperCase();
                     let lastForMac: Record<string, unknown> | null = null;
                     for (let i = calibrationEvents.length - 1; i >= 0; i -= 1) {
@@ -1068,36 +1063,35 @@ export default function SpeakerConfigScreen() {
                       }
                     }
                     const phase = lastForMac ? String(lastForMac.phase ?? '') : '';
+                    if (!phase) return null;
                     const inFlight =
-                      phase &&
                       phase !== 'applied' &&
                       phase !== 'failed' &&
                       phase !== 'sequence_complete' &&
                       phase !== 'sequence_failed';
-                    return (
-                      <YStack marginTop={10}>
-                        <Button
-                          size="$3"
-                          backgroundColor={pc as any}
-                          disabled={!connectedDevice || !!inFlight}
-                          onPress={() => handleSpeakerStartupTune(mac)}
-                        >
-                          <Text fontFamily="Finlandica" color="white">
-                            {inFlight ? `Calibrating (${phase})` : 'Startup tune align (this speaker)'}
-                          </Text>
-                        </Button>
-                        {phase === 'applied' && lastForMac && (
-                          <Body center style={{ marginTop: 6, fontSize: 12, color: stc }}>
-                            Applied {Math.round(((lastForMac.measurement as Record<string, number>)?.lag_ms ?? 0))} ms lag → {Math.round((lastForMac.new_user_delay_ms as number) ?? 0)} ms delay.
-                          </Body>
-                        )}
-                        {phase === 'failed' && lastForMac && (
-                          <Body center style={{ marginTop: 6, fontSize: 12, color: '#FF0055' }}>
-                            {String(lastForMac.detail ?? lastForMac.reason ?? 'Calibration failed')}
-                          </Body>
-                        )}
-                      </YStack>
-                    );
+                    if (inFlight) {
+                      return (
+                        <Body center style={{ marginTop: 8, fontSize: 12, color: stc }}>
+                          Calibrating: {phase.replace(/_/g, ' ')}…
+                        </Body>
+                      );
+                    }
+                    if (phase === 'applied' && lastForMac) {
+                      const m = lastForMac.measurement as Record<string, number> | undefined;
+                      return (
+                        <Body center style={{ marginTop: 8, fontSize: 12, color: stc }}>
+                          Aligned: {Math.round(m?.lag_ms ?? 0)} ms lag → {Math.round((lastForMac.new_user_delay_ms as number) ?? 0)} ms delay (conf {(m?.confidence_secondary ?? 0).toFixed(1)}x)
+                        </Body>
+                      );
+                    }
+                    if (phase === 'failed' && lastForMac) {
+                      return (
+                        <Body center style={{ marginTop: 8, fontSize: 12, color: '#FF0055' }}>
+                          {String(lastForMac.reason ?? lastForMac.detail ?? 'Calibration failed')}
+                        </Body>
+                      );
+                    }
+                    return null;
                   })()}
                   <View style={styles.soundFieldContainer}>
                     {/* Left Side */}

@@ -1485,3 +1485,46 @@ If a `failed` payload's reason is `target_filter_socket_not_found`, it
 means the corresponding speaker is paired but did not finish the audio
 route; the sequence walks the socket directory at run time so this
 indicates a route-ensure failure, not a calibration bug.
+
+### 17.1 Runtime validation (2026-04-30 14:11–14:31 EDT)
+
+Real run with phone (AC:DF:A1:52:8A:41) + VIZIO SB2020n (F4:6A:DD:D4:F3:C8) + 28:FA:19:B6:0E:3B:
+
+- 14:12:00 — single-speaker `CALIBRATE_SPEAKER startup_tune` on VIZIO:
+  backend reached `phase=applied`, lag = 466.83 ms, `confidence_primary` = 44.76,
+  `confidence_secondary` = 3.55, delay 160 ms → 193.17 ms. Filter socket
+  confirmed delay change `40 → 73.2 ms`.
+- 14:27:46 — `CALIBRATE_ALL_SPEAKERS startup_tune` (sequence): both
+  speakers reached `phase=applied`, `sequence_complete` payload listed
+  `per_mac_outcome: {applied, applied}`. 28:FA conf 39.47 / 2.64,
+  VIZIO conf 69.49 / 5.20.
+- 18 minutes of `coordinator_tick`: 1496 ticks observed, **0 in a
+  non-healthy state**. VIZIO RSSI mean −32.5 dBm (range −46…−19), no
+  frame stalls in 265 transport snapshots. `transport_failed`,
+  `coordinator_event`, `rssi_dip`, and `soft_mute_applied` all = 0.
+- 1 `pw_xrun` on the upstream `virtual_out` null sink at 14:27:51
+  (78 ms graph stall) coinciding with the analyzer FFT inside the
+  sequence. Confined to the calibration window.
+
+**User-perceived failure of the buttons** turned out to be a BLE MTU
+issue, not a calibration bug:
+
+- Negotiated ATT MTU = 672 → max notification payload = **669 bytes**.
+- The original `applied` notification serialized to **699 bytes**
+  (`actuation` snapshot inflated it). BlueZ silently truncates
+  oversize ATT notifications, so the phone received malformed JSON
+  and dropped the event.
+
+Fix landed: `_ble_slim_payload` in `backend/measurement/calibrate_one.py`
+strips the `actuation` block and trims the measurement object, taking
+the worst-case `applied` payload to **381 bytes** (288 bytes
+headroom). Telemetry continues to receive the full payload via
+`emit(EventType.CALIBRATION_RESULT, ...)`.
+
+**UI follow-up:** the per-speaker "Startup tune align (this speaker)"
+button was removed — single-speaker calibration only makes sense as a
+diagnostic, since alignment is a relative quantity. Per-speaker
+results are now an inline strip on each speaker card; the "Align all
+speakers" button at the top doubles as a live progress label
+(`Aligning 1/3 (Speaker name)`) during a sequence. The
+`CALIBRATE_SPEAKER` opcode and CLI remain for diagnostics.

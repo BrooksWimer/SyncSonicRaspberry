@@ -118,6 +118,41 @@ MAX_USER_DELAY_MS = 4000.0
 
 EventCallback = Callable[[str, Dict[str, Any]], None]
 
+# BlueZ silently truncates ATT notifications larger than the
+# negotiated MTU (~672 -> 669-byte payload). Measured ``applied``
+# payload with the full ``actuation`` snapshot is ~700 bytes; the
+# truncated form is invalid JSON on the phone and gets dropped. Strip
+# the high-volume diagnostic fields for the BLE mirror.
+_BLE_DROP_TOP_LEVEL = ("actuation",)
+_BLE_MEASUREMENT_KEEP = (
+    "lag_ms",
+    "confidence_primary",
+    "confidence_secondary",
+    "sample_rate",
+)
+
+
+def _ble_slim_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of *payload* small enough to fit a 256–512 byte
+    BLE notification regardless of MTU. We round floats to 2 decimals
+    and drop the verbose ``actuation`` block (telemetry keeps it)."""
+    slim: Dict[str, Any] = {}
+    for k, v in payload.items():
+        if k in _BLE_DROP_TOP_LEVEL:
+            continue
+        if k == "measurement" and isinstance(v, dict):
+            slim[k] = {
+                kk: (round(vv, 2) if isinstance(vv, float) else vv)
+                for kk, vv in v.items()
+                if kk in _BLE_MEASUREMENT_KEEP
+            }
+            continue
+        if isinstance(v, float):
+            slim[k] = round(v, 2)
+        else:
+            slim[k] = v
+    return slim
+
 
 def _resolve_mic_source() -> Optional[str]:
     """Look up the Jieli mic source via pactl. Same lookup as
@@ -300,16 +335,22 @@ def _calibrate_blocking(
             payload["sequence_index"] = sequence_index
         if sequence_total is not None:
             payload["sequence_total"] = sequence_total
-        try:
-            on_event(phase, payload)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("calibrate on_event callback failed: %s", exc)
-        # Mirror to telemetry. We use a generic CALIBRATION_RESULT
-        # event type so the analyzer can replay every step.
+        # Telemetry gets the full payload (no size constraint).
         try:
             emit(EventType.CALIBRATION_RESULT, payload)
         except Exception as exc:  # noqa: BLE001
             logger.debug("calibrate telemetry emit failed: %s", exc)
+        # BLE notify is bounded by the negotiated ATT MTU (typically
+        # 672 bytes -> ~669 bytes payload). The unmodified ``applied``
+        # event serializes to ~700 bytes and gets silently truncated by
+        # BlueZ, producing invalid JSON on the phone. Build a slimmer
+        # mirror that drops the verbose ``actuation`` block and rounds
+        # measurement floats. The mobile app only needs the outcome.
+        ble_payload = _ble_slim_payload(payload)
+        try:
+            on_event(phase, ble_payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("calibrate on_event callback failed: %s", exc)
 
     tune_path: Optional[Path] = None
     if calibration_mode == CALIBRATION_MODE_STARTUP_TUNE:

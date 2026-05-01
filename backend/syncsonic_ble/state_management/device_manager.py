@@ -42,6 +42,11 @@ class DeviceManager:
         self.max_reconnect_attempts: int = 3
         self.pairing_in_progress: Set[str] = set()
         self.connected: Set[str] = set()
+        # Wi-Fi (Sonos) device IDs that are currently part of the active output
+        # mix. Populated by ConnectionService via add_wifi_connected. Empty by
+        # default, so a BT-only configuration is byte-for-byte identical to the
+        # pre-Wi-Fi behavior (Slice 0..4 stability path).
+        self.wifi_connected: Set[str] = set()
         self.expected: set[str] = set()
         self._status: Dict[str, Dict] = {}
         self._char = None
@@ -172,8 +177,32 @@ class DeviceManager:
         work_q.put((Intent.LOOPBACK_SYNC, {"mac": mac, "connected": False}))
 
     def _all_connected(self) -> Set[str]:
-        """Bluetooth-only connected device set for the neutral foundation."""
-        return set(self.connected)
+        """Combined connected set: Bluetooth MACs plus Sonos device IDs.
+
+        When ``wifi_connected`` is empty the result equals ``set(self.connected)``,
+        so the BT-only path is unchanged from the foundation behavior.
+        """
+        return set(self.connected) | set(self.wifi_connected)
+
+    def add_wifi_connected(self, device_id: str) -> None:
+        """Track a Sonos device as connected; pushes a status update so the
+        BLE characteristic reports it alongside the BT connected list."""
+        if not device_id:
+            return
+        if device_id in self.wifi_connected:
+            return
+        self.wifi_connected.add(device_id)
+        log.info("[Wi-Fi] Tracking %s as connected", device_id)
+        if self._char:
+            self._char.push_status({"connected": list(self._all_connected())})
+
+    def remove_wifi_connected(self, device_id: str) -> None:
+        if not device_id or device_id not in self.wifi_connected:
+            return
+        self.wifi_connected.discard(device_id)
+        log.info("[Wi-Fi] Tracking %s as disconnected", device_id)
+        if self._char:
+            self._char.push_status({"connected": list(self._all_connected())})
 
     def _device_found(self, path: str) -> None:
         mac = self._extract_mac(path)

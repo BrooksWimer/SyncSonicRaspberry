@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, createContext } from "react";
+import { useEffect, useState, useCallback, useRef, createContext } from "react";
 import { Alert, Platform } from "react-native";
 import { PERMISSIONS, request, requestMultiple } from "react-native-permissions";
 import * as ExpoDevice from "expo-device";
@@ -125,8 +125,14 @@ export function useBLE(onNotification?: NotificationHandler) {
     setConnectionStatus(null);
   }, []);
 
-  // Define handleNotification here so it has access to setConnectionStatus
-  const handleNotification: NotificationHandler = (error, characteristic) => {
+  // Stable notification handler (useCallback with empty deps because it only
+  // closes over React state *setters*, which are guaranteed stable across
+  // renders by React. Without useCallback, every BLEProvider re-render
+  // (triggered by any state change like wifiScannedDevices updating) creates
+  // a new function reference. Screens that have `handleNotification` in their
+  // useEffect deps then re-run the effect, re-calling clearWifiScannedDevices
+  // and wiping the scan results immediately after they arrive.
+  const handleNotification: NotificationHandler = useCallback((error, characteristic) => {
     if (error) {
       // Check if the error is a disconnection
       if (error.message?.includes('disconnected')) {
@@ -154,7 +160,37 @@ export function useBLE(onNotification?: NotificationHandler) {
 
       const opcode = rawBytes.charCodeAt(0);      // first byte
       const jsonString = rawBytes.slice(1);        // rest is JSON
-      const payload = JSON.parse(jsonString);
+      let payload: any;
+      try {
+        payload = JSON.parse(jsonString);
+      } catch {
+        // BlueZ silently truncates ATT notifications larger than the
+        // negotiated MTU (~672 bytes -> 669 byte payload). The Pi
+        // sometimes emits sequence-level CALIBRATION_RESULT events
+        // whose serialised JSON exceeds this (the 'sequence_complete'
+        // event embeds the full nested anchor_info block, easily
+        // ~750 bytes). Don't surface this as a red error in dev mode;
+        // log a warn and synthesize a stub event for the calibration
+        // UI so SpeakerConfigScreen can still detect a sequence
+        // completion via per-speaker events.
+        console.warn(
+          "[BLE] Notification JSON truncated (opcode=0x" +
+            opcode.toString(16) + ", rawLength=" + rawBytes.length + ")",
+        );
+        if (opcode === MESSAGE_TYPES.CALIBRATION_RESULT) {
+          const stub = {
+            phase: "notification_truncated",
+            _raw_length: rawBytes.length,
+          } as unknown as CalibrationResultPayload;
+          setCalibrationEvents((prev) => {
+            const next = [...prev, stub];
+            return next.length > CALIBRATION_EVENT_BUFFER_SIZE
+              ? next.slice(next.length - CALIBRATION_EVENT_BUFFER_SIZE)
+              : next;
+          });
+        }
+        return;
+      }
 
       // Slice 3.6: COORDINATOR_STATE arrives at 1 Hz; logging it
       // would flood the JS console. Edge-triggered events and all
@@ -198,9 +234,29 @@ export function useBLE(onNotification?: NotificationHandler) {
           }
 
         case MESSAGE_TYPES.WIFI_SCAN_RESULTS: {
-            // payload.wifi_devices === [{ device_id, name, ip, type }]
+            // Two payload shapes are supported:
+            //   1. { device: { device_id, name, ip, type } } - one device per notification
+            //      (matches SCAN_DEVICES streaming style; the Pi backend streams
+            //      results as they're discovered).
+            //   2. { phase: 'complete', count: N } - terminal marker after the last device.
+            //   3. { wifi_devices: [...] } - legacy bulk shape, still tolerated.
+            if (payload.phase === 'complete') {
+              break;
+            }
+            const dev = payload.device as
+              | { device_id: string; name?: string; ip?: string; type?: string }
+              | undefined;
+            if (dev && dev.device_id) {
+              setWifiScannedDevices(old => {
+                if (old.find(d => d.mac === dev.device_id)) return old;
+                return [...old, { mac: dev.device_id, name: dev.name || 'Sonos' }];
+              });
+              break;
+            }
             const list = (payload.wifi_devices || []) as Array<{ device_id: string; name: string; ip?: string; type?: string }>;
-            setWifiScannedDevices(list.map(d => ({ mac: d.device_id, name: d.name || 'Sonos' })));
+            if (Array.isArray(list) && list.length > 0) {
+              setWifiScannedDevices(list.map(d => ({ mac: d.device_id, name: d.name || 'Sonos' })));
+            }
             break;
           }
 
@@ -353,9 +409,13 @@ export function useBLE(onNotification?: NotificationHandler) {
       }
 
     } catch (err) {
-      console.error("[BLE] Failed to decode notification:", err);
+      // Don't surface as a red error: the most common cause is a
+      // truncated/malformed BLE notification, which we already handle
+      // explicitly above. Anything reaching here is non-fatal — the
+      // notification stream stays alive for the next event.
+      console.warn("[BLE] Failed to decode notification:", err);
     }
-  };
+  }, []); // empty deps: only closes over stable setState functions
 
   // Cleanup on unmount
   useEffect(() => {
@@ -382,38 +442,56 @@ export function useBLE(onNotification?: NotificationHandler) {
     }
   };
 
-  const ensurePiNotifications = async (
-    dev: Device,
-    onNotify: (e: BleError | null, c: Characteristic | null) => void
-  ) => {
-    // already monitoring?  (Ble-plx keeps listeners here)
-    // @ts-ignore – not in typings but exists at runtime
-    if (dev.monitorListeners?.length) return;
-  
-    console.log('[BLE] discovering SVC/CHR for', dev.id);
-    const d2        = await dev.discoverAllServicesAndCharacteristics();
-    const svcs      = await d2.services();
-    const svc       = svcs.find(
-      s => s.uuid.toLowerCase() === SERVICE_UUID.toLowerCase()
-    );
-    if (!svc) throw new Error('Pi service not found');
-  
-    const chrs      = await svc.characteristics();
-    const chr       = chrs.find(
-      c => c.uuid.toLowerCase() === CHARACTERISTIC_UUID.toLowerCase()
-    );
-    if (!chr) throw new Error('Pi characteristic not found');
-  
-    console.log('[BLE] enabling notifications …');
-    await chr.monitor((err, c) => {
-      if (err) console.error('[BLE] monitor error:', err);
-      // Per-notification raw logging removed: at the Slice 3.6
-      // 1 Hz Coordinator-state cadence it became console spam, and
-      // handleNotification already logs every non-high-freq opcode
-      // with the decoded payload.
-      onNotify(err, c);
-    });
-  }
+  // Track which devices we've already attached a notification monitor
+  // to. Without this every consumer re-render that re-runs an effect
+  // depending on `ensurePiNotifications` (which is recreated each
+  // render of the BLE provider) would attach a NEW monitor on top of
+  // the existing one, exponentially multiplying the JS work per
+  // incoming notification and turning the app into a slideshow once
+  // the Coordinator's 1 Hz push starts arriving.
+  // The previous guard checked `dev.monitorListeners?.length`, but on
+  // iOS BLE-plx that property is not reliable across reconnect cycles.
+  const monitoredDeviceIdsRef = useRef<Set<string>>(new Set());
+  const monitorSubscriptionsRef = useRef<Map<string, { remove: () => void }>>(new Map());
+
+  const ensurePiNotifications = useCallback(
+    async (
+      dev: Device,
+      onNotify: (e: BleError | null, c: Characteristic | null) => void
+    ) => {
+      if (monitoredDeviceIdsRef.current.has(dev.id)) return;
+      monitoredDeviceIdsRef.current.add(dev.id);
+
+      try {
+        console.log('[BLE] discovering SVC/CHR for', dev.id);
+        const d2 = await dev.discoverAllServicesAndCharacteristics();
+        const svcs = await d2.services();
+        const svc = svcs.find(
+          s => s.uuid.toLowerCase() === SERVICE_UUID.toLowerCase()
+        );
+        if (!svc) throw new Error('Pi service not found');
+
+        const chrs = await svc.characteristics();
+        const chr = chrs.find(
+          c => c.uuid.toLowerCase() === CHARACTERISTIC_UUID.toLowerCase()
+        );
+        if (!chr) throw new Error('Pi characteristic not found');
+
+        console.log('[BLE] enabling notifications …');
+        const sub = chr.monitor((err, c) => {
+          if (err) console.error('[BLE] monitor error:', err);
+          onNotify(err, c);
+        });
+        monitorSubscriptionsRef.current.set(dev.id, sub);
+      } catch (e) {
+        // Allow a future retry on failure - clearing the marker so the
+        // next call can try again rather than silently doing nothing.
+        monitoredDeviceIdsRef.current.delete(dev.id);
+        throw e;
+      }
+    },
+    []
+  );
 
   const isDuplicateDevice = (devices: Device[], nextDevice: Device) =>
     devices.findIndex((device) => nextDevice.id === device.id) > -1;
@@ -516,7 +594,19 @@ export function useBLE(onNotification?: NotificationHandler) {
       });
       
       setConnectedDevice(deviceConnection);
-      
+
+      // When the Pi link drops, purge the monitor-id marker so the
+      // next reconnect can re-attach a fresh listener (the previous
+      // monitor subscription is dead and cannot be reused).
+      bleManager.onDeviceDisconnected(deviceConnection.id, () => {
+        monitoredDeviceIdsRef.current.delete(deviceConnection.id);
+        const sub = monitorSubscriptionsRef.current.get(deviceConnection.id);
+        if (sub) {
+          try { sub.remove(); } catch { /* sub already gone */ }
+          monitorSubscriptionsRef.current.delete(deviceConnection.id);
+        }
+      });
+
       // Discover services and characteristics
       await deviceConnection.discoverAllServicesAndCharacteristics();
       // 1) fetch the services array
@@ -530,19 +620,20 @@ export function useBLE(onNotification?: NotificationHandler) {
         console.log("🛑 Our custom service UUID not found!")
 }
 
-      // Set up notification handler if provided
+      // Set up notification handler if provided. Mark the device as
+      // monitored so the consumer-side ``ensurePiNotifications`` (called
+      // from screen useEffects) is a no-op and does not stack a second
+      // listener on top of this one.
       if (onNotification) {
         await deviceConnection.monitorCharacteristicForService(
           SERVICE_UUID,
           CHARACTERISTIC_UUID,
           (err, char) => {
-            // Per-notification raw + callback-fired logs were dropped
-            // for the same reason as in ensurePiNotifications: at the
-            // Slice 3.6 1 Hz cadence they'd spam the JS console.
-            handleNotification(err, char);   // <-- always handle it internally
-            onNotification?.(err, char);     // <-- still call external handler if user passed one
+            handleNotification(err, char);
+            onNotification?.(err, char);
           }
         );
+        monitoredDeviceIdsRef.current.add(deviceConnection.id);
       }
 
       return deviceConnection;

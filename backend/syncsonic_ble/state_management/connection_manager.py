@@ -74,6 +74,10 @@ class ConnectionService:
 
         self.expected: set[str] = set()
         self.loopbacks: set[str] = set()
+        # Active Sonos device IDs that this service has started streaming to.
+        # We own this locally instead of reaching into device_manager so the
+        # BT-only path does not import any Wi-Fi modules.
+        self.wifi_active: set[str] = set()
         # Per-MAC last-auto-reconnect timestamp (CLOCK_MONOTONIC). Used to
         # debounce one-shot reconnect attempts so duplicate Connected=False
         # signals (the device_manager and connection_manager both subscribe
@@ -149,6 +153,93 @@ class ConnectionService:
         right = min(max(right, 0), 150)
         publish_output_mix(mac, left_percent=left, right_percent=right)
 
+    # ------------------------------------------------------------------
+    # Wi-Fi (Sonos) helpers. Kept self-contained so a BT-only run never
+    # imports ffmpeg / soco modules. Called from the worker only when the
+    # incoming intent payload has a sonos: device_id.
+    # ------------------------------------------------------------------
+    def _connect_sonos(self, payload: Dict) -> None:
+        device_id = (payload.get("mac") or "").strip()
+        if not device_id:
+            return
+        try:
+            from syncsonic_ble.helpers import sonos_controller
+            from syncsonic_ble.helpers.audio_stream_service import (
+                get_audio_stream_service,
+                get_pi_ip,
+                get_stream_url,
+            )
+        except ImportError as exc:
+            logger.exception("Sonos modules unavailable: %s", exc)
+            self._notify_connection_phase(device_id, "connect_failed", reason=str(exc))
+            return
+
+        pi_ip = get_pi_ip()
+        if not pi_ip:
+            logger.error("[Sonos] could not determine Pi LAN IP")
+            self._notify_connection_phase(device_id, "connect_failed", reason="no_pi_ip")
+            return
+
+        service = get_audio_stream_service()
+        if not service.is_streaming():
+            if not service.start_stream():
+                self._notify_connection_phase(device_id, "connect_failed", reason="ffmpeg_start_failed")
+                return
+
+        stream_url = get_stream_url(pi_ip)
+        if not sonos_controller.connect(device_id, stream_url):
+            self._notify_connection_phase(device_id, "connect_failed", reason="sonos_play_failed")
+            # Last Sonos failed to start, so tear down the producer if no
+            # other Wi-Fi outputs are using it.
+            if not self.wifi_active:
+                service.stop_stream()
+            return
+
+        self.wifi_active.add(device_id)
+        # Apply requested settings (volume only; latency for Sonos is a UI
+        # persistence ack and does not actuate).
+        settings = payload.get("settings") or {}
+        try:
+            volume = settings.get("volume")
+            if volume is not None:
+                sonos_controller.set_volume(device_id, int(volume))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Sonos] applying initial volume failed: %s", exc)
+
+        self._notify_connection_phase(device_id, "connect_success")
+
+    def _disconnect_sonos(self, device_id: str) -> None:
+        try:
+            from syncsonic_ble.helpers import sonos_controller
+            from syncsonic_ble.helpers.audio_stream_service import get_audio_stream_service
+        except ImportError as exc:
+            logger.exception("Sonos modules unavailable: %s", exc)
+            return
+
+        try:
+            sonos_controller.disconnect(device_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Sonos] disconnect failed for %s: %s", device_id, exc)
+
+        self.wifi_active.discard(device_id)
+        if not self.wifi_active:
+            try:
+                get_audio_stream_service().stop_stream()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Stream] stop_stream failed: %s", exc)
+
+        self._notify_connection_phase(device_id, "disconnect_success")
+
+    def _notify_connection_phase(self, device: str, phase: str, **extra) -> None:
+        if not self._char:
+            return
+        payload = {"phase": phase, "device": device}
+        payload.update(extra)
+        try:
+            self._char.send_notification(Msg.CONNECTION_STATUS_UPDATE, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("CONNECTION_STATUS_UPDATE notify failed: %s", exc)
+
     def _on_props_changed(self, sender, obj_path, iface, signal, params):
         changed_iface, changed_dict, _invalidated = params
         if changed_iface != "org.bluez.Device1":
@@ -171,16 +262,7 @@ class ConnectionService:
                 continue
 
             if intent is Intent.CONNECT_ONE and is_sonos(payload.get("mac", "")):
-                if self._char:
-                    self._char.send_notification(
-                        Msg.ERROR,
-                        {
-                            "error": "Wi-Fi speaker support is disabled on the neutral foundation branch.",
-                            "feature_disabled": True,
-                            "feature": "wifi_speakers",
-                            "device": payload.get("mac"),
-                        },
-                    )
+                self._connect_sonos(payload)
                 continue
 
             if intent is Intent.SET_EXPECTED:
@@ -242,16 +324,7 @@ class ConnectionService:
             if intent is Intent.DISCONNECT:
                 mac_or_id = payload["mac"]
                 if is_sonos(mac_or_id):
-                    if self._char:
-                        self._char.send_notification(
-                            Msg.ERROR,
-                            {
-                                "error": "Wi-Fi speaker support is disabled on the neutral foundation branch.",
-                                "feature_disabled": True,
-                                "feature": "wifi_speakers",
-                                "device": mac_or_id,
-                            },
-                        )
+                    self._disconnect_sonos(mac_or_id)
                     continue
 
                 # User-initiated disconnect: remove the MAC from expected so the

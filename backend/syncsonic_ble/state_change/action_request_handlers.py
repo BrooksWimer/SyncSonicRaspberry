@@ -75,11 +75,6 @@ def handle_connect_one(char, data):
     mac = target.get("mac")
     if not mac:
         return _encode(Msg.ERROR, {"error": "Missing targetSpeaker.mac"})
-    if is_sonos(mac):
-        return _feature_disabled(
-            "wifi_speakers",
-            "Wi-Fi speaker support is disabled on the neutral foundation branch.",
-        )
 
     payload = {
         "mac": mac,
@@ -90,8 +85,14 @@ def handle_connect_one(char, data):
     logger.info("Queuing CONNECT_ONE %s", payload)
     if service:
         service.submit(Intent.CONNECT_ONE, payload)
+
+    # Sonos device IDs are tracked separately from BT MACs; the device_manager
+    # union will surface them via _all_connected.
     if char.device_manager:
-        char.device_manager.connected.add(mac)
+        if is_sonos(mac):
+            char.device_manager.add_wifi_connected(mac)
+        else:
+            char.device_manager.connected.add(mac)
     return _encode(Msg.SUCCESS, {"queued": True})
 
 
@@ -102,13 +103,10 @@ def handle_disconnect(char, data):
     mac = data.get("mac")
     if not mac:
         return _encode(Msg.ERROR, {"error": "Missing mac"})
-    if is_sonos(mac):
-        return _feature_disabled(
-            "wifi_speakers",
-            "Wi-Fi speaker support is disabled on the neutral foundation branch.",
-        )
     if service:
         service.submit(Intent.DISCONNECT, {"mac": mac})
+    if char.device_manager and is_sonos(mac):
+        char.device_manager.remove_wifi_connected(mac)
     return _encode(Msg.SUCCESS, {"queued": True})
 
 
@@ -118,10 +116,18 @@ def handle_set_latency(char, data):
     if mac is None or latency is None:
         return _encode(Msg.ERROR, {"error": "Missing mac/latency"})
     if is_sonos(mac):
-        return _feature_disabled(
-            "wifi_speakers",
-            "Wi-Fi speaker latency control is disabled on the neutral foundation branch.",
-        )
+        # Sonos has no per-device delay filter under the current architecture
+        # (all Wi-Fi outputs share one Icecast stream from virtual_out.monitor),
+        # so SET_LATENCY for a Sonos is a UI persistence ack only. The frontend
+        # uses this to store the calibration anchor lag back onto the slider.
+        try:
+            latency_ms = float(latency)
+        except (TypeError, ValueError):
+            return _encode(Msg.ERROR, {"error": "Invalid latency value"})
+        emit(EventType.SET_LATENCY_REQUEST, {
+            "mac": mac, "delay_ms": latency_ms, "transport": "wifi",
+        })
+        return _encode(Msg.SUCCESS, {"latency": latency_ms, "transport": "wifi"})
     # Phone MAC must never enter the speaker delay control plane. The phone is
     # an A2DP source via the RESERVED_HCI adapter, not an output, so a delay
     # publish on its MAC produces a daemon poll loop that can never resolve a
@@ -152,10 +158,22 @@ def handle_set_volume(char, data):
     if mac is None or volume is None:
         return _encode(Msg.ERROR, {"error": "Missing mac/volume"})
     if is_sonos(mac):
-        return _feature_disabled(
-            "wifi_speakers",
-            "Wi-Fi speaker volume control is disabled on the neutral foundation branch.",
-        )
+        try:
+            from syncsonic_ble.helpers import sonos_controller
+        except ImportError as exc:
+            logger.exception("sonos_controller import failed")
+            return _encode(Msg.ERROR, {"error": f"sonos module unavailable: {exc}"})
+        try:
+            vol = int(volume)
+        except (TypeError, ValueError):
+            return _encode(Msg.ERROR, {"error": "Invalid volume value"})
+        ok = sonos_controller.set_volume(mac, vol)
+        emit(EventType.SET_VOLUME_REQUEST, {
+            "mac": mac, "volume": vol, "transport": "wifi", "ok": bool(ok),
+        })
+        if not ok:
+            return _encode(Msg.ERROR, {"error": "sonos set_volume failed", "mac": mac})
+        return _encode(Msg.SUCCESS, {"volume": vol, "transport": "wifi"})
     # Same guard as handle_set_latency: the phone MAC is not an output, so
     # publishing a volume against it pollutes the control plane.
     if char.bus and is_device_on_reserved_adapter(char.bus, mac):
@@ -247,10 +265,38 @@ def _scan_stop(char, _):
 
 
 def handle_wifi_scan_start(char, _):
-    return _feature_disabled(
-        "wifi_speakers",
-        "Wi-Fi speaker support is disabled on the neutral foundation branch.",
-    )
+    """Run a one-shot Sonos discovery on a daemon thread and stream each
+    found device back as a WIFI_SCAN_RESULTS notification. Idempotent: a
+    scan already in flight is left to finish."""
+    import threading
+
+    if getattr(char, "_wifi_scan_in_flight", False):
+        return _encode(Msg.SUCCESS, {"scanning": True, "already": True})
+
+    def _runner():
+        try:
+            from syncsonic_ble.state_management.scan_manager import scan_wifi_sonos
+            devices = scan_wifi_sonos(timeout=6)
+            for device in devices:
+                try:
+                    char.send_notification(Msg.WIFI_SCAN_RESULTS, {"device": device})
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("WIFI_SCAN_RESULTS notify failed: %s", exc)
+            char.send_notification(Msg.WIFI_SCAN_RESULTS, {"phase": "complete", "count": len(devices)})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Wi-Fi scan thread crashed: %s", exc)
+        finally:
+            char._wifi_scan_in_flight = False
+
+    char._wifi_scan_in_flight = True
+    threading.Thread(target=_runner, name="syncsonic-wifi-scan", daemon=True).start()
+    return _encode(Msg.SUCCESS, {"scanning": True})
+
+
+def handle_wifi_scan_stop(char, _):
+    """Wi-Fi scan is one-shot, so this is just an idempotent ack (kept for
+    parity with BT SCAN_STOP so the frontend can use the same UI flow)."""
+    return _encode(Msg.SUCCESS, {"scanning": False})
 
 
 def handle_ultrasonic_sync(char, _):
@@ -272,9 +318,13 @@ def handle_calibrate_speaker(char, data):
     if not mac:
         return _encode(Msg.ERROR, {"error": "Missing mac"})
     if is_sonos(mac):
-        return _feature_disabled(
-            "wifi_speakers",
-            "Wi-Fi speaker calibration is not yet supported.",
+        # Per-Sonos calibration is not exposed: Wi-Fi alignment is anchored
+        # measurement during CALIBRATE_ALL_SPEAKERS (BT speakers are pulled
+        # to match the Wi-Fi anchor lag). A solo Sonos has nothing to align
+        # to, so this is intentionally a no-op error.
+        return _encode(
+            Msg.ERROR,
+            {"error": "Single-speaker calibration is not available for Wi-Fi outputs; use Align All."},
         )
     # Phone MAC must never enter the calibration path - the phone is
     # an A2DP source, not an output, and calibration would ask the
@@ -372,6 +422,10 @@ def handle_calibrate_all_speakers(char, data):
     def _push(_phase: str, payload: Dict[str, Any]) -> None:
         char.send_notification(Msg.CALIBRATION_RESULT, payload)
 
+    wifi_device_ids: list[str] = []
+    if char.device_manager:
+        wifi_device_ids = sorted(char.device_manager.wifi_connected)
+
     calibrate_all_speakers_async(
         char.bus,
         _push,
@@ -379,6 +433,7 @@ def handle_calibrate_all_speakers(char, data):
         target_total_ms=target_total_ms,
         capture_duration_sec=float(capture_duration_sec) if capture_duration_sec is not None else None,
         continue_on_failure=continue_on_failure,
+        wifi_device_ids=wifi_device_ids,
     )
     return _encode(
         Msg.SUCCESS,
@@ -409,4 +464,5 @@ HANDLERS = {
     Msg.SCAN_START: _scan_start,
     Msg.SCAN_STOP: _scan_stop,
     Msg.WIFI_SCAN_START: handle_wifi_scan_start,
+    Msg.WIFI_SCAN_STOP: handle_wifi_scan_stop,
 }

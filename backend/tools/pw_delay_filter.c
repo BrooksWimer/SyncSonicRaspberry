@@ -68,7 +68,18 @@
 // -----------------------------------------------------------------------
 #define SAMPLE_RATE 48000
 #define HEADROOM_SAMPLES 8192
-#define MAX_DELAY_MS 2000.0
+// Sized for hybrid BT+Wi-Fi configurations: a Sonos chain through
+// FFmpeg+Icecast+UPnP routinely shows 3-4 s of total acoustic lag on
+// consumer Sonos hardware (measured 3.65 s on a Living Room ZPS9 in
+// April 2026). BT speakers must be pulled UP that far to align with
+// the Wi-Fi anchor, so the per-speaker ring buffer needs to be sized
+// for the worst Sonos in the room, not the worst BT speaker.
+//
+// Each filter ring is ``MAX_DELAY_MS / 1000 * 48 kHz * 4 B`` floats
+// per channel, doubled for stereo: at 5000 ms that's ~1.92 MB per
+// speaker, negligible against the Pi 4's RAM but it does mean the
+// filter binary must be rebuilt whenever this constant changes.
+#define MAX_DELAY_MS 5000.0
 #define MAX_RATE_PPM 50           // hard cap; the architecture proposal Section 4.3 rationale
 #define SLEW_SAMPLES_PER_FRAME 4  // ~83 ppm during slew, inaudible on music
 #define DEFAULT_SOCKET_DIR "/tmp/syncsonic-engine"

@@ -24,7 +24,9 @@ class AlignmentActuatorEngine:
     """Translate manual delay targets into transport-base plus delay-line delay."""
 
     TRANSPORT_BASE_MS = 120.0
-    MAX_DELAY_MS = 4000.0
+    # Mirrors ActuationManager.MAX_DELAY_MS — bumped to 5000 ms to
+    # accommodate Wi-Fi anchor alignment (Sonos lag can reach ~3.65 s).
+    MAX_DELAY_MS = 5000.0
 
     def __init__(self) -> None:
         self._states: Dict[str, OutputActuatorState] = {}

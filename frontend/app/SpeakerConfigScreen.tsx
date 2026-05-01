@@ -102,40 +102,191 @@ export default function SpeakerConfigScreen() {
 
   const calNotificationCursorRef = useRef(0);
 
+  // Sequence-completion fallback. The Pi's `sequence_complete` event
+  // can exceed the BLE ATT MTU (~669 byte payload) because it embeds
+  // the full nested anchor_info block, in which case BlueZ truncates
+  // the notification and the frontend's JSON.parse fails. The
+  // per-speaker `applied`/`failed` events fit comfortably under MTU
+  // and are reliable, so we accumulate their outcomes and synthesize
+  // the final alert from them when the bulky `sequence_complete` is
+  // missing.
+  const seqExpectedTotalRef = useRef<number>(0);
+  const seqOutcomesRef = useRef<Record<string, string>>({});
+  const seqAlertedRef = useRef<boolean>(false);
+
+  // Last anchor lag observed during a calibration sequence. Drives the
+  // unified slider scale below: when Wi-Fi outputs are present, every
+  // slider scales to (anchor_lag * 1.2 or 4000ms, whichever is larger)
+  // so relative slider positions stay meaningful across BT and Wi-Fi.
+  const [latestAnchorLagMs, setLatestAnchorLagMs] = useState<number | null>(null);
+
   useEffect(() => {
     const events = calibrationEvents;
     // Per-speaker progress is shown inline next to each speaker card and
     // the top-level "Align all" banner shows the in-flight state. We only
     // pop a final Alert at sequence boundaries so the user gets one
     // unambiguous "done" confirmation instead of an N-way Alert stack.
+    const fireCompletionAlert = (
+      outcomes: Record<string, string>,
+      title = 'Align all speakers',
+    ) => {
+      const summary = Object.keys(outcomes).length
+        ? Object.entries(outcomes)
+            .map(([m, st]) => `${connectedSpeakers[m] ?? m}: ${st}`)
+            .join('\n')
+        : 'Done.';
+      Alert.alert(title, summary);
+    };
+
     while (calNotificationCursorRef.current < events.length) {
       const ev = events[calNotificationCursorRef.current] as Record<string, unknown>;
       calNotificationCursorRef.current += 1;
       const phase = String(ev.phase ?? '');
 
+      // Reset accumulators at the start of each new sequence. We also
+      // treat the first per-speaker `started` event with index 1 as a
+      // sequence boundary in case `sequence_started` itself was
+      // truncated by BlueZ.
+      const seqIdx = Number(ev.sequence_index);
+      const seqTotal = Number(ev.sequence_total);
+      if (
+        phase === 'sequence_started' ||
+        (phase === 'started' && seqIdx === 1)
+      ) {
+        seqExpectedTotalRef.current = Number.isFinite(seqTotal) ? seqTotal : 0;
+        seqOutcomesRef.current = {};
+        seqAlertedRef.current = false;
+      }
+      if (Number.isFinite(seqTotal) && seqTotal > 0) {
+        seqExpectedTotalRef.current = Math.max(
+          seqExpectedTotalRef.current, seqTotal,
+        );
+      }
+
+      if (phase === 'anchor_measured') {
+        const lag = Number(ev.anchor_lag_ms);
+        if (Number.isFinite(lag) && lag > 0) {
+          setLatestAnchorLagMs(lag);
+          // Auto-update each Sonos card's slider to mirror the anchor
+          // delay (read-only display value; backend ignores SET_LATENCY
+          // for sonos: ids except as a UI persistence ack).
+          setSettings(prev => {
+            const next = { ...prev };
+            Object.keys(prev).forEach(m => {
+              if (m.toLowerCase().startsWith('sonos:')) {
+                next[m] = { ...prev[m], latency: Math.round(lag) };
+                if (configIDParam) {
+                  try {
+                    updateSpeakerSettings(
+                      Number(configIDParam), m,
+                      prev[m]?.volume ?? 50, Math.round(lag),
+                    );
+                  } catch (err) { console.warn('persist anchor latency failed', err); }
+                }
+              }
+            });
+            return next;
+          });
+        }
+        continue;
+      }
+
+      if (phase === 'applied' || phase === 'failed') {
+        const mac = typeof ev.mac === 'string' ? ev.mac : '';
+        if (mac) {
+          // Accumulate per-speaker outcome so we can synthesize the
+          // completion alert if `sequence_complete` is later dropped
+          // by MTU truncation.
+          seqOutcomesRef.current = {
+            ...seqOutcomesRef.current,
+            [mac]: phase,
+          };
+        }
+        if (phase === 'applied') {
+          const newDelay = Number(ev.new_user_delay_ms);
+          if (mac && Number.isFinite(newDelay)) {
+            setSettings(prev => {
+              if (!prev[mac]) return prev;
+              const next = {
+                ...prev,
+                [mac]: { ...prev[mac], latency: Math.round(newDelay) },
+              };
+              if (configIDParam) {
+                try {
+                  updateSpeakerSettings(
+                    Number(configIDParam), mac,
+                    prev[mac]?.volume ?? 50, Math.round(newDelay),
+                  );
+                } catch (err) { console.warn('persist calibrated latency failed', err); }
+              }
+              return next;
+            });
+          }
+        }
+        // If this was the LAST speaker in the sequence and we already
+        // know how many were expected, fire the completion alert as a
+        // fallback. The authoritative `sequence_complete` event still
+        // wins if it makes it through; this guarantees the user sees
+        // *some* completion popup even when MTU truncation eats the
+        // big sequence-level event.
+        const total = seqExpectedTotalRef.current;
+        const collected = Object.keys(seqOutcomesRef.current).length;
+        if (
+          total > 0 &&
+          collected >= total &&
+          !seqAlertedRef.current
+        ) {
+          seqAlertedRef.current = true;
+          fireCompletionAlert(seqOutcomesRef.current);
+        }
+        continue;
+      }
+
       if (phase === 'sequence_complete') {
-        const outcomes = ev.per_mac_outcome as Record<string, string> | undefined;
-        const summary = outcomes
-          ? Object.entries(outcomes)
-              .map(([m, st]) => `${connectedSpeakers[m] ?? m}: ${st}`)
-              .join('\n')
-          : 'Done.';
-        Alert.alert('Align all speakers', summary);
+        const outcomes = (ev.per_mac_outcome as Record<string, string> | undefined)
+          ?? seqOutcomesRef.current;
+        if (!seqAlertedRef.current) {
+          seqAlertedRef.current = true;
+          fireCompletionAlert(outcomes);
+        }
         continue;
       }
 
       if (phase === 'sequence_failed') {
-        Alert.alert(
-          'Align all speakers',
-          String(ev.reason ?? 'No calibratable outputs (connect speakers to the Pi first).'),
-        );
+        if (!seqAlertedRef.current) {
+          seqAlertedRef.current = true;
+          Alert.alert(
+            'Align all speakers',
+            String(ev.reason ?? 'No calibratable outputs (connect speakers to the Pi first).'),
+          );
+        }
         continue;
       }
 
-      // applied / failed events: surface inline next to the speaker
-      // card; do not fire a separate Alert for each.
+      if (phase === 'notification_truncated') {
+        // The parser flagged a CALIBRATION_RESULT notification it
+        // couldn't decode (BlueZ MTU truncation). Per-speaker events
+        // are not affected; the completion alert is already handled
+        // above via the seqOutcomesRef accumulator. Just record the
+        // event for diagnostics and move on without alarming the user.
+        continue;
+      }
+
+      // failed events: surface inline next to the speaker card; do not
+      // fire a separate Alert for each.
     }
-  }, [calibrationEvents, connectedSpeakers]);
+  }, [calibrationEvents, connectedSpeakers, configIDParam]);
+
+  // Unified slider scale across all cards (BT + Wi-Fi). When any Wi-Fi
+  // output is connected we scale every slider to the anchor envelope so
+  // relative positions are preserved. BT-only stays at the original
+  // 500 ms cap to keep slider granularity for fine alignment.
+  const hasAnyWifi = Object.keys(connectedSpeakers).some(
+    m => m.toLowerCase().startsWith('sonos:'),
+  );
+  const unifiedSliderMax = hasAnyWifi
+    ? Math.max(4000, Math.ceil(((latestAnchorLagMs ?? 1500) * 1.2) / 100) * 100)
+    : 500;
 
   // State for loading speakers
   const [loadingSpeakers, setLoadingSpeakers] = useState<{ 
@@ -1030,12 +1181,11 @@ export default function SpeakerConfigScreen() {
                   <Slider
                     style={styles.slider}
                     minimumValue={0}
-                    // Backend MAX_USER_DELAY_MS is 4000 (calibrate_one.py).
-                    // Wi-Fi outputs (Slice 4 + Epic 04) regularly need
-                    // 300–1500 ms; Bluetooth typically lives below 500 ms.
-                    // Detect by device id: Sonos uses the `sonos:` prefix
-                    // ([helpers/device_type_helpers.py]).
-                    maximumValue={mac.toLowerCase().startsWith('sonos:') ? 4000 : 500}
+                    // Unified slider scale across BT + Wi-Fi cards so
+                    // relative positions stay meaningful when a Wi-Fi
+                    // anchor (300-1500+ ms) is in the mix. BT-only
+                    // configs use the tighter 500 ms scale.
+                    maximumValue={unifiedSliderMax}
                     step={10}
                     value={settings[mac]?.latency ?? 100}
                     onValueChange={(value: number) => handleLatencyChangeWrapper(mac, value, false)}

@@ -51,7 +51,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional
 
-from syncsonic_ble.helpers.actuation import get_actuation_manager
+from syncsonic_ble.helpers.actuation import ActuationManager, get_actuation_manager
 from syncsonic_ble.telemetry import EventType
 from syncsonic_ble.telemetry.event_writer import emit
 from syncsonic_ble.utils.logging_conf import get_logger
@@ -64,15 +64,43 @@ SOCK_DIR = Path("/tmp/syncsonic-engine")
 CalibrationMode = Literal["music", "startup_tune"]
 CALIBRATION_MODE_MUSIC: CalibrationMode = "music"
 CALIBRATION_MODE_STARTUP_TUNE: CalibrationMode = "startup_tune"
-# Startup chirp is ~2.7 s; capture long enough for playback plus tail.
-DEFAULT_DURATION_STARTUP_SEC = 4.5
+# Floor for the per-speaker capture duration. We never run shorter than
+# this even at filter=0 so the analyzer always has plenty of post-signal
+# tail to compute confidence against, and the cross-correlation has a
+# clean noise floor reference. The chirp itself is only 2.65 s, so 10 s
+# leaves ~7 s of post-signal room data to define the noise floor — that
+# is what lets us trust the loud direct-path peak even when the speaker
+# is a multi-driver soundbar with non-trivial reflections.
+DEFAULT_DURATION_STARTUP_SEC = 10.0
+# Music-mode floor. Same idea: a continuous 10 s window gives the
+# correlator plenty of overlap region at any plausible BT inherent lag.
+DEFAULT_DURATION_SEC = 10.0
+
+# Generous upper bound on the inherent BT chain (codec + radio + speaker
+# DSP + air). Used only for sizing the *post-signal tail*; the search
+# window does NOT centre on this value (we deliberately give the analyzer
+# room to find the loud chirp wherever it lands within a wide window
+# anchored on the speaker's current filter delay).
+BT_INHERENT_MAX_MS = 800.0
+# Tail margin after the chirp/music finishes arriving at the mic.
+# Generous on purpose: extra post-signal silence lets the cross-correlator
+# compute a stable noise-floor reference and gives reflections from
+# multi-driver speakers (soundbars in particular) time to die out
+# before they could contaminate a future capture.
+CAPTURE_TAIL_MARGIN_SEC = 4.0
+# paplay in chirp mode takes ~80 ms to begin emitting after we start
+# the parecord processes; round up generously.
+PAPLAY_STARTUP_OVERHEAD_SEC = 0.20
+# Music mode wants at least this many seconds of overlap region for
+# the cross-correlator to average over. Generous (5 s) so the result
+# is stable even during quiet musical passages.
+MUSIC_OVERLAP_MIN_SEC = 5.0
 # Cross-process source of truth for the latest user-facing delay
 # every speaker has been published with. The actuation manager keeps
 # an in-memory copy too, but this JSON file is the only thing every
 # process (the GLib service, the actuation daemon, and a CLI test
 # invocation of this module) can agree on.
 CONTROL_STATE_PATH = Path("/tmp/syncsonic_pipewire/control_state.json")
-DEFAULT_DURATION_SEC = 6.0
 DEFAULT_TARGET_TOTAL_MS = 500.0   # alignment target; safely above any plausible measured lag
 SOCKET_TIMEOUT_SEC = 0.5
 RAMP_MS = 50                        # mute_to ramp duration; matches Slice 3.2
@@ -82,28 +110,34 @@ RAMP_MS = 50                        # mute_to ramp duration; matches Slice 3.2
 # confidence_primary is a sanity check that the peak rises above the
 # overall noise floor. Both must pass.
 #
-# Threshold rationale (tuned against Slice 4.1 + 4.2 real captures):
-#   - The LAG values are consistent across captures within ~30 ms,
-#     even when confidence varies wildly. Confidence reflects how
-#     SHARP the peak is, not how WRONG the lag is.
-#   - With dense music (broadband, sustained), confidence_secondary
-#     reaches 3-9x. With sparse music (quiet passages, percussion-
-#     only), it can drop to 1.0-1.5x while the lag stays accurate.
-#   - confidence_primary >= 3.0 still requires the peak to be 3x the
-#     window mean, ruling out true silence-vs-noise garbage.
-#   - confidence_secondary >= 1.5 means the peak is 50% larger than
-#     any echo/alternative-lag candidate; correct enough for music-
-#     based calibration. Slice 4.3+ will add multi-capture agreement
-#     as the next layer of robustness.
+# Threshold rationale (tuned against real captures across BT speakers
+# AND multi-driver soundbars at high filter delays):
+#   - LAG estimates are consistent across captures within ~30 ms,
+#     even when confidence varies. Confidence reflects how SHARP the
+#     peak is, not how WRONG the lag is.
+#   - confidence_primary >= 3.0 keeps out true silence-vs-noise garbage.
+#   - confidence_secondary >= 1.2 (loosened from 1.5) accepts measurements
+#     where a soundbar's room reflection sits within ~20 % of the direct
+#     path's correlation amplitude. Combined with the wider capture
+#     window (10 s minimum, 4 s post-signal tail) and the loud chirp
+#     (target_peak 0.40), this is sufficient to trust the analyzer.
+#     The earlier 1.5 was over-tuned to clean BT and falsely rejected
+#     correct measurements from VIZIO-class soundbars.
 MIN_CONFIDENCE_PRIMARY = 3.0
-MIN_CONFIDENCE_SECONDARY = 1.5
+MIN_CONFIDENCE_SECONDARY = 1.2
 
-# Lag plausibility bounds. A measured lag below MIN_LAG_MS or above
-# MAX_LAG_MS is rejected as "implausible measurement"; this catches
-# the case where the analyzer found a weak peak inside the search
-# window but the speaker itself was never producing audio.
-MIN_PLAUSIBLE_LAG_MS = 30.0
-MAX_PLAUSIBLE_LAG_MS = 700.0
+# Lag-search bounds, anchored on the speaker's CURRENT filter delay.
+# We do NOT centre the window on a guessed "expected peak" location:
+# the loud chirp + 10 s capture + 4 s post-signal tail give the
+# analyzer enough breathing room that it does not need our help
+# locating the dominant peak. The window only needs to be wide enough
+# to absorb plausible BT inherent variation (100-700 ms across the
+# hardware we have seen) and tight enough that distant noise cannot
+# masquerade as a real lag.
+SEARCH_BELOW_FILTER_MS = 100.0   # search starts this much below current_filter
+SEARCH_ABOVE_FILTER_MS = 1500.0  # ...and ends this much above it
+PLAUSIBLE_BELOW_FILTER_MS = 30.0  # accepted lag must be at least 30 ms above filter
+PLAUSIBLE_ABOVE_FILTER_MS = 1200.0  # ...and at most 1200 ms above (any BT inherent ever)
 
 # Alignment-target safety bounds. We refuse to push more than
 # MAX_ADJUSTMENT_MS of single-step adjustment (positive or negative)
@@ -114,7 +148,7 @@ MAX_ADJUSTMENT_MS = 400.0
 # ActuationManager.MIN_DELAY_MS / MAX_DELAY_MS so we don't try to
 # publish something the actuation chain will silently clamp anyway.
 MIN_USER_DELAY_MS = 20.0
-MAX_USER_DELAY_MS = 4000.0
+MAX_USER_DELAY_MS = 5000.0
 
 EventCallback = Callable[[str, Dict[str, Any]], None]
 
@@ -130,6 +164,87 @@ _BLE_MEASUREMENT_KEEP = (
     "confidence_secondary",
     "sample_rate",
 )
+
+
+def _required_capture_sec(
+    current_filter_delay_ms: float,
+    calibration_mode: CalibrationMode,
+    chirp_duration_sec: Optional[float] = None,
+) -> float:
+    """Minimum capture window in seconds, given the speaker's current
+    filter delay.
+
+    A BT speaker emits the chirp at acoustic time ``filter + inherent``
+    after we paplay it into virtual_out. The capture must remain open
+    long enough that the WHOLE chirp from the speaker is inside it,
+    plus a tail margin for cross-correlation overlap. Without this
+    sizing, a speaker that has been pulled up to a Wi-Fi anchor
+    (~5 s) would only have a tiny fraction of its chirp captured
+    (the original 4.5 s default vs ~4.3 s of pure delay = 0.2 s of
+    actual chirp inside the recording), and the analyzer would lock
+    onto noise sidelobes with low secondary confidence.
+
+    Music mode is similar but simpler — the reference is continuous,
+    so we just need a few seconds of overlap region between
+    ``ref[t]`` and ``mic[t + lag]``.
+
+    Worked examples (chirp mode, with the new 4 s tail margin and 10 s floor):
+      - filter = 0 ms     → max(10.0, 0 + 0.8 + 2.65 + 0.2 + 4.0) = 10.0 s
+      - filter = 3880 ms  → max(10.0, 3.88 + 0.8 + 2.65 + 0.2 + 4.0) = 11.53 s
+      - filter = 4960 ms  → max(10.0, 4.96 + 0.8 + 2.65 + 0.2 + 4.0) = 12.61 s
+
+    Worked examples (music mode, with 5 s overlap floor and 10 s capture floor):
+      - filter = 0 ms     → max(10.0, 0 + 0.8 + 5.0) = 10.0 s
+      - filter = 5000 ms  → max(10.0, 5.0 + 0.8 + 5.0) = 10.8 s
+    """
+    inherent_sec = BT_INHERENT_MAX_MS / 1000.0
+    filter_sec = max(0.0, float(current_filter_delay_ms)) / 1000.0
+    if calibration_mode == CALIBRATION_MODE_STARTUP_TUNE:
+        chirp = float(chirp_duration_sec) if chirp_duration_sec is not None else 2.65
+        required = (
+            filter_sec + inherent_sec + chirp
+            + PAPLAY_STARTUP_OVERHEAD_SEC + CAPTURE_TAIL_MARGIN_SEC
+        )
+        return max(DEFAULT_DURATION_STARTUP_SEC, required)
+    required = filter_sec + inherent_sec + MUSIC_OVERLAP_MIN_SEC
+    return max(DEFAULT_DURATION_SEC, required)
+
+
+def _lag_search_window(
+    current_filter_delay_ms: float,
+) -> tuple[float, float, float, float]:
+    """Return ``(search_min, search_max, plausible_min, plausible_max)`` in ms.
+
+    The peak the analyzer is looking for is the loud chirp arriving
+    at the mic at ``current_filter + inherent_BT_lag``. We do NOT
+    pretend to know where exactly that is — instead we hand the
+    analyzer a wide window anchored on the speaker's CURRENT filter
+    delay, generous enough to absorb any plausible BT inherent lag
+    (well under 1200 ms across all hardware we have ever tested) but
+    bounded enough that pre-signal noise cannot win.
+
+    The plausibility window is slightly tighter than the search window:
+    the analyzer is allowed to *evaluate* a wider region (so it sees
+    the noise floor properly) but a winning peak must land in the
+    plausibility band to be accepted.
+
+    Worked examples:
+      - Fresh BT speaker (filter=0):
+          search    = [-50, 1500]
+          plausible = [30, 1200]
+      - VIZIO post-anchor (filter=4636):
+          search    = [4536, 6136]
+          plausible = [4666, 5836]
+
+    No "expected peak" centring. The mic + loud chirp + 4 s tail can
+    handle the assessment unambiguously inside this window.
+    """
+    f = float(current_filter_delay_ms)
+    search_min = max(-50.0, f - SEARCH_BELOW_FILTER_MS)
+    search_max = f + SEARCH_ABOVE_FILTER_MS
+    plausible_min = max(PLAUSIBLE_BELOW_FILTER_MS, f + PLAUSIBLE_BELOW_FILTER_MS)
+    plausible_max = f + PLAUSIBLE_ABOVE_FILTER_MS
+    return search_min, search_max, plausible_min, plausible_max
 
 
 def _ble_slim_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -238,12 +353,36 @@ def _paplay_available() -> bool:
     return shutil.which("paplay") is not None
 
 
+def _mute_sonos_devices(device_ids: List[str], muted: bool) -> List[str]:
+    """Best-effort mute / unmute of Sonos devices for calibration isolation.
+
+    Returns the subset that we successfully toggled, so the caller can
+    restore exactly those (and not punish users by inadvertently muting a
+    Sonos that was already user-muted before the capture started).
+    """
+    if not device_ids:
+        return []
+    try:
+        from syncsonic_ble.helpers import sonos_controller  # type: ignore
+    except ImportError:
+        return []
+    out: List[str] = []
+    for d in device_ids:
+        try:
+            if sonos_controller.mute(d, muted):
+                out.append(d)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Sonos mute] %s -> %s failed: %s", d, muted, exc)
+    return out
+
+
 def _capture_pair(
     duration_sec: float,
     out_dir: Path,
     target_mac: str,
     *,
     play_tune_wav: Optional[Path] = None,
+    extra_silence_devices: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Path]]:
     """Concurrently parecord ``virtual_out.monitor`` and the Jieli mic.
 
@@ -253,6 +392,12 @@ def _capture_pair(
 
     Otherwise sleeps ``duration_sec`` with whatever audio is already on
     ``virtual_out`` (Slice 4.2 music-driven path).
+
+    ``extra_silence_devices`` is a list of Sonos device IDs to mute over
+    SoCo for the duration of the capture. Used by the multi-speaker
+    sequence so a Wi-Fi speaker's delayed echo does not contaminate the
+    cross-correlation of a BT speaker under test. Muted devices are
+    always restored before this function returns.
     """
     mic_source = _resolve_mic_source()
     if not mic_source:
@@ -263,6 +408,8 @@ def _capture_pair(
     safe_mac = target_mac.replace(":", "_").lower()
     ref_wav = out_dir / f"ref_{safe_mac}_{ts}.wav"
     mic_wav = out_dir / f"mic_{safe_mac}_{ts}.wav"
+
+    sonos_muted = _mute_sonos_devices(extra_silence_devices or [], True)
 
     common = [
         "parecord", "--file-format=wav", "--rate=48000",
@@ -301,6 +448,9 @@ def _capture_pair(
                 p.kill()
             except OSError:
                 pass
+        # ALWAYS restore Sonos mute state, even on capture failure.
+        if sonos_muted:
+            _mute_sonos_devices(sonos_muted, False)
 
     if not ref_wav.exists() or not mic_wav.exists():
         return None
@@ -318,6 +468,8 @@ def _calibrate_blocking(
     calibration_mode: CalibrationMode = CALIBRATION_MODE_MUSIC,
     sequence_index: Optional[int] = None,
     sequence_total: Optional[int] = None,
+    extra_silence_devices: Optional[List[str]] = None,
+    max_adjustment_ms: Optional[float] = None,
 ) -> None:
     """The actual calibration steps. Runs on a daemon thread so the
     GLib mainloop is never blocked. ``on_event`` is invoked at each
@@ -352,7 +504,21 @@ def _calibrate_blocking(
         except Exception as exc:  # noqa: BLE001
             logger.debug("calibrate on_event callback failed: %s", exc)
 
+    # Resolve the speaker's current filter delay BEFORE sizing the
+    # capture window. A speaker already pulled up to a Wi-Fi anchor
+    # emits the chirp ~5 s after we paplay it, so the BT-only 4.5 s
+    # default would clip the chirp out of the recording entirely. The
+    # same value is reused later for the analyzer search window so we
+    # don't have to read it twice.
+    current_user_delay_ms = _read_published_delay_ms(target_mac)
+    if current_user_delay_ms is None:
+        current_user_delay_ms = 100.0
+    current_filter_delay_ms = max(
+        0.0, current_user_delay_ms - ActuationManager.TRANSPORT_BASE_MS,
+    )
+
     tune_path: Optional[Path] = None
+    chirp_duration_sec: Optional[float] = None
     if calibration_mode == CALIBRATION_MODE_STARTUP_TUNE:
         try:
             from measurement.startup_tune import ensure_startup_tune_wav, wav_duration_sec
@@ -360,21 +526,30 @@ def _calibrate_blocking(
             _emit("failed", reason="startup_tune_import_failed", error=str(exc))
             return
         tune_path = ensure_startup_tune_wav()
-        need_sec = float(wav_duration_sec(tune_path)) + 0.85
-        if capture_duration_sec < need_sec:
-            capture_duration_sec = need_sec
+        chirp_duration_sec = float(wav_duration_sec(tune_path))
+
+    required_sec = _required_capture_sec(
+        current_filter_delay_ms, calibration_mode,
+        chirp_duration_sec=chirp_duration_sec,
+    )
+    if capture_duration_sec < required_sec:
+        capture_duration_sec = required_sec
+
+    if calibration_mode == CALIBRATION_MODE_STARTUP_TUNE:
         _emit(
             "started",
             target_total_ms=target_total_ms,
             capture_duration_sec=capture_duration_sec,
             startup_tune=str(tune_path),
             pause_phone_audio_hint=True,
+            current_filter_delay_ms=round(current_filter_delay_ms, 2),
         )
     else:
         _emit(
             "started",
             target_total_ms=target_total_ms,
             capture_duration_sec=capture_duration_sec,
+            current_filter_delay_ms=round(current_filter_delay_ms, 2),
         )
 
     target_sock = _socket_for_mac(target_mac)
@@ -393,12 +568,18 @@ def _calibrate_blocking(
     # Tiny settle so the 50 ms ramp completes before we start capturing.
     time.sleep(0.15)
 
-    _emit("capturing", duration_sec=capture_duration_sec)
+    extras = list(extra_silence_devices or [])
+    _emit(
+        "capturing",
+        duration_sec=capture_duration_sec,
+        extra_silence_count=len(extras),
+    )
     capture = _capture_pair(
         capture_duration_sec,
         CAPTURE_DIR,
         target_mac,
         play_tune_wav=tune_path,
+        extra_silence_devices=extras,
     )
 
     # Always restore the mutes, even on capture failure - we MUST NOT
@@ -438,10 +619,21 @@ def _calibrate_blocking(
               ref_sr=ref_sr, mic_sr=mic_sr)
         return
 
+    # ``current_filter_delay_ms`` was already resolved above so the
+    # capture window could be sized correctly. Reuse it now to build
+    # the analyzer's search window around the expected peak location:
+    # the peak is at ``current_filter_delay + inherent_BT_lag``;
+    # without this the analyzer's [-50, 700] default would miss the
+    # real peak whenever the speaker has been pulled up to a Wi-Fi
+    # anchor.
+    search_min, search_max, plausible_min, plausible_max = _lag_search_window(
+        current_filter_delay_ms,
+    )
+
     try:
         est = estimate_lag_samples(
             ref_arr, mic_arr, sample_rate=ref_sr,
-            min_lag_ms=-50.0, max_lag_ms=MAX_PLAUSIBLE_LAG_MS,
+            min_lag_ms=search_min, max_lag_ms=search_max,
         )
     except Exception as exc:  # noqa: BLE001
         _emit("failed", reason="analyzer_failed", error=repr(exc))
@@ -454,6 +646,8 @@ def _calibrate_blocking(
         "confidence_primary": round(est.confidence_primary, 2),
         "confidence_secondary": round(est.confidence_secondary, 2),
         "sample_rate": est.sample_rate,
+        "search_window_ms": [round(search_min, 1), round(search_max, 1)],
+        "plausible_window_ms": [round(plausible_min, 1), round(plausible_max, 1)],
     }
 
     # Reject low-confidence or implausible measurements. We do this
@@ -470,10 +664,10 @@ def _calibrate_blocking(
             f"confidence_secondary {est.confidence_secondary:.2f} below "
             f"threshold {MIN_CONFIDENCE_SECONDARY}"
         )
-    elif not (MIN_PLAUSIBLE_LAG_MS <= est.lag_ms <= MAX_PLAUSIBLE_LAG_MS):
+    elif not (plausible_min <= est.lag_ms <= plausible_max):
         rejection = (
             f"lag_ms {est.lag_ms:.1f} outside plausible window "
-            f"[{MIN_PLAUSIBLE_LAG_MS}, {MAX_PLAUSIBLE_LAG_MS}]"
+            f"[{plausible_min:.1f}, {plausible_max:.1f}]"
         )
 
     if rejection is not None:
@@ -482,35 +676,42 @@ def _calibrate_blocking(
         return
 
     # Compute the new user-facing delay. The cross-correlation analyzer
-    # returned the TOTAL acoustic lag (BlueZ buffer + speaker DSP +
-    # propagation + whatever filter delay was already applied). To
-    # change that total to ``target_total_ms`` we shift the published
-    # user-delay by (target - measured). Working in user-delay space
-    # rather than filter-delay space lets us stay agnostic to the
-    # actuation manager's TRANSPORT_BASE_MS offset; the manager
-    # already does that subtraction internally.
+    # returned the TOTAL acoustic lag from virtual_out to the mic, which
+    # equals (current filter delay) + (inherent BT chain). To change
+    # that total to ``target_total_ms`` we need to shift the FILTER
+    # delay by exactly ``(target - measured)`` ms. Filter delay is a
+    # pure delay line so the acoustic-lag axis and filter-delay axis
+    # are 1:1.
     #
-    # We read the current user-delay from the on-disk control plane,
-    # not from the actuation manager's in-memory state, so this code
-    # works correctly even when invoked from a CLI process distinct
-    # from the running service.
-    current_user_delay_ms = _read_published_delay_ms(target_mac)
-    if current_user_delay_ms is None:
-        # No publish yet for this speaker. The actuation manager will
-        # ensure_output() to its default starting point (100 ms), so
-        # treat that as our pre-image.
-        current_user_delay_ms = 100.0
+    # IMPORTANT: working in user-delay space (the previous implementation)
+    # is only correct when ``user_delay >= TRANSPORT_BASE_MS``. Below that
+    # threshold the actuation manager clamps ``filter = max(0, user-base)``
+    # to 0, so adjusting user-delay by Δ may produce LESS than Δ of filter
+    # change. With a Wi-Fi anchor of ~1700 ms and a starting user-delay
+    # at the 20 ms floor, the previous algorithm under-shot the target
+    # by exactly ``TRANSPORT_BASE_MS - MIN_USER_DELAY_MS`` (= 100 ms),
+    # leaving the BT speaker that much ahead of the Sonos.
+    #
+    # ``current_user_delay_ms`` and ``current_filter_delay_ms`` were
+    # already resolved above so the analyzer search window could be
+    # placed around the expected peak.
 
     adjustment_ms = target_total_ms - est.lag_ms
-    if abs(adjustment_ms) > MAX_ADJUSTMENT_MS:
+    effective_max_adjustment = (
+        float(max_adjustment_ms)
+        if max_adjustment_ms is not None
+        else MAX_ADJUSTMENT_MS
+    )
+    if abs(adjustment_ms) > effective_max_adjustment:
         _emit("failed", reason="adjustment_too_large",
               adjustment_ms=round(adjustment_ms, 2),
-              max_adjustment_ms=MAX_ADJUSTMENT_MS,
+              max_adjustment_ms=effective_max_adjustment,
               current_user_delay_ms=round(current_user_delay_ms, 2),
               measurement=measurement)
         return
 
-    new_user_delay_ms = current_user_delay_ms + adjustment_ms
+    new_filter_delay_ms = max(0.0, current_filter_delay_ms + adjustment_ms)
+    new_user_delay_ms = new_filter_delay_ms + ActuationManager.TRANSPORT_BASE_MS
     new_user_delay_ms_clamped = max(
         MIN_USER_DELAY_MS, min(MAX_USER_DELAY_MS, new_user_delay_ms),
     )
@@ -518,7 +719,9 @@ def _calibrate_blocking(
 
     _emit("applying",
           current_user_delay_ms=round(current_user_delay_ms, 2),
+          current_filter_delay_ms=round(current_filter_delay_ms, 2),
           adjustment_ms=round(adjustment_ms, 2),
+          new_filter_delay_ms=round(new_filter_delay_ms, 2),
           new_user_delay_ms=round(new_user_delay_ms_clamped, 2),
           clamped_to_bounds=clamped,
           target_total_ms=target_total_ms,
@@ -542,7 +745,9 @@ def _calibrate_blocking(
 
     _emit("applied",
           current_user_delay_ms=round(current_user_delay_ms, 2),
+          current_filter_delay_ms=round(current_filter_delay_ms, 2),
           adjustment_ms=round(adjustment_ms, 2),
+          new_filter_delay_ms=round(new_filter_delay_ms, 2),
           new_user_delay_ms=round(new_user_delay_ms_clamped, 2),
           target_total_ms=target_total_ms,
           measurement=measurement,
@@ -558,6 +763,8 @@ def calibrate_speaker_async(
     calibration_mode: CalibrationMode = CALIBRATION_MODE_MUSIC,
     sequence_index: Optional[int] = None,
     sequence_total: Optional[int] = None,
+    extra_silence_devices: Optional[List[str]] = None,
+    max_adjustment_ms: Optional[float] = None,
 ) -> threading.Thread:
     """Spawn the calibration on a daemon thread and return immediately.
 
@@ -566,6 +773,11 @@ def calibrate_speaker_async(
     ``Characteristic.send_notification(Msg.CALIBRATION_RESULT, payload)``
     so the mobile app sees live progress + the final result without
     blocking the GLib mainloop on the capture window.
+
+    ``extra_silence_devices`` is a list of Sonos device IDs that should be
+    muted for the duration of the capture (and restored afterwards). Used
+    by the multi-speaker sequence so Wi-Fi echoes don't pollute the
+    cross-correlation of a BT speaker under test.
     """
     t = threading.Thread(
         target=_calibrate_blocking,
@@ -577,6 +789,8 @@ def calibrate_speaker_async(
             "calibration_mode": calibration_mode,
             "sequence_index": sequence_index,
             "sequence_total": sequence_total,
+            "extra_silence_devices": list(extra_silence_devices) if extra_silence_devices else None,
+            "max_adjustment_ms": max_adjustment_ms,
         },
         name=f"syncsonic-calibrate-{target_mac.replace(':', '_').lower()}",
         daemon=True,

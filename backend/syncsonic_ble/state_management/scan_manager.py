@@ -1,10 +1,11 @@
-"""Thread-safe owner of Bluetooth discovery activity."""
+"""Thread-safe owner of Bluetooth discovery activity, plus a top-level
+``scan_wifi_sonos`` helper that the BLE handler invokes on WIFI_SCAN_START."""
 
 from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import dbus
 
@@ -13,6 +14,18 @@ from syncsonic_ble.state_management.bus_manager import get_bus
 from syncsonic_ble.utils.logging_conf import get_logger
 
 logger = get_logger(__name__)
+
+
+def scan_wifi_sonos(timeout: int = 5) -> List[Dict[str, Any]]:
+    """Run a one-shot Sonos scan. Wrapper that defers the soco import to
+    call-time so the BLE service start path does not pull soco unless the
+    user actually triggers a Wi-Fi scan."""
+    try:
+        from syncsonic_ble.helpers.sonos_discovery import discover_sonos
+    except ImportError as exc:
+        logger.warning("[WiFiScan] sonos_discovery unavailable: %s", exc)
+        return []
+    return discover_sonos(timeout=timeout)
 
 
 class _AdapterEntry:

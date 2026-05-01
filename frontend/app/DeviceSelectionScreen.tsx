@@ -21,6 +21,7 @@ import {
   startScanDevices,
   stopScanDevices,
   fetchPairedDevices,
+  startWifiScan,
 } from '../utils/ble_functions';
 import { TopBar } from '@/components/topbar-variants/TopBar';
 import { Body } from '@/components/texts/BodyText';
@@ -56,7 +57,6 @@ export default function DeviceSelectionScreen() {
     handleNotification,
     scannedDevices,
     wifiScannedDevices,
-    clearWifiScannedDevices,
     pairedDevices,
   } = useBLEContext();
 
@@ -73,8 +73,6 @@ export default function DeviceSelectionScreen() {
 
   const router = useRouter();
 
-  // Wi-Fi stays visible in the UI so future epic work has a home, but the
-  // neutral foundation only allows Bluetooth speaker discovery.
   const startScanning = useCallback(async () => {
     if (!connectedDevice) return;
 
@@ -82,22 +80,29 @@ export default function DeviceSelectionScreen() {
     setScanError(null);
 
     if (deviceType === 'wifi') {
-      clearWifiScannedDevices();
-      setScanLoading(false);
-      setScanError(
-        'Wi-Fi speaker support is disabled on the neutral foundation branch.'
-      );
+      // Mirror BT exactly: just send the scan command. Results arrive
+      // as WIFI_SCAN_RESULTS notifications → appended to wifiScannedDevices.
+      // Do NOT call clearWifiScannedDevices here — it is an inline arrow in
+      // useBLE (new reference each render), so including it in deps would
+      // cause this callback to change on every state update, triggering the
+      // effect loop that clears devices as soon as they arrive.
+      try {
+        await startWifiScan(connectedDevice);
+      } catch (e) {
+        console.error('Failed to start Wi-Fi scan', e);
+        setScanError('Could not start Wi-Fi speaker scan');
+        setScanLoading(false);
+      }
       return;
     }
 
     try {
-      console.log('Starting scan for Bluetooth devices...');
       await startScanDevices(connectedDevice);
     } catch (e) {
       console.error('Failed to start scan', e);
       setScanError('Could not start speaker scan');
     }
-  }, [connectedDevice, deviceType, clearWifiScannedDevices]);
+  }, [connectedDevice, deviceType]);
 
   const fetchPairedDevicesFromPi = useCallback(async () => {
     if (!connectedDevice || deviceType === 'wifi') return;

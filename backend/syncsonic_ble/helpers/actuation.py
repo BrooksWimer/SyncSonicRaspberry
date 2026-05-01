@@ -27,7 +27,12 @@ class ActuationManager:
     """Tracks manual per-speaker timing state for the neutral foundation."""
 
     MIN_DELAY_MS = 20.0
-    MAX_DELAY_MS = 4000.0
+    # Raised from 4000 -> 5000 ms in 2026-04 to support Wi-Fi (Sonos)
+    # anchored alignment. Real Sonos chains measured at 3.65 s of
+    # acoustic lag, so BT user-delay must be able to reach ~3.6-4 s
+    # to match. Must stay <= the C filter's MAX_DELAY_MS or set_delay
+    # commands will be silently clamped at the filter end.
+    MAX_DELAY_MS = 5000.0
     TRANSPORT_BASE_MS = 120.0
 
     def __init__(self) -> None:

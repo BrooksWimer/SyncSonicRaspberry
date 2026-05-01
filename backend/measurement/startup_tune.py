@@ -38,7 +38,7 @@ _FADE_SEC = 0.07
 DEFAULT_TUNE_DIR = Path(
     os.environ.get("SYNCSONIC_STARTUP_TUNE_DIR", "/run/syncsonic/slice4_startup_tune"),
 )
-TUNE_FILENAME = "syncsonic_startup_chirp_v1.wav"
+TUNE_FILENAME = "syncsonic_startup_chirp_v2.wav"
 
 
 def linear_chirp_mono(duration_sec: float, sr: int, f0: float, f1: float) -> np.ndarray:
@@ -77,11 +77,21 @@ def write_stereo_s16_wav(path: Path, mono_fp: np.ndarray, sr: int) -> None:
 
 
 def build_startup_tune_mono(sample_rate: int = SR) -> np.ndarray:
-    """Synthesize the canonical chirp (float mono, peak magnitude <= 1)."""
+    """Synthesize the canonical chirp (float mono, peak magnitude <= 1).
+
+    Peak amplitude is the SNR knob for the Wi-Fi anchor measurement.
+    A debug capture at 0.22 peak through the Sonos / Icecast / MP3
+    chain produced a flat correlation surface where the real lag
+    peak (~5021 ms) was within 5 % of every noise sidelobe between
+    300 ms and 5 s. Bumping to 0.40 (+5 dB) gives the cross-correlator
+    enough margin to lock onto the true Sonos peak while staying well
+    below clipping. BT speakers had ~70x confidence at 0.22 so they
+    have plenty of headroom for the louder chirp.
+    """
     sig = linear_chirp_mono(_CHIRP_DURATION_SEC, sample_rate, _F0_HZ, _F1_HZ)
     sig = raised_cosine_fade(sig, sample_rate, _FADE_SEC)
     peak = float(np.max(np.abs(sig))) if sig.size else 0.0
-    target_peak = 0.22
+    target_peak = 0.40
     if peak > 0:
         sig = sig * (target_peak / peak)
     return sig.astype(np.float64)

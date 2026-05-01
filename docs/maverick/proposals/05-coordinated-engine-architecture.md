@@ -1,8 +1,9 @@
 # Epic 05: Coordinated Engine — Architecture Proposal
 
-_Status: Slices 0–3 deployed and Pi-validated on `epic/05-coordinated-engine`.
-**Slice 4** (mic calibration, startup chirp, sequential align-all) is in
-progress—see §360+. Evidence sections 8–16 remain the Pi audit trail._
+_Status: Slices 0–4 deployed and Pi-validated on `epic/05-coordinated-engine`,
+including the Wi-Fi anchor + 3-speaker auto-alignment landing
+(2026-05-01, §18). The Now horizon is closed; ROADMAP.md tracks the
+Now+ hardening + Epic 03 ultrasonic lanes that follow._
 
 _For the strategic frame this epic sits inside (the North Star, the three
 time horizons, and the design principles every slice is held to), see
@@ -1543,3 +1544,152 @@ results are now an inline strip on each speaker card; the "Align all
 speakers" button at the top doubles as a live progress label
 (`Aligning 1/3 (Speaker name)`) during a sequence. The
 `CALIBRATE_SPEAKER` opcode and CLI remain for diagnostics.
+
+## 18. Wi-Fi anchor + 3-speaker auto-alignment landing (2026-05-01 EDT)
+
+**The North Star is reached.** A 3-speaker configuration (2 Bluetooth +
+1 Wi-Fi Sonos) was perfectly aligned end to end through the phone app
+on the Pi target, after the changes in this section landed.
+
+### 18.1 Why this section exists
+
+Slice 4 (§17) shipped startup-tune + sequential calibration for
+Bluetooth-only stacks. Wi-Fi support per the original epic 04 plan
+called for a manual slider workaround because nobody had measured a
+~5 s Sonos lag with the cross-correlation analyzer before. The
+analyzer turned out to be perfectly capable of measuring it once
+three things were fixed:
+
+1. The `pw_delay_filter` C ring and the Python actuation chain were
+   silently clamping at 2 s and 4 s respectively. Lifting both to 5 s
+   let a multi-second adjustment reach the wire.
+2. The calibration math was operating in user-delay space, but
+   `TRANSPORT_BASE_MS` (a +100 ms floor only applied at the actuation
+   boundary) was eating 100 ms of every adjustment. Moving the math
+   into filter-delay space (where there is no such floor) closed the
+   gap.
+3. The capture window was not sized for a 5 s filter delay: a 4.5 s
+   default capture against a 4.6 s filter only contained ~0.2 s of
+   chirp signal. Dynamic capture sizing (now `max(10 s, filter +
+   0.8 + chirp + 0.2 + 4)`) plus a 4 s post-signal tail margin gives
+   the analyzer a full chirp plus a clean noise floor at any plausible
+   filter delay.
+
+### 18.2 Architectural change recap
+
+```mermaid
+flowchart LR
+    subgraph App["Phone (BLE)"]
+        BTN_TUNE["Align all speakers (startup tune)"]
+        BTN_MUSIC["Align all speakers (music)"]
+    end
+    subgraph Pi["SyncSonic backend"]
+        SEQ["calibrate_sequence::calibrate_all_speakers_async"]
+        ANCHOR["calibrate_anchor::measure_wifi_anchor_lag"]
+        ONE["calibrate_one::calibrate_speaker_async"]
+        ACT["ActuationManager (per-MAC)"]
+    end
+    subgraph Outputs["Engine outputs"]
+        BT1["BT speaker 1 (filter+adjust)"]
+        BT2["BT speaker 2 (filter+adjust)"]
+        SONOS["Sonos via Icecast (filter at TRANSPORT_BASE_MS only)"]
+    end
+    BTN_TUNE -- chirp anchor --> SEQ
+    BTN_MUSIC -- music anchor --> SEQ
+    SEQ -- if Wi-Fi present --> ANCHOR
+    ANCHOR -- target_total_ms = anchor_lag --> SEQ
+    SEQ -- per BT speaker --> ONE
+    ONE -- new_user_delay --> ACT
+    ACT --> BT1
+    ACT --> BT2
+    SEQ -. Sonos muted at sequence level .-> SONOS
+```
+
+The frontend buttons map 1:1 to anchor mode: the "Startup tune"
+button uses the chirp anchor, the "Music" button uses passive music
+capture as the anchor. There is no in-band fallback between them —
+each button is a deterministic end-to-end path.
+
+### 18.3 Live test result (3 speakers, music playing)
+
+User-confirmed result, 2026-05-01 EDT after the deployment in this
+commit (`a18772b`):
+
+> "It worked perfectly."
+
+Pi-side, the sequence produced:
+- one `anchor_measured` event with `anchor_mode=chirp`,
+  `anchor_lag_ms ≈ 5066` (Sonos's acoustic lag from
+  `virtual_out.monitor` to the room mic via Icecast → Sonos DSP →
+  speaker → air)
+- per-BT-speaker `applied` events with the BT filter delays pulled
+  UP by ~4.5 s each so all three speakers' acoustic emission
+  arrived at the listener at the same instant
+- a single `sequence_complete` event with `per_mac_outcome` =
+  `{applied, applied}` for the BT speakers (Sonos doesn't appear in
+  `per_mac_outcome`; it's the anchor, not a calibrated peer)
+- zero false-positive soft-mutes from the Coordinator while the
+  chirp played, because the sequence-level Sonos mute prevents the
+  Icecast pipeline from leaking a delayed chirp echo into the
+  middle of the next BT capture
+
+### 18.4 The seven defects the robustness pass closed
+
+This is the audit trail of what specifically broke during the iterative
+debugging that preceded the 2026-05-01 success. Each entry is the
+permanent answer for "why is the parameter set to this value" so a
+future agent doesn't re-derive it from the shell history.
+
+| # | Symptom | Root cause | Fix |
+|---|---|---|---|
+| 1 | Sonos chirp echoed mid-BT-capture, BT analyzer locked onto the wrong peak | Per-capture Sonos mute/unmute was too short for the 500-3000 ms Icecast→Sonos pipeline buffering | Sequence-level Sonos mute: mute once before BT loop, unmute once after, `settle_sec = anchor_lag + 2 s` between |
+| 2 | `adjustment_too_large` rejection on a clearly-correct large adjustment | `MAX_ADJUSTMENT_MS=400` was sized for BT-only sliders | `_anchor_max_adjustment(target) = max(400, target+600)` is used when a Wi-Fi anchor is present |
+| 3 | VIZIO at slider 4 s was still way ahead of Sonos | C filter `MAX_DELAY_MS=2000` silently clamped the request | C ring + ActuationManager + AlignmentActuator all lifted to 5000 ms |
+| 4 | Adjustment computed and published, but applied delay was 100 ms short | Math was in user-delay space, `TRANSPORT_BASE_MS=100` eaten at boundary | Math moved entirely to filter-delay space, with explicit user/filter conversion at the boundaries |
+| 5 | VIZIO `confidence_secondary 1.19 below threshold 1.5` after large filter shift | Capture was 4.5 s; only ~0.2 s of chirp inside the recording window | `_required_capture_sec()` sizes the window dynamically against `current_filter_delay_ms`, with a 10 s floor and 4 s post-signal tail |
+| 6 | Music anchor returned correct lag but `confidence_secondary 1.0` | Music has self-similar peaks (drum loops repeating ~500 ms apart) that compete with the direct path | `MIN_CONFIDENCE_SECONDARY` lowered from 1.5 to 1.2 (BT calibrator and music anchor both); chirp anchor stays at 0.9 due to MP3 smearing |
+| 7 | `sequence_complete` notification truncated; no completion alert in app | Embedded `anchor_info` block + measurement diagnostic pushed payload past BLE ATT MTU (~669 bytes) | `_slim_anchor_info()` keeps only `{phase, anchor_mode, anchor_lag_ms, reason}`; frontend additionally synthesizes the completion alert from per-speaker `applied/failed` events as a fallback |
+
+A failure mode previously masked by a silent fallback (Wi-Fi present
++ anchor failed → BT-only target = 500 ms → speakers actively
+de-aligned from the Sonos that the user is currently listening to)
+now surfaces as `sequence_failed { reason: anchor_failed_wifi_present }`.
+The user retries; nothing gets quietly destroyed.
+
+### 18.5 Status
+
+- Slice 4 closes here. The Now horizon (per ROADMAP.md) is closed.
+- Epic 02 (Startup Mic Auto-Alignment) is done.
+- Epic 04 (Wi-Fi Speakers Manual Alignment) is done; Wi-Fi speakers
+  ship as auto-aligned peers, not as a separate manual workstream.
+- Epic 03 (Runtime Ultrasonic Auto-Alignment) is the next active
+  optional technical lane. Wires are already in place: the elastic
+  engine, the cross-correlation analyzer, the per-speaker filter
+  sockets, and the BLE coordinator state surface. What is missing
+  is the runtime measurement signal during music playback.
+- The hardening track (ROADMAP §3.2 H1-H8) runs in parallel and is
+  the project owner's stated top priority for moving toward custom
+  hardware and commercial release.
+
+### 18.6 What this means for a fresh agent picking up the project
+
+If you are a coding agent reading this file in a new session,
+**start here**:
+
+1. Read `AGENTS.md` (the orchestration doctrine).
+2. Read `docs/maverick/ROADMAP.md` §1 (North Star), §2 (Where We Are),
+   §3.2 (Hardening track), §3.3 (Epic 03).
+3. Read `docs/maverick/epics/02-startup-mic-auto-alignment.md` and
+   `docs/maverick/epics/03-runtime-ultrasonic-auto-alignment.md` for
+   the lane status; Epic 02 is done with code references inside, Epic
+   03 is queued with its open design questions.
+4. Skim §18 of this file (the audit trail above) only if you are
+   touching anything in `backend/measurement/calibrate_*` or
+   `backend/tools/pw_delay_filter.c`.
+
+The current production branch is `epic/05-coordinated-engine`; the
+production deployment target is `syncsonic@10.0.0.89` per
+`AGENTS.md`. The active codebase passes
+`python -m compileall syncsonic_ble measurement` cleanly and
+`npx tsc --noEmit` + `npm run lint` cleanly on the frontend (warnings
+exist but no errors).

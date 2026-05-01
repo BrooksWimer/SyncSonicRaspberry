@@ -1,5 +1,16 @@
 # Epic 04: Wi-Fi Speakers Manual Alignment
 
+> **Status: DONE (2026-05-01).** Wi-Fi speakers (Sonos) ship as
+> **auto-aligned** peer engine outputs, not "manual alignment". The
+> originally-scoped manual slider workaround was superseded once the
+> Slice 4 cross-correlation analyzer proved it could measure the
+> ~5 s Sonos lag directly via the chirp anchor pattern. Real-world
+> 3-speaker (2 BT + Sonos) alignment confirmed by the project owner
+> as "perfectly aligned" 2026-05-01 EDT. Implementation rolled into
+> Epic 02; runtime evidence in architecture proposal §18. The W1-W4
+> slice plan below was followed in spirit but compressed into the
+> single Wi-Fi-anchor delivery rather than a multi-week stagger.
+
 > **Architecture proposal:** [`../proposals/04-wifi-speakers-architecture.md`](../proposals/04-wifi-speakers-architecture.md)
 > reframes this lane as a downstream consumer of the Slice 2 elastic
 > engine and Slice 4 mic calibration. Read it first.

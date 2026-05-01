@@ -104,6 +104,14 @@ CONTROL_STATE_PATH = Path("/tmp/syncsonic_pipewire/control_state.json")
 DEFAULT_TARGET_TOTAL_MS = 500.0   # alignment target; safely above any plausible measured lag
 SOCKET_TIMEOUT_SEC = 0.5
 RAMP_MS = 50                        # mute_to ramp duration; matches Slice 3.2
+# After sending mute_to to the other BT speakers, wait this long before
+# starting the capture. The C-filter gain ramp finishes in RAMP_MS (50 ms),
+# but the downstream A2DP transmit buffer still holds up to ~800 ms of audio
+# that was already committed before the gain reached 0. Without a settle wait
+# the first ~800 ms of the capture window includes fading bleed from the
+# just-muted speakers, which creates spurious correlation energy (especially
+# in music mode where all speakers are playing the same content).
+MUTE_SETTLE_SEC = 1.0
 
 # Confidence acceptance thresholds. confidence_secondary is the
 # discriminating one (peak vs second-best lobe with a 50 ms guard);
@@ -565,8 +573,12 @@ def _calibrate_blocking(
         if not _send_filter_command(sock, f"mute_to 0 {RAMP_MS}"):
             logger.warning("mute_to failed for %s; calibration may pick up cross-speaker bleed", sock)
 
-    # Tiny settle so the 50 ms ramp completes before we start capturing.
-    time.sleep(0.15)
+    # Wait for the other speakers' A2DP transmit buffers to drain.
+    # The C-filter gain hits zero after RAMP_MS (50 ms) but the A2DP
+    # stack can hold ~800 ms of already-committed audio that still
+    # plays out acoustically. MUTE_SETTLE_SEC (1.0 s) > 50 ms + 800 ms
+    # so the room is clean when capture begins.
+    time.sleep(MUTE_SETTLE_SEC)
 
     extras = list(extra_silence_devices or [])
     _emit(

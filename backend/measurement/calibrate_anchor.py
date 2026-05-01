@@ -113,12 +113,20 @@ ANCHOR_SONOS_VOLUME = 85
 
 # Confidence thresholds, per mode.
 #
-# Both modes use the same secondary threshold as the per-speaker BT
-# calibrator (1.2). Real captures of a 5 s Sonos lag with the user's
-# music returned conf_secondary ≈ 1.0 because mid-tempo songs have
-# strong self-similar structure (drum loops repeating ~500 ms later
-# create competing correlation peaks). The lag value itself was correct
-# within 30 ms — the 1.5 floor was rejecting good measurements.
+# Music mode threshold is 1.0 (not the BT-speaker 1.2).
+#
+# Real-world evidence from 2026-05-01: two back-to-back music-anchor
+# measurements returned lag_ms=4924 (conf_secondary=1.15) and
+# lag_ms=4876 (conf_secondary=2.08). The lags agree to 48 ms; the
+# first was correct but rejected at 1.2. Mid-tempo music with a
+# drum loop creates a ghost correlation peak ~500 ms away from the
+# real peak that can push secondary confidence below 1.2 even when
+# the primary peak is unambiguous.
+#
+# The ref_rms gate (>> MIN_REF_RMS_MUSIC=100) already ensures real
+# signal is present, so a secondary of 1.0 means "the direct-path
+# peak is at least as strong as the next-best ghost" — sufficient
+# given that the ghost is a musical repeat 500 ms away, not noise.
 #
 # Chirp mode stays at 0.9: MP3 + Sonos DSP smear the chirp's auto-
 # correlation enough that the anchor capture frequently lands in the
@@ -126,7 +134,7 @@ ANCHOR_SONOS_VOLUME = 85
 ANCHOR_MIN_CONFIDENCE_PRIMARY_CHIRP = 2.0
 ANCHOR_MIN_CONFIDENCE_SECONDARY_CHIRP = 0.9
 ANCHOR_MIN_CONFIDENCE_PRIMARY_MUSIC = 3.0
-ANCHOR_MIN_CONFIDENCE_SECONDARY_MUSIC = 1.2
+ANCHOR_MIN_CONFIDENCE_SECONDARY_MUSIC = 1.0
 
 # Music-mode reference-energy floor. ``load_wav_mono`` returns int16
 # values cast to float64, so the natural unit is the int16 sample

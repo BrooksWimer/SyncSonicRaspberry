@@ -75,14 +75,22 @@ ANCHOR_MODE_MUSIC: AnchorMode = "music"
 
 # Physically plausible Sonos lag bounds. The chain is
 # ``ffmpeg → libshout → Icecast queue → Sonos UPnP buffer → speaker DSP →
-# air → mic``. Even with a small Icecast queue, the Sonos UPnP buffer
-# alone is typically 300-2000 ms; total can reach 5+ s on consumer
-# hardware (5021 ms measured on the dev Sonos). Refuse to consider:
-#   - peaks below 300 ms (electrical / direct-coupling artifacts and
-#     residual BT audio leakage during the first half-second of capture)
-#   - peaks above 6500 ms (well past anything the buffer chain produces;
-#     would be a late room reflection or a correlation-tail sidelobe).
-ANCHOR_MIN_LAG_MS = 300.0
+# air → mic``. Even with a minimal Icecast queue, the Sonos UPnP buffer
+# alone is typically 1500-3000 ms; total can reach 5+ s on consumer
+# hardware (4876-5066 ms measured on the dev Sonos across multiple runs).
+#
+# Minimum floor raised from 300 ms to 2000 ms in 2026-05-01 robustness
+# pass. Music cross-correlation can find a ghost peak at 1742 ms when
+# the song has a repeating pattern (drum loop, ostinato, etc.) at that
+# offset. The 1742 ms ghost has higher correlation energy in some 10 s
+# windows than the real 4876 ms peak, so without a physical minimum the
+# analyzer accepts the wrong lag and the subsequent BT calibration tries
+# to pull speakers to a 1742 ms target (then fails with adjustment_too_large,
+# which is safe but confusing). 2000 ms is a safe conservative minimum:
+# no realistic Sonos/Icecast deployment has end-to-end lag under 1.5 s.
+#   - peaks below 2000 ms: music ghost or early reflection, not the Sonos
+#   - peaks above 6500 ms: room reflection or correlation-tail sidelobe
+ANCHOR_MIN_LAG_MS = 2000.0
 ANCHOR_MAX_LAG_MS = 6500.0
 
 # Capture window. With chirp duration 2.65 s + max-lag 6.5 s + tail

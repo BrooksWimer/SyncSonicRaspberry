@@ -118,21 +118,30 @@ MUTE_SETTLE_SEC = 1.0
 # confidence_primary is a sanity check that the peak rises above the
 # overall noise floor. Both must pass.
 #
-# Threshold rationale (tuned against real captures across BT speakers
-# AND multi-driver soundbars at high filter delays):
-#   - LAG estimates are consistent across captures within ~30 ms,
-#     even when confidence varies. Confidence reflects how SHARP the
-#     peak is, not how WRONG the lag is.
-#   - confidence_primary >= 3.0 keeps out true silence-vs-noise garbage.
-#   - confidence_secondary >= 1.2 (loosened from 1.5) accepts measurements
-#     where a soundbar's room reflection sits within ~20 % of the direct
-#     path's correlation amplitude. Combined with the wider capture
-#     window (10 s minimum, 4 s post-signal tail) and the loud chirp
-#     (target_peak 0.40), this is sufficient to trust the analyzer.
-#     The earlier 1.5 was over-tuned to clean BT and falsely rejected
-#     correct measurements from VIZIO-class soundbars.
+# Two separate secondary thresholds by calibration mode:
+#
+#   startup_tune (chirp): 1.2 is appropriate. The chirp has a very
+#     specific time-frequency structure that music lacks, so the
+#     cross-correlation surface is clean and a sharp peak is expected.
+#     Borderline secondary confidence (< 1.2) with the chirp usually
+#     means a real measurement problem (short capture, weak signal,
+#     room reflection confusing the correlator).
+#
+#   music (passive): 1.0 is appropriate. Real music has a repeating
+#     rhythmic or harmonic structure (drum loops, ostinato basslines)
+#     that creates ghost correlation peaks 300-700 ms away from the
+#     correct peak. This can push secondary confidence below 1.2 even
+#     when the PRIMARY peak is unambiguously at the correct lag.
+#     Evidence: 2026-05-01 run 3 showed two speakers fail with
+#     confidence_secondary 1.10 and 1.18 respectively, both at lags
+#     fully consistent with their current filter delays.
+#     confidence_primary >= 3.0 already screens out flat noise — a
+#     secondary of 1.0 means "the direct-path peak is at least as
+#     strong as the nearest ghost peak", which is sufficient when the
+#     primary is large.
 MIN_CONFIDENCE_PRIMARY = 3.0
-MIN_CONFIDENCE_SECONDARY = 1.2
+MIN_CONFIDENCE_SECONDARY_CHIRP = 1.2
+MIN_CONFIDENCE_SECONDARY_MUSIC = 1.0
 
 # Lag-search bounds, anchored on the speaker's CURRENT filter delay.
 # We do NOT centre the window on a guessed "expected peak" location:
@@ -671,10 +680,19 @@ def _calibrate_blocking(
             f"confidence_primary {est.confidence_primary:.2f} below "
             f"threshold {MIN_CONFIDENCE_PRIMARY}"
         )
-    elif est.confidence_secondary < MIN_CONFIDENCE_SECONDARY:
+    elif est.confidence_secondary < (
+        MIN_CONFIDENCE_SECONDARY_CHIRP
+        if calibration_mode == CALIBRATION_MODE_STARTUP_TUNE
+        else MIN_CONFIDENCE_SECONDARY_MUSIC
+    ):
+        min_s = (
+            MIN_CONFIDENCE_SECONDARY_CHIRP
+            if calibration_mode == CALIBRATION_MODE_STARTUP_TUNE
+            else MIN_CONFIDENCE_SECONDARY_MUSIC
+        )
         rejection = (
             f"confidence_secondary {est.confidence_secondary:.2f} below "
-            f"threshold {MIN_CONFIDENCE_SECONDARY}"
+            f"threshold {min_s}"
         )
     elif not (plausible_min <= est.lag_ms <= plausible_max):
         rejection = (
@@ -764,6 +782,11 @@ def _calibrate_blocking(
           target_total_ms=target_total_ms,
           measurement=measurement,
           actuation=snapshot if isinstance(snapshot, dict) else {})
+    # Give PipeWire a moment to recover after the compute-heavy FFT
+    # analysis. Without this pause the virtual_out graph can miss its
+    # next processing deadline (xrun), which silences the audio stream
+    # for the following speaker in the sequence.
+    time.sleep(0.5)
 
 
 def calibrate_speaker_async(

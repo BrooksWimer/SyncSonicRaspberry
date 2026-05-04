@@ -370,6 +370,24 @@ def _paplay_available() -> bool:
     return shutil.which("paplay") is not None
 
 
+def mute_bt_socket_for_mac(mac: str, muted: bool) -> None:
+    """Mute (gain→0) or restore (gain→1000) a single BT speaker's C-filter.
+
+    Used by the calibration sequence to manage per-speaker isolation without
+    relying on each individual _calibrate_blocking call to touch neighbours.
+    """
+    target = 0 if muted else 1000
+    sock = _socket_for_mac(mac)
+    if not _send_filter_command(sock, f"mute_to {target} {RAMP_MS}"):
+        logger.warning("[mute_bt_socket] command failed for %s (muted=%s)", mac, muted)
+
+
+def mute_bt_sockets_for_macs(macs: List[str], muted: bool) -> None:
+    """Bulk mute / restore for a list of BT speaker MACs."""
+    for mac in macs:
+        mute_bt_socket_for_mac(mac, muted)
+
+
 def _mute_sonos_devices(device_ids: List[str], muted: bool) -> List[str]:
     """Best-effort mute / unmute of Sonos devices for calibration isolation.
 
@@ -487,6 +505,7 @@ def _calibrate_blocking(
     sequence_total: Optional[int] = None,
     extra_silence_devices: Optional[List[str]] = None,
     max_adjustment_ms: Optional[float] = None,
+    others_already_muted: bool = False,
 ) -> None:
     """The actual calibration steps. Runs on a daemon thread so the
     GLib mainloop is never blocked. ``on_event`` is invoked at each
@@ -576,17 +595,32 @@ def _calibrate_blocking(
         return
 
     others = _other_sockets(target_mac)
-    _emit("muting_others", n_others=len(others),
-          others=[p.name for p in others])
-    for sock in others:
-        if not _send_filter_command(sock, f"mute_to 0 {RAMP_MS}"):
-            logger.warning("mute_to failed for %s; calibration may pick up cross-speaker bleed", sock)
+    if others_already_muted:
+        # Sequence is managing all BT muting. Others are already silent.
+        # The target was just un-muted by the sequence caller; wait for its
+        # A2DP transmit buffer to refill so the speaker is acoustically
+        # audible when capture begins. The required wait is the same
+        # ~1 s regardless of direction (draining vs. refilling).
+        _emit(
+            "muting_others",
+            n_others=len(others),
+            others=[p.name for p in others],
+            pre_muted=True,
+        )
+    else:
+        _emit("muting_others", n_others=len(others),
+              others=[p.name for p in others])
+        for sock in others:
+            if not _send_filter_command(sock, f"mute_to 0 {RAMP_MS}"):
+                logger.warning(
+                    "mute_to failed for %s; calibration may pick up cross-speaker bleed",
+                    sock,
+                )
 
-    # Wait for the other speakers' A2DP transmit buffers to drain.
-    # The C-filter gain hits zero after RAMP_MS (50 ms) but the A2DP
-    # stack can hold ~800 ms of already-committed audio that still
-    # plays out acoustically. MUTE_SETTLE_SEC (1.0 s) > 50 ms + 800 ms
-    # so the room is clean when capture begins.
+    # Wait for isolation to settle.
+    # others_already_muted=False: others' A2DP buffers drain (~850 ms max).
+    # others_already_muted=True:  target's A2DP buffer refills (~850 ms max).
+    # Both cases need the same wait; MUTE_SETTLE_SEC covers both.
     time.sleep(MUTE_SETTLE_SEC)
 
     extras = list(extra_silence_devices or [])
@@ -603,11 +637,14 @@ def _calibrate_blocking(
         extra_silence_devices=extras,
     )
 
-    # Always restore the mutes, even on capture failure - we MUST NOT
-    # leave the system silent.
-    for sock in others:
-        _send_filter_command(sock, f"mute_to 1000 {RAMP_MS}")
-    _emit("unmuting_others_done", n_restored=len(others))
+    # Restore others' mutes — only when we own the muting.
+    # When others_already_muted=True the sequence caller remutes the
+    # target and restores all BT speakers at the end of the loop, so
+    # touching neighbours here would break the isolation invariant.
+    if not others_already_muted:
+        for sock in others:
+            _send_filter_command(sock, f"mute_to 1000 {RAMP_MS}")
+    _emit("unmuting_others_done", n_restored=0 if others_already_muted else len(others))
 
     if capture is None:
         reason = "capture_failed"
@@ -800,6 +837,7 @@ def calibrate_speaker_async(
     sequence_total: Optional[int] = None,
     extra_silence_devices: Optional[List[str]] = None,
     max_adjustment_ms: Optional[float] = None,
+    others_already_muted: bool = False,
 ) -> threading.Thread:
     """Spawn the calibration on a daemon thread and return immediately.
 
@@ -813,6 +851,12 @@ def calibrate_speaker_async(
     muted for the duration of the capture (and restored afterwards). Used
     by the multi-speaker sequence so Wi-Fi echoes don't pollute the
     cross-correlation of a BT speaker under test.
+
+    ``others_already_muted`` signals that the caller (the multi-speaker
+    sequence) has pre-muted all BT speakers and is managing per-speaker
+    unmute/remute externally. When True, _calibrate_blocking skips its
+    own mute/unmute of neighbours; it still waits MUTE_SETTLE_SEC to
+    allow the target's A2DP buffer to refill after the caller unmuted it.
     """
     t = threading.Thread(
         target=_calibrate_blocking,
@@ -826,6 +870,7 @@ def calibrate_speaker_async(
             "sequence_total": sequence_total,
             "extra_silence_devices": list(extra_silence_devices) if extra_silence_devices else None,
             "max_adjustment_ms": max_adjustment_ms,
+            "others_already_muted": others_already_muted,
         },
         name=f"syncsonic-calibrate-{target_mac.replace(':', '_').lower()}",
         daemon=True,

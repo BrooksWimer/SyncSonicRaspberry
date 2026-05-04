@@ -53,8 +53,12 @@ from measurement.calibrate_one import (
     DEFAULT_DURATION_STARTUP_SEC,
     DEFAULT_TARGET_TOTAL_MS,
     MAX_ADJUSTMENT_MS,
+    MUTE_SETTLE_SEC,
+    RAMP_MS,
     SOCK_DIR,
     _mute_sonos_devices,
+    mute_bt_socket_for_mac,
+    mute_bt_sockets_for_macs,
     calibrate_speaker_async,
 )
 from measurement.calibrate_anchor import (
@@ -282,6 +286,20 @@ def calibrate_all_speakers_async(
 
         max_adj = _anchor_max_adjustment(effective_target_ms)
 
+        # ── Sequence-level BT isolation ──────────────────────────────────
+        # Pre-mute EVERY BT speaker so the loop can unmute exactly one at
+        # a time. This eliminates the ~500 ms window (unmute-others →
+        # next-speaker-mutes-others) where all speakers were audible
+        # simultaneously between measurement slots.
+        logger.info(
+            "[sequence] Pre-muting %d BT speakers for one-at-a-time isolation", len(macs)
+        )
+        mute_bt_sockets_for_macs(macs, muted=True)
+        # Wait for all A2DP buffers to drain before the first measurement.
+        # A small extra margin beyond MUTE_SETTLE_SEC ensures every speaker
+        # is acoustically silent when speaker 1's capture window opens.
+        time.sleep(MUTE_SETTLE_SEC + 0.2)
+
         try:
             for idx, mac in enumerate(macs, start=1):
                 done = threading.Event()
@@ -297,6 +315,11 @@ def calibrate_all_speakers_async(
                         summary[_mac] = phase
                         _done.set()
 
+                # Unmute ONLY this speaker so it alone is audible while
+                # _calibrate_blocking waits MUTE_SETTLE_SEC for the A2DP
+                # buffer to refill, then captures it in isolation.
+                mute_bt_socket_for_mac(mac, muted=False)
+
                 # Do NOT pass extra_silence_devices here — Sonos is
                 # already muted at the sequence level above.
                 calibrate_speaker_async(
@@ -308,8 +331,14 @@ def calibrate_all_speakers_async(
                     sequence_index=idx,
                     sequence_total=n,
                     max_adjustment_ms=max_adj,
+                    others_already_muted=True,
                 )
                 finished = done.wait(timeout=PER_SPEAKER_TIMEOUT_SEC)
+
+                # Remute this speaker IMMEDIATELY, before the next one
+                # is unmuted, so only one speaker is ever audible.
+                mute_bt_socket_for_mac(mac, muted=True)
+
                 if not finished:
                     summary[mac] = "timeout"
                     on_event(
@@ -326,6 +355,10 @@ def calibrate_all_speakers_async(
                     if not continue_on_failure:
                         break
         finally:
+            # Restore ALL BT speakers regardless of how the loop exited
+            # so the user can hear music again immediately.
+            logger.info("[sequence] Restoring all %d BT speakers after calibration loop", len(macs))
+            mute_bt_sockets_for_macs(macs, muted=False)
             # ALWAYS restore Sonos, even on unexpected failure.
             if sonos_muted_ids:
                 # Small settle so the last chirp clears the pipeline

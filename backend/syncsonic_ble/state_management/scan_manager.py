@@ -62,10 +62,12 @@ class ScanManager:
 
             if entry.refcount == 0:
                 try:
+                    logger.info("[ScanMgr] StartDiscovery on adapter %s", adapter_mac)
                     entry.proxy.StartDiscovery()
                 except Exception as exc:  # noqa: BLE001
                     if "InProgress" not in str(exc):
                         raise
+                    logger.info("[ScanMgr] StartDiscovery already in progress on adapter %s", adapter_mac)
             entry.refcount += 1
 
     def release_discovery(self, adapter_mac: str) -> None:
@@ -78,6 +80,7 @@ class ScanManager:
             entry.refcount -= 1
             if entry.refcount == 0:
                 try:
+                    logger.info("[ScanMgr] StopDiscovery on adapter %s", adapter_mac)
                     entry.proxy.StopDiscovery()
                 except Exception as exc:  # noqa: BLE001
                     if "InProgress" in str(exc):
@@ -98,15 +101,25 @@ class ScanManager:
         with self._cond:
             path = self._lookup_device_path(adapter_mac, target_mac)
             if path:
+                logger.info("[ScanMgr] Found %s on %s before waiting: %s", target_mac, adapter_mac, path)
                 return path
 
+            # Wake on InterfacesAdded and also poll periodically: dbus-python may
+            # deliver signals on the GLib mainloop while this thread waits; a missed
+            # wake plus GetManagedObjects keys typed as dbus.ObjectPath (not str)
+            # used to make "expected in objects" always false until timeout.
             while time.time() < deadline:
                 remaining = deadline - time.time()
-                self._cond.wait(timeout=remaining)
+                if remaining <= 0:
+                    break
+                chunk = min(remaining, 0.25)
+                self._cond.wait(timeout=chunk)
                 path = self._lookup_device_path(adapter_mac, target_mac)
                 if path:
+                    logger.info("[ScanMgr] Found %s on %s: %s", target_mac, adapter_mac, path)
                     return path
 
+        logger.info("[ScanMgr] Timed out waiting for %s on %s", target_mac, adapter_mac)
         return None
 
     def _on_interfaces_added(self, sender, object_path, *args, **kwargs):  # noqa: ANN001,D401
@@ -120,8 +133,13 @@ class ScanManager:
         )
         objects = om.GetManagedObjects()
         expected = device_path_on_adapter(self._bus, adapter_mac, dev_mac)
-        if expected and expected in objects:
-            return expected
+        if not expected:
+            return None
+        # GetManagedObjects keys are dbus.ObjectPath; plain str membership often fails.
+        expected_s = str(expected)
+        for key in objects:
+            if str(key) == expected_s:
+                return expected_s
         return None
 
     def refresh_adapters(self) -> None:

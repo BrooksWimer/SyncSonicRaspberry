@@ -637,7 +637,14 @@ export default function SpeakerConfigScreen() {
   // Listen for BLE connection status updates
   useEffect(() => {
     if (!bleConnectionStatus?.mac) return;
-    const mac = bleConnectionStatus.mac.toString();
+    const raw = bleConnectionStatus.mac.toString();
+    // Backend sends uppercase AA:BB:…; SQLite / URL speakers may differ in case.
+    // loadingSpeakers is keyed by the same mac string as the speaker cards —
+    // must resolve to that key or overlays never update past "Starting…".
+    const mac =
+      Object.keys(connectedSpeakers).find(
+        k => k.toUpperCase().replace(/-/g, ':') === raw.toUpperCase().replace(/-/g, ':'),
+      ) ?? raw;
 
     // Failure phases: stop spinner and show error, then clear
     const failurePhases = ['discovery_timeout', 'pairing_failed', 'connect_failed', 'connect_profile_failed'];
@@ -658,10 +665,11 @@ export default function SpeakerConfigScreen() {
       return () => clearTimeout(t);
     }
 
-    // In-progress: show status (spinner stays until success or failure)
-    const currentStatus = loadingSpeakers[mac]?.action;
-    if (currentStatus === 'connect') {
-      setLoadingSpeakers(prev => ({
+    // In-progress: show status (spinner stays until success or failure).
+    // Functional update: avoids stale loadingSpeakers and avoids effect deps churn.
+    setLoadingSpeakers(prev => {
+      if (prev[mac]?.action !== 'connect') return prev;
+      return {
         ...prev,
         [mac]: {
           action: 'connect',
@@ -669,9 +677,9 @@ export default function SpeakerConfigScreen() {
           progress: bleConnectionStatus.progress,
           error: bleConnectionStatus.error
         }
-      }));
-    }
-  }, [bleConnectionStatus]);
+      };
+    });
+  }, [bleConnectionStatus, connectedSpeakers]);
 
   const handleVolumeChangeWrapper = async (mac: string, newVolume: number, isSlidingComplete: boolean) => {
     await handleVolumeChange(

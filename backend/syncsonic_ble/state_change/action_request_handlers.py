@@ -62,6 +62,13 @@ def _feature_disabled(feature: str, message: str):
     )
 
 
+def _is_connected_output(char, mac: str) -> bool:
+    if not char.device_manager:
+        return True
+    mac_u = mac.upper()
+    return any(str(connected).upper() == mac_u for connected in char.device_manager._all_connected())
+
+
 def handle_ping(char, data):
     count = data.get("count", 0)
     return _encode(Msg.PONG, {"count": count})
@@ -86,13 +93,14 @@ def handle_connect_one(char, data):
     if service:
         service.submit(Intent.CONNECT_ONE, payload)
 
-    # Sonos device IDs are tracked separately from BT MACs; the device_manager
-    # union will surface them via _all_connected.
+    # Sonos device IDs are tracked separately from BlueZ Device1 state, so the
+    # device_manager union surfaces them via _all_connected. Bluetooth outputs
+    # must not be marked connected optimistically here: BlueZ's Connected=True
+    # signal is the physical truth that lets DeviceManager run adapter-collision
+    # checks and queue LOOPBACK_SYNC.
     if char.device_manager:
         if is_sonos(mac):
             char.device_manager.add_wifi_connected(mac)
-        else:
-            char.device_manager.connected.add(mac)
     return _encode(Msg.SUCCESS, {"queued": True})
 
 
@@ -138,6 +146,10 @@ def handle_set_latency(char, data):
         return _encode(Msg.ERROR, {"error": "MAC is on the reserved adapter (phone), cannot apply output delay"})
 
     latency_ms = float(latency)
+    if not _is_connected_output(char, mac):
+        logger.info("Ignoring SET_LATENCY for disconnected output %s", mac)
+        return _encode(Msg.SUCCESS, {"latency": latency_ms, "connected": False, "ignored": True})
+
     emit(EventType.SET_LATENCY_REQUEST, {"mac": mac, "delay_ms": latency_ms})
     manager = get_actuation_manager()
     ok, snapshot = manager.apply_control_target(mac, delay_ms=latency_ms, rate_ppm=0.0, mode="manual")
@@ -181,6 +193,10 @@ def handle_set_volume(char, data):
         return _encode(Msg.ERROR, {"error": "MAC is on the reserved adapter (phone), cannot apply output volume"})
 
     volume = int(volume)
+    if not _is_connected_output(char, mac):
+        logger.info("Ignoring SET_VOLUME for disconnected output %s", mac)
+        return _encode(Msg.SUCCESS, {"volume": volume, "connected": False, "ignored": True})
+
     balance = float(data.get("balance", 0.5))
     balance = max(0.0, min(1.0, balance))
     if balance >= 0.5:
@@ -243,6 +259,7 @@ def _scan_start(char, _):
         char._scan_mgr = ScanManager()
         char._scan_mgr.ensure_discovery(adapter_mac)
         if char.device_manager:
+            char.device_manager.reset_bt_scan_announcements()
             char.device_manager.scanning = True
         char._scan_adapter_mac = adapter_mac
     except Exception:  # noqa: BLE001

@@ -33,4 +33,4 @@ spectrum.png
 # Env and secrets (if you add any)
 .env
 .env.local
-.env.*.local
+.env.*.local.claude/

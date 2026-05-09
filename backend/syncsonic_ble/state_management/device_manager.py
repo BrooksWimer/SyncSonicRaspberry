@@ -51,6 +51,8 @@ class DeviceManager:
         self._status: Dict[str, Dict] = {}
         self._char = None
         self.scanning = False
+        # Dedupe notifications/logs when the same MAC is seen via RSSI/alias churn.
+        self._scan_stream_announced: Set[str] = set()
         self._setup_monitoring()
 
     _extract_mac = staticmethod(extract_mac)
@@ -60,6 +62,10 @@ class DeviceManager:
 
     def attach_characteristic(self, char) -> None:
         self._char = char
+
+    def reset_bt_scan_announcements(self) -> None:
+        """Call when the app begins SCAN_START so a new round of discovery can log/stream."""
+        self._scan_stream_announced.clear()
 
     def _setup_monitoring(self) -> None:
         self.bus.add_signal_receiver(
@@ -89,11 +95,34 @@ class DeviceManager:
         else:
             return
 
-        if interface != DEVICE_INTERFACE or "Connected" not in changed:
+        if interface != DEVICE_INTERFACE:
+            return
+        if not isinstance(changed, dict):
+            return
+
+        eff_path = path
+        if eff_path is None and len(args) >= 4:
+            eff_path = args[3]
+
+        # During inquiry, BlueZ usually refreshes *existing* Device1 objects
+        # (RSSI, Name, Alias) instead of emitting InterfacesAdded. The old code
+        # only handled "Connected", so [SCAN STREAM] never fired for cached devices.
+        if (
+            self.scanning
+            and self._char
+            and eff_path is not None
+            and str(eff_path).startswith("/org/bluez/")
+            and "/dev_" in str(eff_path)
+            and "Connected" not in changed
+            and any(k in changed for k in ("RSSI", "Name", "Alias", "Paired"))
+        ):
+            self._emit_scan_stream_for_path(str(eff_path), from_props=True)
+
+        if "Connected" not in changed:
             return
 
         connected = bool(changed["Connected"])
-        mac = self._extract_mac(path)
+        mac = self._extract_mac(path if path is not None else eff_path)
         if not mac:
             return
 
@@ -113,12 +142,47 @@ class DeviceManager:
         if self._char:
             self._char.push_status({"connected": list(self._all_connected())})
 
-    def _handle_new_connection(self, path: str, mac: str) -> None:
-        if mac in self.connected:
+    def _emit_scan_stream_for_path(self, path: str, *, from_props: bool) -> None:
+        """Log + SCAN_DEVICES while the app scan UI is active."""
+        if not self.scanning or not self._char:
+            return
+        mac = self._extract_mac(path)
+        if not mac:
+            return
+        key = mac.upper()
+        if key in self._scan_stream_announced:
+            return
+        try:
+            obj = self.bus.get_object(BLUEZ_SERVICE_NAME, path)
+            props_if = dbus.Interface(obj, DBUS_PROP_IFACE)
+            name = props_if.Get(DEVICE_INTERFACE, "Alias") or props_if.Get(DEVICE_INTERFACE, "Name")
+            paired = bool(props_if.Get(DEVICE_INTERFACE, "Paired"))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("scan stream: skip %s: %s", path, exc)
+            return
+        device_info = {"mac": mac, "name": name, "paired": paired}
+        if from_props:
+            log.info(
+                "[SCAN STREAM] Inquiry update %s (%s), paired=%s (RSSI/alias refresh on cached device)",
+                name,
+                mac,
+                paired,
+            )
+        else:
+            log.info("[SCAN STREAM] Discovered %s (%s), paired=%s", name, mac, paired)
+
+        if re.search(r"([0-9A-F]{2}-){2,}", name, re.IGNORECASE):
+            log.info("Filtering out device: %s", name)
             return
 
+        self._char.send_notification(Msg.SCAN_DEVICES, {"device": device_info})
+        self._scan_stream_announced.add(key)
+        log.info("Adding device: %s with name: %s", mac, name)
+
+    def _handle_new_connection(self, path: str, mac: str) -> None:
         dev_obj = self.bus.get_object(BLUEZ_SERVICE_NAME, path)
         dev_props = dbus.Interface(dev_obj, DBUS_PROP_IFACE)
+        dev_iface = dbus.Interface(dev_obj, DEVICE_INTERFACE)
 
         try:
             uuids = dev_props.Get(DEVICE_INTERFACE, "UUIDs")
@@ -136,28 +200,32 @@ class DeviceManager:
         adapter_prefix = adapter_prefix_from_path(path)
         others = [other for other in self._devices_on_adapter(adapter_prefix) if other != mac]
         if others:
-            other_path = f"{adapter_prefix}/dev_{others[0].replace(':', '_')}"
-            dbus.Interface(dev_obj, DEVICE_INTERFACE).Disconnect()
+            try:
+                dev_iface.Disconnect()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Disconnecting %s from busy adapter %s failed: %s", mac, adapter_prefix, exc)
             from syncsonic_ble.state_change.action_functions import remove_device_dbus
 
-            remove_device_dbus(other_path, self.bus)
+            remove_device_dbus(path, self.bus)
             log.warning(
-                "%s tried adapter %s but %s is already there, disconnecting and removing",
+                "%s tried adapter %s but %s is already there, disconnecting and removing new arrival",
                 mac,
                 adapter_prefix,
                 others[0],
             )
             return
 
-        self.connected.add(mac)
-        log.info("Tracking %s as connected, loopback deferred to FSM", mac)
+        if mac in self.connected:
+            log.info("Refreshing tracked connection for %s at %s", mac, path)
+        else:
+            self.connected.add(mac)
+            log.info("Tracking %s as connected, loopback deferred to FSM", mac)
         # Nudge BlueZ to actually negotiate A2DP. Phones in particular often
         # need an explicit ConnectProfile after the BR/EDR link comes up
         # before they expose their A2DP source. Best-effort: failure here is
         # not fatal because the LOOPBACK_SYNC handler will still try to set
         # things up, and the phone may already have A2DP up via another path.
         try:
-            dev_iface = dbus.Interface(dev_obj, DEVICE_INTERFACE)
             dev_iface.ConnectProfile(A2DP_UUID)
             log.info("Requested A2DP profile for %s", mac)
         except Exception as exc:  # noqa: BLE001
@@ -210,18 +278,7 @@ class DeviceManager:
             return
 
         if self.scanning and self._char:
-            obj = self.bus.get_object(BLUEZ_SERVICE_NAME, path)
-            props = dbus.Interface(obj, DBUS_PROP_IFACE)
-            name = props.Get(DEVICE_INTERFACE, "Alias") or props.Get(DEVICE_INTERFACE, "Name")
-            paired = bool(props.Get(DEVICE_INTERFACE, "Paired"))
-            device_info = {"mac": mac, "name": name, "paired": paired}
-            log.info("[SCAN STREAM] Discovered %s (%s), paired=%s", name, mac, paired)
-
-            if re.search(r"([0-9A-F]{2}-){2,}", name, re.IGNORECASE):
-                log.info("Filtering out device: %s", name)
-            else:
-                self._char.send_notification(Msg.SCAN_DEVICES, {"device": device_info})
-                log.info("Adding device: %s with name: %s", mac, name)
+            self._emit_scan_stream_for_path(path, from_props=False)
             return
 
         if mac.upper() not in self.connected:

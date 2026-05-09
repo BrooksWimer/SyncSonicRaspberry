@@ -18,6 +18,13 @@ Durable cross-workstream facts, decisions, and conventions. Operator-editable; p
 - Maverick config `control-plane.shared.json` rewritten with six new durable epics (`feature-hardening`, `ui-polish`, `custom-hardware-design`, `patent-application`, `ultrasonic-runtime-sync`, `spatial-audio-awareness`) all branching from `main`.
 - The Pi service is unaffected by the branch rewrite — it doesn't pull from git, it gets manual `tar`-snapshot deploys, and the file content on disk is identical to `main`.
 
+## 2026-05-09 - Lane structure: ten first-class lanes, not six
+
+- The four lanes inherited from the pre-rewrite epic structure (`pipewire-stability`, `startup-mic`, `runtime-ultrasonic`, `wifi-manual`) are now **first-class lanes alongside the six post-rewrite ones**, not historical/retired ones.
+- Their v1 implementations were a success and are merged into the coordinated engine on `main`. That's the floor for this work, not the ceiling. Each lane has ongoing forward work (e.g., `wifi-manual` extends to TVs and other Wi-Fi audio targets beyond Sonos; `pipewire-stability` tracks ongoing drift across PipeWire upgrades; `startup-mic` covers ongoing mic calibration improvements; `runtime-ultrasonic` carries the v1 experimentation context for revisits adjacent to `ultrasonic-runtime-sync`).
+- Branch convention: each first-class lane has a branch named identically to the lane id, all based off the latest `main`. Old `epic/01..04` branches are kept as historical references; new work branches from `main`, not from those.
+- Total durable lanes: 10. Maverick `control-plane.shared.json` registers all 10 with their respective Discord forum threads.
+
 ## Historical epic charters
 
 The five files under `epics/01..05-*.md` describe the lanes before the 2026-05-05 rewrite. They are preserved for context and should not be deleted. New planning calls reference the new charters under the same `epics/` directory.

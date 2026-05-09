@@ -4,11 +4,11 @@ _The strategic context for hardening — North Star, three horizons, design prin
 
 ## Goal
 
-Take the working coordinated engine (deployed on the Pi, North Star reached) and make it survive contact with realities the operator's living room hasn't tested: degraded networks, controller drift, partial service crashes, USB hub contention, partial speaker failures, 24-hour soak under varied speaker mixes. Turn "works on this Pi" into "works on a stranger's Pi after a clean install."
+Stress-test the boundaries of the coordinated engine and harden every failure path until the service runs unsupervised under degraded conditions, hardware variance, and long-soak operation. This lane is broad: it owns durability of the system as a whole — not just any one symptom. The "works on a stranger's Pi after a clean install" check is one specific scenario under this umbrella, not the framing.
 
 ## Why This Lane Exists
 
-The North Star was reached on 2026-05-01 with a specific hardware configuration, three specific speakers, one specific room, and one operator who knows where every cable goes. Turning that into something a stranger can plug in and use means closing every silent failure mode that's currently masked by `Restart=on-failure`, by manual snapshot-rollback, by the operator knowing which speaker to power-cycle, and by the operator being the only person watching the journal.
+A working system in the operator's living room is not the same as a durable one. Under stress — degraded networks, controller drift, USB hub contention, codec edge cases, partial speaker failures, hardware variance, 24-hour soak — the coordinated engine still has silent failure modes masked by `Restart=on-failure`, by manual snapshot-rollback, by the operator knowing which speaker to power-cycle, and by the operator being the only person watching the journal. This lane systematically finds those failure modes and closes them.
 
 ## In Scope
 

@@ -178,6 +178,13 @@ export const updateSpeakerSettings = (configId: number, mac: string, volume: num
     );
   };
 
+export const updateSpeakerName = (configId: number, mac: string, name: string): void => {
+  db.runSync(
+    `UPDATE speakers SET name = ? WHERE config_id = ? AND mac = ?;`,
+    [name.trim() || mac, configId, mac]
+  );
+};
+
   export const updateSpeakerConnectionStatus = (configId: number, mac: string, isConnected: boolean) => {
     db.runSync(
       `UPDATE speakers SET is_connected = ? WHERE config_id = ? AND mac = ?;`,

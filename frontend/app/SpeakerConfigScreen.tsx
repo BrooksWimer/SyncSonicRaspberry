@@ -1,5 +1,5 @@
 import { useSearchParams } from 'expo-router/build/hooks';
-import { Pencil, Volume1, Volume2, VolumeX } from '@tamagui/lucide-icons'
+import { Clock3, Pencil, Play, RefreshCw, Volume1, Volume2, VolumeX } from '@tamagui/lucide-icons'
 import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, Alert, TouchableOpacity, ScrollView, View, Dimensions, Platform, TextInput } from 'react-native';
 import Slider from '@react-native-community/slider';
@@ -1083,9 +1083,13 @@ export default function SpeakerConfigScreen() {
                 <YStack alignSelf="center" marginTop={12} marginBottom={8} width="90%">
                   <Button
                     backgroundColor={pc as any}
+                    borderRadius="$size.4"
                     color="white"
                     disabled={seqInFlight}
+                    height={48}
+                    icon={<Play size={18} color="white" />}
                     onPress={handleAlignAllStartupTune}
+                    pressStyle={{ opacity: 0.85, scale: 0.98 }}
                   >
                     <Text fontFamily="Finlandica" color="white">
                       {seqInFlight && seqTotal > 0
@@ -1096,9 +1100,13 @@ export default function SpeakerConfigScreen() {
                   <Button
                     marginTop={10}
                     backgroundColor={themeName === 'dark' ? '#3D2A55' : '#E8DCFA'}
+                    borderRadius="$size.4"
                     color={tc as any}
                     disabled={seqInFlight}
+                    height={48}
+                    icon={<RefreshCw size={18} color={tc} />}
                     onPress={handleAlignAllMusic}
+                    pressStyle={{ opacity: 0.85, scale: 0.98 }}
                   >
                     <Text fontFamily="Finlandica" color={tc}>
                       Align all (use playing music)
@@ -1116,17 +1124,22 @@ export default function SpeakerConfigScreen() {
             {Object.keys(connectedSpeakers).length >= 2 && (
               <YStack alignSelf="center" marginTop={12} marginBottom={8} width="90%">
                 <Button
-                  backgroundColor={pc as any}
-                  color="white"
-                  disabled={!connectedDevice}
+                  backgroundColor={themeName === 'dark' ? '#333333' : '#E5E5E5'}
+                  borderRadius="$size.4"
+                  color={stc as any}
+                  disabled
+                  height={48}
+                  icon={<Clock3 size={18} color={stc} />}
                   onPress={handleUltrasonicSync}
+                  opacity={0.72}
+                  pressStyle={{ opacity: 0.85, scale: 0.98 }}
                 >
-                  <Text fontFamily="Finlandica" color="white">
-                    Auto-sync speakers
+                  <Text fontFamily="Finlandica" color={stc}>
+                    Auto-sync speakers - coming soon
                   </Text>
                 </Button>
                 <Body center style={{ marginTop: 6, fontSize: 12, color: stc }}>
-                  Reserved for Epic 3. The neutral foundation keeps this UI visible but disables runtime auto-sync.
+                  Epic 3 runtime ultrasonic alignment placeholder.
                 </Body>
               </YStack>
             )}

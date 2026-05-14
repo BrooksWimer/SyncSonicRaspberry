@@ -121,19 +121,33 @@ class DeviceManager:
         if "Connected" not in changed:
             return
 
+        # Both `path` (the explicit signal arg) and `eff_path` (the *args[3]
+        # fallback) may be None depending on which BlueZ signal variant
+        # fired. Prefer path; fall back to eff_path; bail if neither was
+        # populated. We need a real BlueZ object path to call
+        # `_handle_new_connection`, not just to extract the MAC.
+        resolved_path = path if path is not None else eff_path
+        if resolved_path is None:
+            return
+
         connected = bool(changed["Connected"])
-        mac = self._extract_mac(path if path is not None else eff_path)
+        path_str = str(resolved_path)
+        mac = self._extract_mac(path_str)
         if not mac:
             return
 
         log.info("[BlueZ] %s is now %s", mac, "CONNECTED" if connected else "DISCONNECTED")
         emit(
             EventType.BLUEZ_CONNECT if connected else EventType.BLUEZ_DISCONNECT,
-            {"mac": mac, "path": path},
+            {"mac": mac, "path": path_str},
         )
 
         if connected:
-            self._handle_new_connection(path, mac)
+            # Previously this passed `path` (the explicit signal arg) which
+            # could be None when the signal variant only populated *args[3].
+            # Use the resolved-then-stringified version so
+            # `_handle_new_connection(path: str, mac: str)` is honored.
+            self._handle_new_connection(path_str, mac)
         else:
             self._handle_disconnection(mac)
 

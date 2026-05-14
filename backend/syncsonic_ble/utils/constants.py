@@ -2,10 +2,15 @@
 from enum import IntEnum
 import os
 
-# Getting reserved vaiable
-reserved = os.getenv("RESERVED_HCI")
-if not reserved:
+# Phone-adapter reservation. Read from env at import time and narrowed to a
+# non-None `str` for the rest of the codebase. The `RESERVED_HCI` env var is
+# required because some adapters serve as the local control plane for the
+# operator's phone-paired connection and must not be claimed by the audio
+# fan-out path; see docs/maverick/PROJECT_MEMORY.md for the durable rule.
+_reserved_raw = os.getenv("RESERVED_HCI")
+if not _reserved_raw:
     raise RuntimeError("RESERVED_HCI not set – cannot pick phone adapter")
+reserved: str = _reserved_raw
 
 # D-Bus names / interfaces ---------------------------------------------------
 BLUEZ_SERVICE_NAME           = "org.bluez"

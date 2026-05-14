@@ -177,3 +177,59 @@ These are real gaps in operational tooling. A planning agent should suggest crea
 - **Do not restart `pipewire` / `wireplumber` directly** while a route is live. Restart `syncsonic.service` instead — it tears down filters cleanly.
 - **Do not modify code paths in `connection_manager.py` or `pipewire_transport.py`** without taking a pre-deploy snapshot first (per the snapshot pattern above).
 - **Do not edit logs/telemetry directly** to "make a problem look fixed." All claims of fix require fresh Pi validation evidence per AGENTS.md.
+
+## 2026-05-14 — Backend mypy baseline closed to zero errors (Pi-validated)
+
+Three passes through 2026-05-14 brought `python -m mypy --config-file backend/pyproject.toml syncsonic_ble measurement` from **20 errors → 12 → 0** across 55 source files. Full audit history lives in `backend/MYPY_AUDIT.md` (kept as the canonical record). High-level closure:
+
+- Pass 1: established `pyproject.toml` `[tool.mypy]` config + per-module overrides for the `socket.AF_UNIX` Windows-typeshed false positive and the `DBusPathMixin` attribute pattern. Documented the 20-error baseline.
+- Pass 2: removed 6 stale `# type: ignore` comments (handled by `ignore_missing_imports = true` now) + 2 trivial empty-literal annotations (`config_speaker_usage: dict[str, list[str]]`, `characteristics: list[dbus.service.Object]`).
+- Pass 3 (Pi-validated): closed the remaining 12 — `constants.reserved` narrowed at source so every `from … import reserved` resolves to `str`; `_require_bus()` helper raises a clear `RuntimeError` instead of letting `None.get_object(...)` crash deep inside dbus; explicit `device_path: str | None` declaration plus a guard before pair/trust/connect/remove that redirects to discovery if None; `_property_changed` resolves path once into `resolved_path` before passing to `_handle_new_connection`; `find_actual_sink_name() -> str | None` matches the function's real behavior. Pi-validated by fetching the branch into `/tmp/syncsonic-narrowing-check` on `syncsonic@10.0.0.89`, running `compileall` + smoke import that exercises both the constants narrowing and the `_require_bus()` error path; service was not restarted, fix flows to next deploy.
+
+Per `backend/MYPY_AUDIT.md`'s closing note: `check_untyped_defs = true` is now an isolated next-step decision rather than gated on fixing N existing bugs first.
+
+## 2026-05-14 — BLE protocol documented + cross-stack alignment now in CI
+
+`docs/BLE_PROTOCOL.md` was added today as the reverse-engineered wire-protocol reference. Captures:
+
+- Service / Characteristic / CCCD UUIDs.
+- Wire format diagram (1-byte type prefix + UTF-8 JSON body, base64-encoded).
+- 14 request types (every `Msg` in `HANDLERS` with body shape + expected response).
+- 10 notification types (every `Msg` pushed via `send_notification` from the backend, including the Slice 3.6 `COORDINATOR_STATE` + `COORDINATOR_EVENT` shapes mirrored from `proposals/05-coordinated-engine-architecture.md`).
+- A 7-step checklist for adding a new message type without re-introducing drift.
+
+A protocol-alignment Jest test in `frontend/__tests__/protocol-alignment.test.ts` now parses `constants.py` (`Msg` IntEnum + `HANDLERS` dict) as text and asserts the frontend `MESSAGE_TYPES` matches. **New drift fails CI** — the test runs in the Jest job from the CI workflow added today.
+
+**Known documented drift:** `START_CLASSIC_PAIRING (0x66)` is declared in frontend `MESSAGE_TYPES` but has no entry in the backend `Msg` IntEnum or `HANDLERS` dict. The mobile can write a 0x66 message and the dispatcher will fall through to `_UNKNOWN_HANDLER`. Two resolution paths documented in `docs/BLE_PROTOCOL.md`:
+1. Drop `START_CLASSIC_PAIRING` from the frontend if classic pairing isn't intended to be a BLE-triggered flow (BlueZ usually handles it through the agent layer, not via app messages).
+2. Implement `handle_start_classic_pairing(...)` in `action_request_handlers.py` that accepts a target MAC and triggers BlueZ's pairing agent. Add `START_CLASSIC_PAIRING = 0x66` to `Msg`, register in `HANDLERS`, remove from the allowlist in the protocol-alignment test.
+
+The protocol-alignment test allowlists this single drift so the test stays green while you decide; remove the allowlist entry as soon as the gap closes.
+
+## 2026-05-14 — UTF-8 BLE encoder bug fixed + frontend has Jest tests
+
+`frontend/utils/ble_codec.ts` `encode()` was sizing its Uint8Array by `json.length` (UTF-16 code units) but writing UTF-8 bytes into it. Any non-ASCII payload — speaker nicknames with emoji or accented characters, Japanese calibration phase labels in `CALIBRATION_RESULT` — threw `RangeError: offset is out of bounds`. Fix: size by `TextEncoder().encode(json).byteLength`, then write that array. Decoder was already byte-correct (used `TextDecoder` on the byte slice).
+
+Backfilled the frontend's first Jest test suite at the same time: `frontend/__tests__/ble_codec.test.ts` with 11 tests covering encode wire format, decode happy + empty paths, full roundtrips (including the unicode regression case, base64-overlapping characters, and every `MESSAGE_TYPES` value used as the type byte).
+
+Suite total: 15 frontend tests (11 codec + 4 protocol-alignment). All run in the new Jest CI job.
+
+## 2026-05-14 — First CI for the repo + Pi-deploy verification baseline matches
+
+`.github/workflows/ci.yml` was added today with two jobs:
+
+- **Frontend** (`frontend/`): `npm ci` → `npm run lint` → `npx tsc --noEmit` → `npx jest --watchAll=false --passWithNoTests`.
+- **Backend** (`backend/`): `pip install -r requirements.txt && pip install pytest` → `python -m compileall syncsonic_ble measurement` → `python -m pytest measurement -v`.
+
+Triggers on push to `main`, `epic/**`, `feature-hardening`, `ui-polish`, and all PRs. Concurrency group cancels stale runs on the same ref. Pi hardware validation is **explicitly outside CI** per the AGENTS.md verification baseline — CI is the static / pure-logic surface only.
+
+The CI matches the AGENTS.md "Verification Baseline" section exactly, so green CI is the same green an operator would see running the commands locally.
+
+## 2026-05-14 — Live operational observations
+
+Read-only audit on `syncsonic@10.0.0.89` (4-day Pi uptime, 10h service uptime, JBL Flip 6 + VIZIO SB2020n connected at 100% volume but no active stream — silent state). Captured here for future hardening work:
+
+- **`virtual_out-74` PipeWire xrun cadence: ~10/24h.** Nine of ten xruns are on the delay-node sink; one was an upstream `alsa_input.usb-Jieli` xrun on the measurement mic input. Sparse (~1 every 2.4 hours) — not a sustained issue but worth a feature-hardening look. Concrete signal H1.
+- **BT auto-disconnects: 4/24h.** Pattern of note: `A8:41:F4:F8:E1:18` disconnected → reconnected → disconnected within 24 seconds at 01:24 EDT. Flap pattern. The 2026-05-14 narrowing fix in `connection_manager.py` adds a `device_path is None → run_discovery` guard that should make the recovery path more predictable, but the underlying flap cause (RSSI dip? speaker timeout? router roaming?) is unresolved.
+- **Service errors: 0** in the last 24 hours. `journalctl -u syncsonic.service -p err` returned no entries.
+- **Disk usage: 6%** of 114 GB. Snapshot dir empty. H7 ("snapshot disk pressure") is not active.

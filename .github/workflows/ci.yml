@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "epic/**"
+      - "feature-hardening"
+      - "ui-polish"
+  pull_request:
+
+# Cancel in-progress runs on the same branch when a new push lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (lint + typecheck + jest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Mirrors AGENTS.md "Verification Baseline > Frontend". `expo lint`
+      # exits 0 on warnings (currently 83 pre-existing); only fails on
+      # actual lint errors.
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      # `--passWithNoTests` keeps the job green if a slice introduces a new
+      # package with no tests yet; existing tests still must pass.
+      - name: Jest
+        run: npx jest --watchAll=false --passWithNoTests
+
+  backend:
+    name: Backend (compileall + pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      # Mirrors AGENTS.md "Verification Baseline > Backend". Confirms every
+      # module under syncsonic_ble + measurement compiles cleanly under
+      # the runner's Python version before tests start.
+      - name: Compile-all
+        run: python -m compileall syncsonic_ble measurement
+
+      # Discovers `def test_*` functions across the backend. Today only
+      # `measurement/test_analyze_lag.py` ships tests (7 cases, no Pi
+      # required); pytest will run them and stay green when new test
+      # files land next to existing logic.
+      - name: pytest
+        run: python -m pytest measurement -v

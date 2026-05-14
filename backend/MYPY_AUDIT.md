@@ -1,6 +1,8 @@
 # SyncSonic backend — mypy audit baseline
 
-Baseline captured **2026-05-14** by running:
+Baseline captured **2026-05-14**. Initial pass found **20 errors across 11 files**; the same-day follow-up cleanup pass removed 8 of those (6 stale `# type: ignore` comments + 2 trivial annotation gaps), leaving **12 errors across 5 files** as of the latest mypy run.
+
+Run:
 
 ```bash
 cd backend
@@ -12,10 +14,10 @@ Config: see [`pyproject.toml`](pyproject.toml) `[tool.mypy]`. Briefly:
 - `python_version = "3.11"` (matches the Pi runtime)
 - `ignore_missing_imports = true` (dbus / BlueZ helpers lack stubs)
 - `explicit_package_bases = true` (required for the flat `syncsonic_ble/` + `measurement/` layout)
-- `check_untyped_defs = false` — gradual adoption; flipping this to `true` today raises the noise floor from ~20 errors to >100. Plan: fix the 14 real errors below, then flip the flag.
+- `check_untyped_defs = false` — gradual adoption; flipping this to `true` today raises the noise floor from 12 errors to >100. Plan: fix the remaining 10 real errors below, then flip the flag.
 - `warn_unused_ignores = true` (catches stale `# type: ignore` comments)
 
-**Total:** 20 errors across 11 files. **No mypy errors are intentional silences yet** — they're real findings to triage.
+**Current total:** 12 errors across 5 files. All 12 are real findings, not intentional silences.
 
 ## Real type-narrowing bugs (8)
 
@@ -48,44 +50,35 @@ Suggests the calling code resolves a MAC via `.get(...)` or similar pattern that
 
 Same pattern: D-Bus property reads return `Any | None`, callers don't narrow.
 
-## Real annotation gaps (3)
+## Real annotation gaps (2 remaining)
 
 ### `syncsonic_ble/helpers/pulseaudio_helpers.py:132`
 
 - `Incompatible return value type (got "None", expected "str")` — `[return-value]`
 
-A return path falls through to an implicit `None` while the function is typed to return `str`. Either narrow the type to `Optional[str]` or add a fallback return.
-
-### `syncsonic_ble/state_change/action_planning.py:33`
-
-- `Need type annotation for "config_speaker_usage" (hint: "config_speaker_usage: dict[<type>, <type>] = ...")` — `[var-annotated]`
-
-Empty-dict literal needs a type hint so subsequent assignments can be checked.
-
-### `syncsonic_ble/infra/gatt_service.py:76`
-
-- `Need type annotation for "characteristics"` — `[var-annotated]`
-
-Empty-list literal on `GattService.characteristics`. Likely wants `list[Characteristic]` once that type is in scope.
+A return path falls through to an implicit `None` while the function is typed to return `str`. Either narrow the type to `Optional[str]` or add a fallback return. Touches the PulseAudio sink path — has runtime impact, defer to a slice with operator review.
 
 ### `syncsonic_ble/main.py:64`
 
 - `List item 1 has incompatible type "str | None"; expected "str | bytes | PathLike[str] | PathLike[bytes]"` — `[list-item]`
 
-`subprocess`-style argv being built with a potentially-None element. Narrow upstream.
+`subprocess`-style argv being built with a potentially-None element. Narrow upstream. Touches process startup; defer.
 
-## Unused `# type: ignore` comments (5)
+### Fixed in the same-day cleanup pass
 
-These are stale comments — mypy used to flag the call as broken, but with current stubs / config it doesn't anymore. Safe to delete in a cleanup pass:
+- ~~`syncsonic_ble/state_change/action_planning.py:33`~~ — typed as `dict[str, list[str]]` based on `.setdefault(dev_mac, []).append(ctrl_mac)` usage at line 70.
+- ~~`syncsonic_ble/infra/gatt_service.py:76`~~ — typed as `list[dbus.service.Object]` matching `add_characteristic(ch: dbus.service.Object)`.
 
-- `syncsonic_ble/helpers/sonos_discovery.py:24`
-- `syncsonic_ble/helpers/sonos_controller.py:37`
-- `measurement/calibrate_one.py:401`
-- `measurement/calibrate_one.py:661`
-- `measurement/calibrate_anchor.py:178`
-- `measurement/calibrate_anchor.py:197`
+## Unused `# type: ignore` comments (all 6 removed in same-day cleanup)
 
-(6 occurrences across 4 files.)
+These were stale — mypy used to flag the call as broken, but with `ignore_missing_imports = true` they're handled at the config layer and the inline ignore is redundant. Removed in the cleanup pass:
+
+- ~~`syncsonic_ble/helpers/sonos_discovery.py:24`~~ — `import soco.discovery`
+- ~~`syncsonic_ble/helpers/sonos_controller.py:37`~~ — `import soco`
+- ~~`measurement/calibrate_one.py:401`~~ — `from syncsonic_ble.helpers import sonos_controller`
+- ~~`measurement/calibrate_one.py:661`~~ — `from measurement.analyze_lag import ...`
+- ~~`measurement/calibrate_anchor.py:178`~~ — `from syncsonic_ble.helpers import sonos_controller`
+- ~~`measurement/calibrate_anchor.py:197`~~ — `from syncsonic_ble.helpers import sonos_controller`
 
 ## Suppressed by per-module overrides
 
@@ -94,15 +87,13 @@ The `pyproject.toml` has narrow `disable_error_code = ["attr-defined"]` override
 1. **`syncsonic_ble.infra.gatt_service`** — DBusPathMixin reads `self.path` defined in mixed-in subclasses. Modeling this properly needs a `Protocol[path: str]` declaration; not blocking.
 2. **`measurement._filter_ctl`, `measurement.calibrate_one`, `syncsonic_ble.helpers.pipewire_transport`, `syncsonic_ble.coordinator.coordinator`** — `socket.AF_UNIX` is Linux/Mac-only. The Pi is Linux, so this is correct at runtime. mypy on a Windows host reads the Windows typeshed and reports `AF_UNIX` as missing; on Linux CI runners it would type-check cleanly. Override silences the false positive without losing other coordinator / pipewire type checks.
 
-## How to fix
+## How to fix (remaining 10)
 
-1. **Connection / device manager `str | None` (8 errors)** — bulk-fix by adding `assert mac is not None, "mac required"` near the top of each helper call site, OR narrowing the caller path so MACs are guaranteed before the D-Bus boundary.
-2. **`pulseaudio_helpers.py:132` return type** — decide between widening the return to `Optional[str]` (lets callers see the failure mode) or keeping `str` and adding a fallback. Trade-off is whether silent fallback or explicit-None-handling is the desired contract.
-3. **Three `var-annotated` errors** — add the explicit type hints. Trivially mechanical.
-4. **Five unused `# type: ignore` comments** — delete them; mypy will re-flag if the underlying error reappears.
-5. **`main.py:64` list-item** — narrow the argv source so it can't carry `None`.
+1. **Connection / device manager `str | None` (8 errors)** — bulk-fix by adding `assert mac is not None, "mac required"` near the top of each helper call site, OR narrowing the caller path so MACs are guaranteed before the D-Bus boundary. **Pi validation recommended** because these touch BlueZ pairing flow.
+2. **`pulseaudio_helpers.py:132` return type** — decide between widening the return to `Optional[str]` (lets callers see the failure mode) or keeping `str` and adding a fallback. Trade-off is whether silent fallback or explicit-None-handling is the desired contract. Touches PulseAudio sink lookup; runtime-sensitive.
+3. **`main.py:64` list-item** — narrow the argv source so it can't carry `None`. Touches process startup; behavior-sensitive.
 
-Once the eight `[arg-type]` and `[union-attr]` errors are fixed, flipping `check_untyped_defs = true` is the right next step. That will surface the much larger backlog of implicit-`Any` function bodies, but at least the type-narrowing bugs are gone first.
+Once the 8 `[arg-type]` / `[union-attr]` errors are fixed, flipping `check_untyped_defs = true` is the right next step. That will surface the much larger backlog of implicit-`Any` function bodies, but at least the type-narrowing bugs are gone first.
 
 ## Not in CI yet
 

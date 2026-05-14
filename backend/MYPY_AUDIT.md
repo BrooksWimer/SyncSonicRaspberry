@@ -1,6 +1,10 @@
 # SyncSonic backend — mypy audit baseline
 
-Baseline captured **2026-05-14**. Initial pass found **20 errors across 11 files**; the same-day follow-up cleanup pass removed 8 of those (6 stale `# type: ignore` comments + 2 trivial annotation gaps), leaving **12 errors across 5 files** as of the latest mypy run.
+Captured **2026-05-14**. Three passes brought the count from **20 errors → 12 → 0**:
+
+1. **Initial pass** found 20 errors across 11 files.
+2. **Same-day cleanup** removed 8 (6 stale `# type: ignore` comments + 2 trivial annotation gaps).
+3. **Pi-validated narrowing pass** (later same day) closed the remaining 12 — all real `str | None` / `Any | None` narrowing gaps in the BlueZ pairing flow, plus the `_BUS` lazy-init guard and the `pulseaudio_helpers.find_actual_sink_name` return type. Validated on the live Pi via `python -m compileall` + import smoke test against the running service tree.
 
 Run:
 
@@ -14,55 +18,55 @@ Config: see [`pyproject.toml`](pyproject.toml) `[tool.mypy]`. Briefly:
 - `python_version = "3.11"` (matches the Pi runtime)
 - `ignore_missing_imports = true` (dbus / BlueZ helpers lack stubs)
 - `explicit_package_bases = true` (required for the flat `syncsonic_ble/` + `measurement/` layout)
-- `check_untyped_defs = false` — gradual adoption; flipping this to `true` today raises the noise floor from 12 errors to >100. Plan: fix the remaining 10 real errors below, then flip the flag.
+- `check_untyped_defs = false` — gradual; the suite is at zero errors with the flag off. Flipping `true` is the next step and is now an isolated decision rather than a "fix N existing bugs first" project.
 - `warn_unused_ignores = true` (catches stale `# type: ignore` comments)
 
-**Current total:** 12 errors across 5 files. All 12 are real findings, not intentional silences.
+**Current total: 0 errors across 55 source files.** Notes about `[annotation-unchecked]` from untyped function bodies are informational — they vanish if you flip `check_untyped_defs = true` and accept the larger backlog those will surface.
 
-## Real type-narrowing bugs (8)
+## Real type-narrowing bugs (all 8 resolved in the third pass)
 
-These are the highest-priority items. Each is a `str | None` (or `Any | None`) being passed to a function that expects a non-null `str`. Today they "work" because the callers happen to filter null upstream — but a refactor could break it without warning.
+Each was a `str | None` (or `Any | None`) being passed to a function that expected a non-null `str`. Most "worked" in practice because upstream control flow narrowed at runtime — but a refactor or unexpected D-Bus signal variant would crash the BlueZ pairing path opaquely. All fixed and Pi-validated.
 
-### `syncsonic_ble/helpers/adapter_helpers.py`
+### ~~`syncsonic_ble/helpers/adapter_helpers.py`~~ — RESOLVED
 
-- **line 61** — `Item "None" of "Any | None" has no attribute "get_object"` — `[union-attr]`
-- **line 67** — same, second call site.
+- ~~**line 61** — `Item "None" of "Any | None" has no attribute "get_object"`~~
+- ~~**line 67** — same, second call site.~~
 
-Likely a missing `if proxy is None: return` guard before `.get_object(...)`.
+**Fix:** Added a `_require_bus()` helper that raises a clear `RuntimeError` if `set_bus()` hasn't been called yet, instead of letting `None.get_object(...)` crash deep inside the dbus library with an opaque `AttributeError`. Same pattern propagated to `reset_adapter` at line ~97.
 
-### `syncsonic_ble/state_management/connection_manager.py`
+### ~~`syncsonic_ble/state_management/connection_manager.py`~~ — RESOLVED
 
-Six call sites passing a potentially-None MAC string into the BlueZ D-Bus helpers:
+Six call sites passing a potentially-None `device_path` into the BlueZ D-Bus helpers; one more emerged at line 569 (`remove_device_dbus`) when `device_path_on_adapter()` was re-invoked mid-flow.
 
-- **line 500** — `Argument 1 to "pair_device_dbus" has incompatible type "str | None"; expected "str"` — `[arg-type]`
-- **line 510** — `remove_device_dbus`
-- **line 521** — `trust_device_dbus`
-- **line 536** — `connect_device_dbus`
-- **line 545** — `remove_device_dbus`
-- **line 603** — `remove_device_dbus`
+**Fix:** Declared `device_path: str | None` explicitly at initialization. Added a guard before the state machine's pair/trust/connect branches: if `device_path` is None at that point, log a warning and redirect to `run_discovery` rather than diving into BlueZ with a None argument. Inside the connect-success path, the `refreshed = device_path_on_adapter(...)` is only assigned if non-None — falling back to the most-recent-good path when BlueZ has already torn down the Device1 object (a race during connection state changes).
 
-Suggests the calling code resolves a MAC via `.get(...)` or similar pattern that returns `Optional[str]` and never narrows before the D-Bus call. Fix: narrow with an early-return guard or `assert mac is not None`.
+### ~~`syncsonic_ble/state_management/device_manager.py`~~ — RESOLVED
 
-### `syncsonic_ble/state_management/device_manager.py`
+- ~~**line 125** — `Argument 1 has incompatible type "Any | None"; expected "str"`~~
+- ~~**line 136** — `Argument 1 to "_handle_new_connection" has incompatible type "Any | None"; expected "str"`~~
 
-- **line 125** — `Argument 1 has incompatible type "Any | None"; expected "str"` — `[arg-type]`
-- **line 136** — `Argument 1 to "_handle_new_connection" of "DeviceManager" has incompatible type "Any | None"; expected "str"` — `[arg-type]`
+**Fix:** Resolve `path if path is not None else eff_path` once into `resolved_path`, bail early if both are None, then stringify into `path_str` for the `_handle_new_connection` and `_extract_mac` calls. Line 136 previously passed `path` directly which could be None when only `*args[3]` was populated — now passes the resolved value.
 
-Same pattern: D-Bus property reads return `Any | None`, callers don't narrow.
+## Real annotation gaps (all resolved)
 
-## Real annotation gaps (2 remaining)
+### ~~`syncsonic_ble/helpers/pulseaudio_helpers.py:132`~~ — RESOLVED
 
-### `syncsonic_ble/helpers/pulseaudio_helpers.py:132`
+**Fix:** Changed `find_actual_sink_name() -> str` to `-> str | None` to match reality (it does fall through to `return None` when no sink matches the prefix). The callers already check `if actual_sink_name:` before using the result, so no behavioral change — the previous lie about return type was the only issue.
 
-- `Incompatible return value type (got "None", expected "str")` — `[return-value]`
+### ~~`syncsonic_ble/main.py:64`~~ — RESOLVED
 
-A return path falls through to an implicit `None` while the function is typed to return `str`. Either narrow the type to `Optional[str]` or add a fallback return. Touches the PulseAudio sink path — has runtime impact, defer to a slice with operator review.
+`subprocess.run(["hciconfig", reserved, "name", "SyncSonic"], ...)` complained because `reserved` was typed as `str | None` (imported from `constants.reserved`, which was `os.getenv("RESERVED_HCI")` — mypy didn't recognize the post-init `if not reserved: raise RuntimeError` as proof of non-None).
 
-### `syncsonic_ble/main.py:64`
+**Fix:** Narrowed at the source in `constants.py`:
 
-- `List item 1 has incompatible type "str | None"; expected "str | bytes | PathLike[str] | PathLike[bytes]"` — `[list-item]`
+```python
+_reserved_raw = os.getenv("RESERVED_HCI")
+if not _reserved_raw:
+    raise RuntimeError("RESERVED_HCI not set – cannot pick phone adapter")
+reserved: str = _reserved_raw
+```
 
-`subprocess`-style argv being built with a potentially-None element. Narrow upstream. Touches process startup; defer.
+The explicit `str` annotation on the post-narrow assignment propagates through every `from ... import reserved` site, fixing this error without any change at the call site.
 
 ### Fixed in the same-day cleanup pass
 
@@ -87,13 +91,9 @@ The `pyproject.toml` has narrow `disable_error_code = ["attr-defined"]` override
 1. **`syncsonic_ble.infra.gatt_service`** — DBusPathMixin reads `self.path` defined in mixed-in subclasses. Modeling this properly needs a `Protocol[path: str]` declaration; not blocking.
 2. **`measurement._filter_ctl`, `measurement.calibrate_one`, `syncsonic_ble.helpers.pipewire_transport`, `syncsonic_ble.coordinator.coordinator`** — `socket.AF_UNIX` is Linux/Mac-only. The Pi is Linux, so this is correct at runtime. mypy on a Windows host reads the Windows typeshed and reports `AF_UNIX` as missing; on Linux CI runners it would type-check cleanly. Override silences the false positive without losing other coordinator / pipewire type checks.
 
-## How to fix (remaining 10)
+## How to fix — historical (kept for reference)
 
-1. **Connection / device manager `str | None` (8 errors)** — bulk-fix by adding `assert mac is not None, "mac required"` near the top of each helper call site, OR narrowing the caller path so MACs are guaranteed before the D-Bus boundary. **Pi validation recommended** because these touch BlueZ pairing flow.
-2. **`pulseaudio_helpers.py:132` return type** — decide between widening the return to `Optional[str]` (lets callers see the failure mode) or keeping `str` and adding a fallback. Trade-off is whether silent fallback or explicit-None-handling is the desired contract. Touches PulseAudio sink lookup; runtime-sensitive.
-3. **`main.py:64` list-item** — narrow the argv source so it can't carry `None`. Touches process startup; behavior-sensitive.
-
-Once the 8 `[arg-type]` / `[union-attr]` errors are fixed, flipping `check_untyped_defs = true` is the right next step. That will surface the much larger backlog of implicit-`Any` function bodies, but at least the type-narrowing bugs are gone first.
+All 12 baseline errors are resolved as of the 2026-05-14 narrowing pass. The remaining gradual-adoption step is flipping `check_untyped_defs = true` in `pyproject.toml` and addressing the implicit-`Any` function bodies that flag surfaces (currently informational `[annotation-unchecked]` notes, not errors). That's an isolated decision now — no real bugs need fixing first.
 
 ## Not in CI yet
 

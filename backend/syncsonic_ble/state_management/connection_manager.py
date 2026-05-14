@@ -439,7 +439,15 @@ class ConnectionService:
         logger.info("FSM: reconnect %s via %s", dev_mac, adapter_mac)
 
         state = analyze_device(self.bus, adapter_mac, dev_mac)
-        device_path = device_path_on_adapter(self.bus, adapter_mac, dev_mac)
+        # device_path_on_adapter() can return None if BlueZ doesn't know about
+        # the device yet — that's the normal case when the FSM starts in
+        # `run_discovery`. Initialise as None and let the discovery branch
+        # populate it via `device_path = path` once wait_for_device returns
+        # a real path. Every branch below that consumes `device_path` (pair /
+        # trust / connect / removal) only runs after we've successfully
+        # discovered, so a guard there narrows the type for the type checker
+        # without changing runtime behavior.
+        device_path: str | None = device_path_on_adapter(self.bus, adapter_mac, dev_mac)
         max_retry = 3
         attempt = 0
 
@@ -491,6 +499,22 @@ class ConnectionService:
                 state = "pair"
                 continue
 
+            # By this point we're past the discovery branch, which is the
+            # only path that can leave device_path as None (analyze_device
+            # returns "run_discovery" exactly in that case). If somehow we
+            # reached pair/trust/connect/remove without a device_path,
+            # treat that as a discovery-needed condition rather than
+            # crashing inside BlueZ.
+            if device_path is None:
+                logger.warning(
+                    "FSM: %s reached state=%s without a device_path; "
+                    "redirecting to discovery",
+                    dev_mac,
+                    state,
+                )
+                state = "run_discovery"
+                continue
+
             if state == "pair":
                 if self._char:
                     self._char.send_notification(
@@ -534,7 +558,15 @@ class ConnectionService:
                         {"phase": "connect_start", "device": dev_mac},
                     )
                 if connect_device_dbus(device_path, self.bus):
-                    device_path = device_path_on_adapter(self.bus, adapter_mac, dev_mac)
+                    # device_path_on_adapter can lose the path here if BlueZ
+                    # has already torn down the Device1 object (race during
+                    # connection state changes). When that happens the path
+                    # we just connected against is the most recent good
+                    # path — fall back to it rather than dropping into the
+                    # `bus.get_object(None, ...)` runtime crash.
+                    refreshed = device_path_on_adapter(self.bus, adapter_mac, dev_mac)
+                    if refreshed is not None:
+                        device_path = refreshed
                     dev_obj = self.bus.get_object(BLUEZ_SERVICE_NAME, device_path)
                     dev_iface = Interface(dev_obj, DEVICE_INTERFACE)
 

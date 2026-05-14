@@ -398,7 +398,7 @@ def _mute_sonos_devices(device_ids: List[str], muted: bool) -> List[str]:
     if not device_ids:
         return []
     try:
-        from syncsonic_ble.helpers import sonos_controller  # type: ignore
+        from syncsonic_ble.helpers import sonos_controller
     except ImportError:
         return []
     out: List[str] = []
@@ -658,7 +658,7 @@ def _calibrate_blocking(
     # Import the analyzer lazily so a calibration that never runs
     # doesn't pull scipy into syncsonic_ble's startup path.
     try:
-        from measurement.analyze_lag import (  # type: ignore
+        from measurement.analyze_lag import (
             estimate_lag_samples, load_wav_mono,
         )
     except ImportError as exc:

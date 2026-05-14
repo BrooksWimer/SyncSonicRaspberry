@@ -21,7 +21,7 @@ def discover_sonos(timeout: int = 5) -> List[Dict[str, Any]]:
     Empty list on missing soco, scan failure, or no devices.
     """
     try:
-        import soco.discovery  # type: ignore
+        import soco.discovery
     except ImportError:
         log.warning("[WiFiScan] soco not installed; cannot discover Sonos")
         return []

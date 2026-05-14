@@ -175,7 +175,7 @@ def _boost_sonos_volumes(
     if not wifi_device_ids:
         return saved
     try:
-        from syncsonic_ble.helpers import sonos_controller  # type: ignore
+        from syncsonic_ble.helpers import sonos_controller
     except ImportError:
         return saved
     for d in wifi_device_ids:
@@ -194,7 +194,7 @@ def _restore_sonos_volumes(saved: Dict[str, int]) -> None:
     if not saved:
         return
     try:
-        from syncsonic_ble.helpers import sonos_controller  # type: ignore
+        from syncsonic_ble.helpers import sonos_controller
     except ImportError:
         return
     for d, prev in saved.items():

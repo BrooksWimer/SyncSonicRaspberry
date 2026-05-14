@@ -34,7 +34,7 @@ def _uid_from_device_id(device_id: str) -> Optional[str]:
 def _get_speaker_for_uid(uid: str):
     """Return a SoCo speaker for *uid*, caching the instance for reuse."""
     try:
-        import soco  # type: ignore
+        import soco
     except ImportError:
         log.error("[Sonos] soco not installed")
         return None

@@ -122,18 +122,29 @@ Remote mutating actions such as copying files, restarting services, changing pac
 or editing remote config are in scope, but they should leave a clear approval trail and
 must be called out in verification notes.
 
-## Current Strategic Epics
+## Current Strategic Lanes
 
-Current Maverick development lanes are:
+Since the 2026-05-09 branch-model elevation, SyncSonic has **ten first-class lanes** (six post-North-Star + four historical epics promoted to ongoing-work status). See `docs/maverick/WORKSTREAM_MODEL.md` for the full table and `config/control-plane.shared.json` for the canonical Maverick registration.
 
-- PipeWire transport stability and better latency application behavior
-- startup microphone auto-alignment with human-audible sounds
-- runtime ultrasonic auto-alignment during playback
-- Wi-Fi speaker support with manual alignment before automation
+**Post-North-Star lanes:**
 
-Other product work such as UI polish, commercial readiness, custom hardware,
-cost mapping, GTM planning, and patent-related drafts may still happen, but
-feature implementation work should stay inside one epic lane at a time.
+- `feature-hardening` — operational hardening of the coordinated engine
+- `ui-polish` — mobile/Expo fit-and-finish
+- `custom-hardware-design` — enclosure / board / BOM (mostly design)
+- `patent-application` — patent drafting + prior-art research
+- `ultrasonic-runtime-sync` — port ultrasonic playback-time correction into the coordinated engine
+- `spatial-audio-awareness` — exploratory: room mapping, mic-driven shape adjustment
+
+**Historical epic lanes elevated 2026-05-09 (v1 in main, forward work ongoing):**
+
+- `pipewire-stability` — ongoing PipeWire transport stability work
+- `startup-mic` — chirp + music anchor calibration improvements
+- `runtime-ultrasonic` — historical experimentation lane (parallel to ultrasonic-runtime-sync)
+- `wifi-manual` — Wi-Fi speakers beyond Sonos
+
+All ten lanes share the same Pi-validation rule, verification baseline, and workstream protocol documented in the rest of this file. Feature implementation should stay inside one lane at a time.
+
+Other product work such as commercial readiness, cost mapping, and GTM planning may still happen, but should not mix into a feature-implementation workstream.
 
 ## Workstream Protocol
 

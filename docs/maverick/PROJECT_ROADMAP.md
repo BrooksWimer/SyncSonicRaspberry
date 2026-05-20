@@ -52,6 +52,8 @@ The North Star is reached. From here, the work is hardening the coordinated engi
 
 **Scope.** Ultrasonic burst generator that integrates with the playback graph (psychoacoustic masking + speaker bandwidth gating), runtime measurement that doesn't require muting, bounded runtime correction (cap ±50 ppm rate adjustment), UX switch + "drift correction: on" status pill in `SpeakerConfigScreen.tsx`. Open question still active: ultrasonic vs in-band/quiet-region — small experiment before committing.
 
+**Status (2026-05-19).** Slice 0 complete — open question resolved. See [`epics/ultrasonic-runtime-sync.md`](epics/ultrasonic-runtime-sync.md) "Slice 0 Findings" for the conclusion and slice-1 architecture.
+
 **Success signal.** A system that holds 3-speaker alignment within audible threshold over a 1-hour music session without operator intervention.
 
 **Lane.** [`ultrasonic-runtime-sync`](epics/ultrasonic-runtime-sync.md) → branches from `main`. Architecturally downstream of the coordinated engine (already shipped on `main`).

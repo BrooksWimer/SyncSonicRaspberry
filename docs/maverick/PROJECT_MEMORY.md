@@ -233,3 +233,7 @@ Read-only audit on `syncsonic@10.0.0.89` (4-day Pi uptime, 10h service uptime, J
 - **BT auto-disconnects: 4/24h.** Pattern of note: `A8:41:F4:F8:E1:18` disconnected → reconnected → disconnected within 24 seconds at 01:24 EDT. Flap pattern. The 2026-05-14 narrowing fix in `connection_manager.py` adds a `device_path is None → run_discovery` guard that should make the recovery path more predictable, but the underlying flap cause (RSSI dip? speaker timeout? router roaming?) is unresolved.
 - **Service errors: 0** in the last 24 hours. `journalctl -u syncsonic.service -p err` returned no entries.
 - **Disk usage: 6%** of 114 GB. Snapshot dir empty. H7 ("snapshot disk pressure") is not active.
+
+## 2026-05-19 — Slice 0 of `ultrasonic-runtime-sync` shipped
+
+Open-question experiment resolved. See [`epics/ultrasonic-runtime-sync.md`](epics/ultrasonic-runtime-sync.md) "Slice 0 Findings" for the conclusion + slice-1 architecture, and [`proposals/06-ultrasonic-vs-inband.md`](proposals/06-ultrasonic-vs-inband.md) for the raw experimental record.

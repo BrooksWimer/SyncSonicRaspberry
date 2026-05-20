@@ -234,20 +234,6 @@ Read-only audit on `syncsonic@10.0.0.89` (4-day Pi uptime, 10h service uptime, J
 - **Service errors: 0** in the last 24 hours. `journalctl -u syncsonic.service -p err` returned no entries.
 - **Disk usage: 6%** of 114 GB. Snapshot dir empty. H7 ("snapshot disk pressure") is not active.
 
-## 2026-05-19 — Slice 0 ultrasonic-vs-in-band experiment concluded
+## 2026-05-19 — Slice 0 of `ultrasonic-runtime-sync` shipped
 
-Pi-validated on `syncsonic@10.0.0.89` against the operator's worst-case BT speaker (cheap Chinese unit). Three runs: pure-tone-with-music, pure-tone-silent, chirp-silent. Full record in [`proposals/06-ultrasonic-vs-inband.md`](proposals/06-ultrasonic-vs-inband.md); epic-level summary in the [`ultrasonic-runtime-sync.md`](epics/ultrasonic-runtime-sync.md) charter's "Slice 0 Findings" section.
-
-**Conclusion: ultrasonic at 18.0-19.5 kHz wins on viability — but the detector has to change.**
-
-Three things every future SyncSonic agent needs to know after this slice:
-
-1. **Ultrasonic survives BT.** ~40 dB SNR at the USB measurement mic in the 17.5-20 kHz band; naturally immune to music masking (ordinary music has near-zero content in that band). Validated end-to-end on the cheapest BT speaker the operator owns — if it works there, it works on the fleet.
-2. **Cross-correlation does NOT work for ultrasonic over BT.** A2DP codecs (SBC / AAC / aptX) are psychoacoustically tuned to aggressively quantize >16 kHz content, preserving total energy but destroying waveform phase/shape. Every cross-correlation run scored well below `analyze_lag.estimate_lag_samples`'s own "usable" confidence thresholds (`confidence_primary > 5`, `confidence_secondary > 2`). The existing analyzer is fine for startup calibration where the chirp traverses the wired/dedicated path; **do not reuse it for runtime probes over BT**.
-3. **Envelope detection works.** Sliding-window FFT in the 17.5-20 kHz band shows clean ~40 dB step transitions at burst arrival and end. Slice 1 should add a new `backend/measurement/analyze_envelope.py` alongside `analyze_lag.py` — bandpass + envelope follower + peak detector with ~10 ms time resolution.
-
-**Slice 1 is now well-scoped** (operator's cadence-bursts proposal validated by the experiment):
-- Short ultrasonic bursts at known cadence (~1 Hz, verify under CPU load)
-- Rotate frequencies across 18.0 / 18.5 / 19.0 / 19.5 kHz per cadence cycle for disambiguation and per-frequency speaker-response signal
-- Envelope-detect arrivals; drift across consecutive bursts feeds the existing elastic-engine `set_rate_ppm` socket with the ±50 ppm cap from `ROADMAP.md` §4
-- Multi-speaker arrival disambiguation strategy (cadence-frequency-rotation vs time-slotted per-speaker emission) is the one remaining open design question for the slice-1 charter
+Open-question experiment resolved. See [`epics/ultrasonic-runtime-sync.md`](epics/ultrasonic-runtime-sync.md) "Slice 0 Findings" for the conclusion + slice-1 architecture, and [`proposals/06-ultrasonic-vs-inband.md`](proposals/06-ultrasonic-vs-inband.md) for the raw experimental record.

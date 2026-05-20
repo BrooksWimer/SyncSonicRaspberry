@@ -55,6 +55,10 @@ def hf_power_db(
         mono = mono / 32768.0
 
     window = np.hanning(mono.size)
+    # Compensate for Hanning window energy loss so a full-amplitude pure
+    # sine at center_hz reports the docstring-claimed ~0 dBFS instead of
+    # the windowed -4.26 dB. Hanning RMS in [0,1] is sqrt(3/8) ≈ 0.6124.
+    window_rms = float(np.sqrt(np.mean(window * window)))
     spectrum = np.fft.rfft(mono * window)
     freqs = np.fft.rfftfreq(mono.size, d=1.0 / float(sample_rate))
     half_bw = bandwidth_hz / 2.0
@@ -63,7 +67,7 @@ def hf_power_db(
         return float("-inf")
 
     band_time = np.fft.irfft(spectrum * band, n=mono.size)
-    rms = float(np.sqrt(np.mean(band_time * band_time)))
+    rms = float(np.sqrt(np.mean(band_time * band_time))) / window_rms
     if rms <= 1e-15:
         return float("-inf")
     peak_equivalent = rms * math.sqrt(2.0)

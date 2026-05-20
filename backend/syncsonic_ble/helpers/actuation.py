@@ -73,6 +73,19 @@ class ActuationManager:
         with self._lock:
             return state.delay_cmd_ms
 
+    def get_delay_metadata(self, *, active_only: bool = True) -> Dict[str, Dict[str, float]]:
+        """Return per-speaker timing metadata owned by the actuation manager."""
+        with self._lock:
+            return {
+                mac: {
+                    "delay_ms": float(state.delay_cmd_ms),
+                    "applied_delay_ms": float(state.delay_applied_ms),
+                    "delay_line_ms": float(state.delay_line_applied_ms),
+                }
+                for mac, state in self._states.items()
+                if not active_only or state.active
+            }
+
     def get_status_snapshot(self, mac: Optional[str] = None):
         with self._lock:
             if mac is not None:

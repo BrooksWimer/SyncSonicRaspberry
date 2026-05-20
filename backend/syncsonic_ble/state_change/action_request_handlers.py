@@ -316,10 +316,69 @@ def handle_wifi_scan_stop(char, _):
     return _encode(Msg.SUCCESS, {"scanning": False})
 
 
-def handle_ultrasonic_sync(char, _):
-    return _feature_disabled(
-        "ultrasonic_sync",
-        "Ultrasonic auto-alignment is disabled on the neutral foundation branch.",
+def handle_ultrasonic_sync(char, data):
+    """Slice 1 runtime ultrasonic actuation: emit per-speaker arrival bursts."""
+    try:
+        from syncsonic_ble.helpers.arrival_burst_actuation import (
+            ArrivalBurstActuator,
+            active_speaker_delays,
+        )
+    except ImportError as exc:
+        logger.exception("Arrival burst actuation import failed")
+        return _encode(Msg.ERROR, {"error": f"arrival actuation unavailable: {exc}"})
+
+    raw_macs = data.get("macs")
+    macs = [str(mac).upper() for mac in raw_macs] if isinstance(raw_macs, list) else None
+    requested_macs = set(macs) if macs is not None else None
+    manager = get_actuation_manager()
+    active_delays = active_speaker_delays(manager)
+    selected = {
+        mac: delay for mac, delay in active_delays.items()
+        if requested_macs is None or mac in requested_macs
+    }
+    if not selected:
+        return _encode(Msg.ERROR, {"error": "no active speaker outputs for ultrasonic sync"})
+
+    def _push(phase: str, payload: Dict[str, Any]) -> None:
+        char.send_notification(
+            Msg.CALIBRATION_RESULT,
+            {"phase": phase, "kind": "ultrasonic_arrival_burst", **payload},
+        )
+
+    def _runner() -> None:
+        try:
+            results = ArrivalBurstActuator(manager=manager).emit_once(
+                macs=macs,
+                on_event=_push,
+            )
+            ok = all(result.ok for result in results)
+            _push("complete", {
+                "ok": ok,
+                "count": len(results),
+                "failures": [
+                    {
+                        "mac": result.target.mac,
+                        "returncode": result.returncode,
+                        "stderr": result.stderr,
+                    }
+                    for result in results if not result.ok
+                ],
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ultrasonic arrival burst actuation failed: %s", exc)
+            _push("failed", {"ok": False, "error": str(exc)})
+
+    import threading
+
+    threading.Thread(target=_runner, name="syncsonic-ultrasonic-arrival", daemon=True).start()
+    return _encode(
+        Msg.SUCCESS,
+        {
+            "queued": True,
+            "mode": "arrival_burst",
+            "speaker_count": len(selected),
+            "delays_ms": selected,
+        },
     )
 
 

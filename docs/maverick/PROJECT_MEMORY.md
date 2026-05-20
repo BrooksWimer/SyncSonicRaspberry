@@ -237,3 +237,9 @@ Read-only audit on `syncsonic@10.0.0.89` (4-day Pi uptime, 10h service uptime, J
 ## 2026-05-19 — Slice 0 of `ultrasonic-runtime-sync` shipped
 
 Open-question experiment resolved. See [`epics/ultrasonic-runtime-sync.md`](epics/ultrasonic-runtime-sync.md) "Slice 0 Findings" for the conclusion + slice-1 architecture, and [`proposals/06-ultrasonic-vs-inband.md`](proposals/06-ultrasonic-vs-inband.md) for the raw experimental record.
+
+## 2026-05-20 — Slice 1 arrival burst actuation scaffold
+
+Implemented the multi-speaker ultrasonic arrival actuation surface in the execution worktree. The backend now plans one fixed 100 ms runtime burst per active speaker, resolves the concrete PulseAudio/PipeWire sink for that speaker, and emits the burst with `paplay --device=<sink>` without muting or ducking other audio. Detection-window metadata is centered on the per-speaker `delay_ms` reported by `ActuationManager.get_delay_metadata()`, preserving the chain where actuation owns timing metadata, context logic consumes the detection window, and the audio layer isolates playback by device targeting.
+
+Local evidence: `python3 -m compileall syncsonic_ble measurement` passed from `backend/`. `python3 -m pytest measurement -v` was blocked in this workspace because `pytest` and `numpy` are not installed and `python3 -m venv` cannot create an environment without `ensurepip` / `python3.12-venv`. Read-only Pi inspection reached `syncsonic@10.0.0.89`; `syncsonic.service` was inactive, so no live burst playback was claimed.

@@ -17,6 +17,8 @@ import numpy as np
 SAMPLE_RATE_HZ = 48_000
 PROBE_DURATION_SEC = 2.65
 DEFAULT_ULTRASONIC_HZ = 18_500.0
+RUNTIME_BURST_DURATION_SEC = 0.100
+RUNTIME_BURST_FREQUENCIES_HZ = (18_000.0, 18_500.0, 19_000.0, 19_500.0)
 
 INBAND_PAUSE_SEC = 0.20
 INBAND_CHIRP_START_HZ = 420.0
@@ -119,6 +121,26 @@ def build_ultrasonic_probe(
     if max_abs > 0:
         sig = sig * (peak / max_abs)
     return sig.astype(np.float64)
+
+
+def build_runtime_ultrasonic_burst(
+    *,
+    sample_rate: int = SAMPLE_RATE_HZ,
+    frequency_hz: float = DEFAULT_ULTRASONIC_HZ,
+    peak: float = 0.95,
+) -> np.ndarray:
+    """Build the fixed-duration runtime arrival burst.
+
+    Slice 1 uses short energy bursts and envelope detection; every speaker gets
+    the same 100 ms probe so context timing stays tied to actuation delay, not
+    variable stimulus length.
+    """
+    return build_ultrasonic_probe(
+        sample_rate=sample_rate,
+        duration_sec=RUNTIME_BURST_DURATION_SEC,
+        frequency_hz=frequency_hz,
+        peak=peak,
+    )
 
 
 def write_mono_s16_wav(path: Path, mono: np.ndarray, sample_rate: int = SAMPLE_RATE_HZ) -> None:

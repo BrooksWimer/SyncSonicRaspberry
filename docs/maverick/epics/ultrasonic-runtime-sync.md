@@ -35,3 +35,22 @@ The operator has prior ultrasonic experiments on old branches that proved the bu
 - Each slice ends with Pi validation evidence: a journal excerpt, a measurement plot, a soak session report. This is non-negotiable per `AGENTS.md`.
 - Pet sensitivity to ultrasonic is a real risk for some operators. Document the experiment and fallback to in-band if needed.
 - When the loop is shipping, update [`PROJECT_ROADMAP.md`](../PROJECT_ROADMAP.md) M5 status and append a "done" entry to [`PROJECT_MEMORY.md`](../PROJECT_MEMORY.md).
+
+## Slice 0 Findings (2026-05-19) — open question resolved
+
+**Ultrasonic wins on viability; cross-correlation is the wrong detector for it.**
+
+Pi-validated on `syncsonic@10.0.0.89` against the operator's worst-case BT speaker (cheap Chinese unit). Full experimental record + raw metrics in [`../proposals/06-ultrasonic-vs-inband.md`](../proposals/06-ultrasonic-vs-inband.md). Three findings that determine slice-1 design:
+
+1. **Ultrasonic survives the BT round trip with ~40 dB SNR.** Probes at 18.0–19.5 kHz (chirp) and 18.5 kHz (pure tone) reach the USB measurement mic with measurable energy in the 17.5–20 kHz band; ordinary music has near-zero content in that band so detection is naturally immune to music masking.
+2. **The existing `analyze_lag.estimate_lag_samples` cross-correlation analyzer fails on ultrasonic over BT.** All three runs scored well below the analyzer's own `confidence_primary > 5` / `confidence_secondary > 2` "usable" thresholds; `peak_correlation` was essentially zero (-0.011 to +0.0031) and the chirp lag landed at the search-window boundary (-49 ms, physically impossible). Root cause: A2DP codecs (SBC / AAC / aptX) are psychoacoustically tuned to aggressively quantize >16 kHz content, preserving total energy but destroying waveform phase/shape.
+3. **Direct spectral energy detection works.** Sliding-window FFT in the 17.5–20 kHz band shows a clean ~40 dB step at chirp arrival (t = 0.85 s) and a corresponding step at chirp end. Time resolution of the envelope detector with 50 ms windows / 25 ms hop is sufficient to time burst arrivals well within the drift-correction precision the runtime loop needs.
+
+**Slice 1 architecture (data-backed, not speculative):**
+
+- Probe shape: **short ultrasonic bursts on a known cadence** (operator suggestion validated by the experiment — cadence + envelope detection sidesteps the codec-mangling problem because energy preservation is enough)
+- Burst frequencies: **rotate across 18.0 / 18.5 / 19.0 / 19.5 kHz** per cadence cycle for disambiguation and per-frequency speaker-response measurement
+- Detector: a new `analyze_envelope.py` alongside `analyze_lag.py` — bandpass 17–20 kHz, envelope follower, peak detector. Do **not** reuse the existing `lag_analyzer` for runtime; keep it for startup calibration only.
+- Drift correction path: unchanged — feed measured per-speaker lag into the Slice 2 elastic engine's `set_rate_ppm` socket with the ±50 ppm cap from `ROADMAP.md` §4.
+
+The **Open Design Questions** section above is closed for slice 1 planning. The "Ultrasonic vs in-band chirp" question is resolved in favor of ultrasonic; the "Measurement cadence" question still needs CPU-load validation but the 1 Hz hint from the charter is consistent with the slice-0 burst-duration evidence.

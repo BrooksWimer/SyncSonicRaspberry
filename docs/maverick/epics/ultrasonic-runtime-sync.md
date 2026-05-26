@@ -82,3 +82,11 @@ What this changes for slice 1 scope:
 - Filter-resident emission must not introduce its own xruns under the engine's existing load; CPU budget is a real constraint and should be measured as part of slice 1 verification
 
 The slice 1 v1 implementation on `maverick/syncsonic/ultrasonic/slice-1-cadence-based-ultrasonic-envelope-detector-drift-correction-loop-9437d092` (commit `02b581b`) is preserved as a reference for the actuation-manager integration pattern (`ActuationManager.set_manual_delay`, BLE handler shape, scheduling primitives) — the wiring there is fine, only the emission target is wrong.
+
+### Slice 1 Option C implementation note (2026-05-25 Pi validation)
+
+The revised workstream branch `maverick/syncsonic/ultrasonic/slice-1-revised-in-filter-ultrasonic-burst-emission-4307e4eb` implements filter-resident burst emission by adding `emit_burst` and `query_emit_timestamps` to `pw_delay_filter`'s Unix socket protocol. The C filter now queues one burst request at a time, schedules it after the current delay depth, mixes a raised-cosine 18.5 kHz sine into both output channels, and logs the first emitted output frame. Python actuation is now a thin socket-command wrapper; the retired direct-`paplay` path is not used.
+
+Pi validation on heyday (`45:7A:D9:00:81:19`) used the live baseline delay instead of disturbing music alignment. Baseline query returned `target_delay_samples=5424` (`113.0 ms`). A validation script compared per-burst scheduling offsets relative to `frames_out_total` immediately before each `emit_burst`: baseline offset was `5424` samples; baseline+500 ms (`613.0 ms`, `29424` samples) offset was `29424` samples; delta was exactly `24000` samples. The script restored heyday to `target_delay_samples=5424`, and a follow-up query confirmed `current_delay_samples_x100=542400`.
+
+Deployment note: `start_syncsonic.sh` also needs `-lm` on its auto-rebuild command. Updating only the Python transport compile command is insufficient because systemd startup rebuilds `tools/pw_delay_filter` directly when the C source is newer.

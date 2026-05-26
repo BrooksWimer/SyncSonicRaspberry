@@ -296,6 +296,38 @@ class PipeWireTransportManager:
         resp = self._send_socket_command(sock_path, f"mute_to {gain_x1000} {ramp_ms}")
         return bool(resp and resp.get("ok"))
 
+    def emit_burst(
+        self,
+        mac: str,
+        *,
+        freq_hz: float = 18500.0,
+        duration_ms: int = 100,
+        amplitude: float = 0.95,
+    ) -> Optional[Dict[str, Any]]:
+        """Request one ultrasonic burst from the in-filter synthesizer."""
+        mac = mac.upper()
+        with self._lock:
+            route = self._active_routes.get(mac)
+            sock_path = route.get("socket_path") if route else None
+        if not sock_path:
+            return None
+        freq_x10 = int(round(freq_hz * 10))
+        amp_x1000 = max(0, min(1000, int(round(amplitude * 1000))))
+        return self._send_socket_command(
+            sock_path,
+            f"emit_burst {freq_x10} {int(duration_ms)} {amp_x1000}",
+        )
+
+    def query_emit_timestamps(self, mac: str) -> Optional[Dict[str, Any]]:
+        """Drain and return emitted burst timestamp entries from the filter."""
+        mac = mac.upper()
+        with self._lock:
+            route = self._active_routes.get(mac)
+            sock_path = route.get("socket_path") if route else None
+        if not sock_path:
+            return None
+        return self._send_socket_command(sock_path, "query_emit_timestamps")
+
     # -- socket helpers -----------------------------------------------------
 
     def _send_set_delay(self, sock_path: str, delay_ms: float) -> bool:
@@ -312,7 +344,7 @@ class PipeWireTransportManager:
                 s.connect(sock_path)
                 s.sendall((line + "\n").encode("ascii"))
                 buf = b""
-                while b"\n" not in buf and len(buf) < 1024:
+                while b"\n" not in buf and len(buf) < 4096:
                     chunk = s.recv(1024)
                     if not chunk:
                         break
@@ -344,7 +376,7 @@ class PipeWireTransportManager:
         compile_cmd = (
             f"gcc -O2 -Wall -Wextra -pthread -o {shlex.quote(str(FILTER_BINARY))} "
             f"{shlex.quote(str(FILTER_SOURCE))} "
-            "$(/usr/bin/pkg-config --cflags --libs libpipewire-0.3) -latomic"
+            "$(/usr/bin/pkg-config --cflags --libs libpipewire-0.3) -latomic -lm"
         )
         result = subprocess.run(
             ["/bin/sh", "-lc", compile_cmd],

@@ -7,6 +7,8 @@ Usage:
   python _filter_ctl.py query <mac>
   python _filter_ctl.py set_delay <mac> <ms>          # ramp 100 ms
   python _filter_ctl.py set_delay <mac> <ms> <ramp>
+  python _filter_ctl.py emit_burst <mac> [freq_hz_x10] [dur_ms] [amp_x1000]
+  python _filter_ctl.py query_emit_timestamps <mac>
 """
 from __future__ import annotations
 
@@ -56,6 +58,15 @@ def main() -> int:
         ms = float(sys.argv[3])
         ramp = float(sys.argv[4]) if len(sys.argv) >= 5 else 100.0
         print(send(mac, f"set_delay {ms} {ramp}"))
+        return 0
+    if cmd == "emit_burst":
+        freq_hz_x10 = int(sys.argv[3]) if len(sys.argv) >= 4 else 185000
+        dur_ms = int(sys.argv[4]) if len(sys.argv) >= 5 else 100
+        amp_x1000 = int(sys.argv[5]) if len(sys.argv) >= 6 else 950
+        print(send(mac, f"emit_burst {freq_hz_x10} {dur_ms} {amp_x1000}"))
+        return 0
+    if cmd == "query_emit_timestamps":
+        print(send(mac, "query_emit_timestamps"))
         return 0
     print(f"unknown cmd: {cmd}")
     return 2

@@ -233,3 +233,52 @@ Read-only audit on `syncsonic@10.0.0.89` (4-day Pi uptime, 10h service uptime, J
 - **BT auto-disconnects: 4/24h.** Pattern of note: `A8:41:F4:F8:E1:18` disconnected → reconnected → disconnected within 24 seconds at 01:24 EDT. Flap pattern. The 2026-05-14 narrowing fix in `connection_manager.py` adds a `device_path is None → run_discovery` guard that should make the recovery path more predictable, but the underlying flap cause (RSSI dip? speaker timeout? router roaming?) is unresolved.
 - **Service errors: 0** in the last 24 hours. `journalctl -u syncsonic.service -p err` returned no entries.
 - **Disk usage: 6%** of 114 GB. Snapshot dir empty. H7 ("snapshot disk pressure") is not active.
+
+## 2026-05-19 — Slice 0 of `ultrasonic-runtime-sync` shipped
+
+Open-question experiment resolved. See [`epics/ultrasonic-runtime-sync.md`](epics/ultrasonic-runtime-sync.md) "Slice 0 Findings" for the conclusion + slice-1 architecture, and [`proposals/06-ultrasonic-vs-inband.md`](proposals/06-ultrasonic-vs-inband.md) for the raw experimental record.
+
+## 2026-05-25 — Slice 1 v1 retired; redesign to in-filter burst emission (Option C)
+
+Slice 1 of `ultrasonic-runtime-sync` shipped only the emission half (`backend/syncsonic_ble/helpers/arrival_burst_actuation.py` + BLE handler `handle_ultrasonic_sync` + ActuationManager hookup). Pi validation today on the **heyday** speaker (MAC `45:7A:D9:00:81:19`) surfaced two architectural failures with the chosen emission strategy.
+
+### Phase 1: silent-room single-shot
+
+One 100 ms 18.5 kHz burst emitted via `paplay --device=bluez_output.45_7A_D9_00_81_19.1` (exactly what `ArrivalBurstActuator.emit_once` does). Result:
+
+- Burst visible at mic with **SNR ≈ 52 dB** — well above slice 0's 40 dB at the cheap unit; envelope-domain detection is comfortable on this speaker
+- End-to-end latency emit → first arrival ≈ **325 ms**, emit → peak ≈ **375 ms**
+- Clean rise / ~125 ms plateau / decay envelope — detector-friendly shape
+
+### Phase 1b: 4-delay × 3-shot sweep with music playing
+
+Filter delay swept across 0 / 100 / 250 / 500 ms (set via `backend/measurement/_filter_ctl.py set_delay`), 3 shots per delay value, music streaming through `virtual_out` throughout. 12 shots total.
+
+**Findings (data straight, not editorialized):**
+
+1. **Arrival time was indifferent to configured filter delay.** Mean peak time clustered at 358–375 ms across all four delay settings; in-shot variance ±25 ms (FFT hop resolution). Filter state confirmed at every step (`target_delay_samples = 0 / 4800 / 12000 / 24000`) — the filter accepted the commands but the bursts never went through it.
+
+   Reason: `paplay --device=bluez_output.<mac>.1` writes directly to the BlueZ sink. The `pw_delay_filter` sits *between* `virtual_out` and `bluez_output` in the music path (see `backend/syncsonic_ble/helpers/pipewire_transport.py`). The probe path bypasses the filter entirely.
+
+2. **Music played choppily during the sweep.** Operator-audible degradation throughout the test window. Two streams (filter-managed music + direct-to-sink burst) compete at the BT sink boundary — exactly the failure mode SyncSonic's architecture exists to prevent.
+
+3. **Music does NOT mask the ultrasonic.** Noise floor only crept up ~1 dB (from −89.9 silent to −89.3 with music). SNR held at 60 ± 1 dB across all 12 shots regardless of music content. Confirms slice 0's finding that the 17.5–20 kHz band is naturally above music content.
+
+4. **BT codec latency on heyday is rock-stable at ~370 ms.** Useful baseline number for the detector's window sizing.
+
+### Decision: redesign slice 1 around in-filter burst emission (Option C)
+
+The C `pw_delay_filter` process is already in the per-speaker audio path and is the only place where:
+
+- Bursts can be timestamped frame-precisely against the same clock that processes music
+- Bursts can be inserted into the speaker's audio stream without spawning a second concurrent stream
+- Configured filter delay actually affects burst arrival time (so the loop can validate "delay setting → measured shift")
+- The emission path matches the music path closely enough that measured latency is a meaningful end-to-end number for alignment correction
+
+Cost: the filter's wire protocol needs extending — a "play this burst at the next zero crossing" command on the existing control socket, plus an event stream for frame-precise emit timestamps so the detector can compute arrival - emit.
+
+**Slice 1 v1 emission code stays on its workstream branch (`maverick/syncsonic/ultrasonic/slice-1-cadence-based-ultrasonic-envelope-detector-drift-correction-loop-9437d092`) for reference but is NOT promoted into the epic branch.** A new slice 1 workstream targets Option C and replans from this finding.
+
+### Theoretical caveat to revisit
+
+In-filter burst emission means probe samples don't traverse the `virtual_out → filter input` PipeWire link that music traverses. Operator flagged this as a possible measurement-fidelity gap but expected impact is small relative to BT codec latency (PipeWire-internal hop is typically <5 ms vs ~370 ms codec). Worth measuring once the in-filter path exists; not a blocker for design adoption.

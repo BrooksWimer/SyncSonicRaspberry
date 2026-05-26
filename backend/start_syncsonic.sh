@@ -14,7 +14,7 @@ if [ -f tools/pw_delay_filter.c ] && { [ ! -x tools/pw_delay_filter ] || [ tools
   #   -pthread     for the new control-thread / Unix-socket surface
   #   -latomic     gcc on aarch64 emits libatomic calls for 8-byte
   #                atomic ops (used by frames_in_total / frames_out_total)
-  gcc -O2 -Wall -Wextra -pthread -o tools/pw_delay_filter tools/pw_delay_filter.c $(/usr/bin/pkg-config --cflags --libs libpipewire-0.3) -latomic
+  gcc -O2 -Wall -Wextra -pthread -o tools/pw_delay_filter tools/pw_delay_filter.c $(/usr/bin/pkg-config --cflags --libs libpipewire-0.3) -latomic -lm
 fi
 
 cleanup() {

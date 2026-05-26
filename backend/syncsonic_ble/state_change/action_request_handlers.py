@@ -316,11 +316,26 @@ def handle_wifi_scan_stop(char, _):
     return _encode(Msg.SUCCESS, {"scanning": False})
 
 
-def handle_ultrasonic_sync(char, _):
-    return _feature_disabled(
-        "ultrasonic_sync",
-        "Ultrasonic auto-alignment is disabled on the neutral foundation branch.",
+def handle_ultrasonic_sync(char, data):
+    """Slice 1 Option C: in-filter ultrasonic burst emission."""
+    from syncsonic_ble.helpers.arrival_burst_actuation import get_arrival_burst_actuator
+
+    mac = data.get("mac")
+    if not mac:
+        return _encode(Msg.ERROR, {"error": "Missing mac"})
+    freq_hz = float(data.get("freq_hz", 18500.0))
+    duration_ms = int(data.get("duration_ms", 100))
+    amplitude = float(data.get("amplitude", 0.95))
+    actuator = get_arrival_burst_actuator()
+    entries = actuator.emit_once(
+        mac,
+        freq_hz=freq_hz,
+        duration_ms=duration_ms,
+        amplitude=amplitude,
     )
+    if not entries:
+        return _encode(Msg.ERROR, {"error": "emit_burst failed or no timestamp returned"})
+    return _encode(Msg.SUCCESS, {"emit_entries": entries})
 
 
 def handle_calibrate_speaker(char, data):

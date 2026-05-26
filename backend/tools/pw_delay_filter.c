@@ -46,6 +46,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -84,6 +85,22 @@
 #define SLEW_SAMPLES_PER_FRAME 4  // ~83 ppm during slew, inaudible on music
 #define DEFAULT_SOCKET_DIR "/tmp/syncsonic-engine"
 #define CMD_LINE_MAX 256
+#define BURST_QUEUE_CAP 8
+#define EMIT_LOG_CAP 32
+
+typedef struct {
+    atomic_int    pending;           // 1 = request waiting, 0 = consumed
+    atomic_uint   freq_x10;          // frequency * 10 (e.g. 185000 = 18500.0 Hz)
+    atomic_uint   duration_ms;       // burst duration in ms
+    atomic_int    amplitude_x1000;   // 0..1000 amplitude scale
+} burst_request_t;
+
+typedef struct {
+    atomic_int      used;            // 1 = entry populated, 0 = empty
+    atomic_ullong   frame_index;     // frames_out_total at first burst sample
+    atomic_uint     freq_x10;
+    atomic_uint     duration_samples;
+} emit_log_entry_t;
 
 // -----------------------------------------------------------------------
 // Shared state - audio thread reads, control thread writes
@@ -108,6 +125,14 @@ struct shared_state {
     atomic_uint   queue_depth_samples;    // current_delay_samples integer part
     atomic_uint   current_delay_samples_x100;  // *100 for centi-sample precision
     atomic_int    current_gain_x1000;     // for query introspection
+    atomic_int    burst_active_pub;       // 1 if a burst is currently synthesizing
+
+    // Burst queue: control thread writes; audio thread reads and clears.
+    burst_request_t burst_queue[BURST_QUEUE_CAP];
+
+    // Emitted timestamp ring: audio thread writes when a burst starts.
+    emit_log_entry_t emit_log[EMIT_LOG_CAP];
+    atomic_uint emit_log_write_idx;       // next slot to write (wraps mod EMIT_LOG_CAP)
 };
 
 // -----------------------------------------------------------------------
@@ -121,6 +146,18 @@ struct audio_state {
     float    current_delay_samples;   // float for fractional interpolation
     double   rate_phase_acc;          // accumulator for ±ppm rate
     float    current_gain;            // 0.0..1.0; slews toward target each sample
+
+    // Active burst synthesis state (one burst at a time; single-speaker first).
+    int      burst_active;            // 1 if synthesizing
+    uint32_t burst_samples_total;
+    uint32_t burst_samples_done;
+    uint32_t burst_start_countdown;
+    float    burst_freq_hz;
+    float    burst_amplitude;
+    float    burst_phase;             // continuous phase accumulator (radians)
+    uint32_t burst_fade_samples;      // raised-cosine fade length (each end)
+    uint64_t burst_emit_frame;        // frames_out_total at burst start
+    uint32_t burst_emit_log_slot;     // which emit_log[] slot we claimed
 };
 
 // -----------------------------------------------------------------------
@@ -262,7 +299,86 @@ static void on_process(void *userdata, struct spa_io_position *position) {
         float y_fl = ring_read_lerp(data->audio.ring_fl, cap, read_pos);
         float y_fr = ring_read_lerp(data->audio.ring_fr, cap, read_pos);
 
-        // 4. Slew current gain toward target_gain. Step size is fixed
+        // 4. Mix an optional in-filter ultrasonic burst into both channels.
+        // A socket request is scheduled current-delay samples into the future
+        // so changing the filter delay shifts the emitted burst timestamp by
+        // the same amount as delayed music.
+        if (!data->audio.burst_active) {
+            for (int bq = 0; bq < BURST_QUEUE_CAP; bq++) {
+                if (atomic_load_explicit(&data->shared.burst_queue[bq].pending,
+                                         memory_order_acquire) == 1) {
+                    uint32_t fhz10 = atomic_load(&data->shared.burst_queue[bq].freq_x10);
+                    uint32_t dur_ms = atomic_load(&data->shared.burst_queue[bq].duration_ms);
+                    int amp1000 = atomic_load(&data->shared.burst_queue[bq].amplitude_x1000);
+                    atomic_store_explicit(&data->shared.burst_queue[bq].pending, 0,
+                                          memory_order_release);
+
+                    data->audio.burst_freq_hz = (float)fhz10 / 10.0f;
+                    data->audio.burst_samples_total =
+                        (uint32_t)(((double)dur_ms / 1000.0) * SAMPLE_RATE + 0.5);
+                    data->audio.burst_samples_done = 0;
+                    data->audio.burst_start_countdown = (uint32_t)(cur_delay + 0.5f);
+                    data->audio.burst_amplitude = (float)amp1000 / 1000.0f;
+                    data->audio.burst_phase = 0.0f;
+                    data->audio.burst_fade_samples = (uint32_t)(0.005 * SAMPLE_RATE);
+                    if (data->audio.burst_fade_samples * 2 > data->audio.burst_samples_total) {
+                        data->audio.burst_fade_samples = data->audio.burst_samples_total / 4;
+                    }
+
+                    data->audio.burst_active = 1;
+                    atomic_store_explicit(&data->shared.burst_active_pub, 1,
+                                          memory_order_release);
+                    break;
+                }
+            }
+        }
+        if (data->audio.burst_active == 1) {
+            if (data->audio.burst_start_countdown > 0) {
+                data->audio.burst_start_countdown--;
+            } else {
+                uint32_t slot = atomic_fetch_add(&data->shared.emit_log_write_idx, 1)
+                                % EMIT_LOG_CAP;
+                data->audio.burst_emit_log_slot = slot;
+                data->audio.burst_emit_frame =
+                    (uint64_t)atomic_load(&data->shared.frames_out_total) + (uint64_t)i;
+                atomic_store(&data->shared.emit_log[slot].freq_x10,
+                             (uint32_t)(data->audio.burst_freq_hz * 10.0f + 0.5f));
+                atomic_store(&data->shared.emit_log[slot].duration_samples,
+                             data->audio.burst_samples_total);
+                atomic_store(&data->shared.emit_log[slot].frame_index,
+                             data->audio.burst_emit_frame);
+                atomic_store_explicit(&data->shared.emit_log[slot].used, 1,
+                                      memory_order_release);
+                data->audio.burst_active = 2;
+            }
+        }
+        if (data->audio.burst_active == 2) {
+            uint32_t bd = data->audio.burst_samples_done;
+            uint32_t bt = data->audio.burst_samples_total;
+            uint32_t bf = data->audio.burst_fade_samples;
+            float env = 1.0f;
+            if (bf > 0 && bd < bf) {
+                env = 0.5f - 0.5f * cosf((float)M_PI * (float)bd / (float)bf);
+            } else if (bf > 0 && bd >= bt - bf) {
+                env = 0.5f - 0.5f * cosf((float)M_PI * (float)(bt - bd) / (float)bf);
+            }
+            float phase_inc = 2.0f * (float)M_PI * data->audio.burst_freq_hz / (float)SAMPLE_RATE;
+            float bsample = sinf(data->audio.burst_phase) * env * data->audio.burst_amplitude;
+            data->audio.burst_phase += phase_inc;
+            if (data->audio.burst_phase > 2.0f * (float)M_PI) {
+                data->audio.burst_phase -= 2.0f * (float)M_PI;
+            }
+            y_fl += bsample;
+            y_fr += bsample;
+            data->audio.burst_samples_done++;
+            if (data->audio.burst_samples_done >= bt) {
+                data->audio.burst_active = 0;
+                atomic_store_explicit(&data->shared.burst_active_pub, 0,
+                                      memory_order_release);
+            }
+        }
+
+        // 5. Slew current gain toward target_gain. Step size is fixed
         //    by gain_step_full; we clamp so we never overshoot. A
         //    target change of 1.0 (full mute or full unmute) takes
         //    exactly ramp_samples samples; smaller changes finish
@@ -336,6 +452,7 @@ static void handle_query(struct app_data *data, int client_fd) {
         "\"target_gain_x1000\":%d,"
         "\"current_gain_x1000\":%d,"
         "\"gain_ramp_samples\":%d,"
+        "\"burst_active\":%d,"
         "\"ring_capacity\":%u}\n",
         atomic_load(&data->shared.target_delay_samples),
         atomic_load(&data->shared.current_delay_samples_x100),
@@ -346,6 +463,7 @@ static void handle_query(struct app_data *data, int client_fd) {
         atomic_load(&data->shared.target_gain_x1000),
         atomic_load(&data->shared.current_gain_x1000),
         atomic_load(&data->shared.gain_ramp_samples),
+        atomic_load(&data->shared.burst_active_pub),
         data->audio.ring_capacity
     );
     if (n > 0) (void)write(client_fd, json, (size_t)n);
@@ -401,6 +519,74 @@ static void handle_command(struct app_data *data, int client_fd, char *line) {
                          "{\"ok\":true,\"target_gain_x1000\":%d,\"ramp_samples\":%d}\n",
                          gain, ramp_samples);
         (void)write(client_fd, ack, (size_t)n);
+    } else if (strcmp(cmd, "emit_burst") == 0) {
+        // emit_burst <freq_hz_x10> <duration_ms> <amplitude_x1000>
+        char *a1 = strtok(NULL, " \t");
+        char *a2 = strtok(NULL, " \t");
+        char *a3 = strtok(NULL, " \t");
+        if (!a1 || !a2 || !a3) {
+            const char *msg = "{\"ok\":false,\"err\":\"usage:emit_burst <freq_hz_x10> <dur_ms> <amp_x1000>\"}\n";
+            (void)write(client_fd, msg, strlen(msg));
+            return;
+        }
+        uint32_t fhz10 = (uint32_t)strtoul(a1, NULL, 10);
+        uint32_t dur_ms = (uint32_t)strtoul(a2, NULL, 10);
+        int amp1000 = atoi(a3);
+        if (amp1000 < 0) amp1000 = 0;
+        if (amp1000 > 1000) amp1000 = 1000;
+        if (dur_ms == 0 || dur_ms > 2000) {
+            const char *msg = "{\"ok\":false,\"err\":\"dur_ms out of range\"}\n";
+            (void)write(client_fd, msg, strlen(msg));
+            return;
+        }
+
+        int placed = 0;
+        for (int bq = 0; bq < BURST_QUEUE_CAP; bq++) {
+            if (atomic_load_explicit(&data->shared.burst_queue[bq].pending,
+                                     memory_order_acquire) == 0) {
+                atomic_store(&data->shared.burst_queue[bq].freq_x10, fhz10);
+                atomic_store(&data->shared.burst_queue[bq].duration_ms, dur_ms);
+                atomic_store(&data->shared.burst_queue[bq].amplitude_x1000, amp1000);
+                atomic_store_explicit(&data->shared.burst_queue[bq].pending, 1,
+                                      memory_order_release);
+                placed = 1;
+                break;
+            }
+        }
+        char ack[128];
+        int n = snprintf(ack, sizeof(ack),
+                         "{\"ok\":%s,\"freq_hz_x10\":%u,\"dur_ms\":%u,\"amp_x1000\":%d}\n",
+                         placed ? "true" : "false", fhz10, dur_ms, amp1000);
+        (void)write(client_fd, ack, (size_t)n);
+    } else if (strcmp(cmd, "query_emit_timestamps") == 0) {
+        char out[2048];
+        int pos = 0;
+        pos += snprintf(out + pos, sizeof(out) - (size_t)pos, "{\"ok\":true,\"entries\":[");
+        int first = 1;
+        for (int el = 0; el < EMIT_LOG_CAP; el++) {
+            if (atomic_load_explicit(&data->shared.emit_log[el].used,
+                                     memory_order_acquire) == 1) {
+                unsigned long long fi = atomic_load(&data->shared.emit_log[el].frame_index);
+                uint32_t fhz10 = atomic_load(&data->shared.emit_log[el].freq_x10);
+                uint32_t dsamp = atomic_load(&data->shared.emit_log[el].duration_samples);
+                if (!first) {
+                    pos += snprintf(out + pos, sizeof(out) - (size_t)pos, ",");
+                }
+                pos += snprintf(
+                    out + pos,
+                    sizeof(out) - (size_t)pos,
+                    "{\"frame_index\":%llu,\"freq_hz_x10\":%u,\"duration_samples\":%u}",
+                    fi,
+                    fhz10,
+                    dsamp
+                );
+                atomic_store_explicit(&data->shared.emit_log[el].used, 0,
+                                      memory_order_release);
+                first = 0;
+            }
+        }
+        pos += snprintf(out + pos, sizeof(out) - (size_t)pos, "]}\n");
+        (void)write(client_fd, out, (size_t)pos);
     } else if (strcmp(cmd, "query") == 0) {
         handle_query(data, client_fd);
     } else if (strcmp(cmd, "quit") == 0) {
@@ -536,6 +722,14 @@ int main(int argc, char *argv[]) {
     atomic_store(&data.shared.frames_out_total, 0);
     atomic_store(&data.shared.queue_depth_samples, 0);
     atomic_store(&data.shared.current_delay_samples_x100, 0);
+    atomic_store(&data.shared.burst_active_pub, 0);
+    for (int i = 0; i < BURST_QUEUE_CAP; i++) {
+        atomic_store(&data.shared.burst_queue[i].pending, 0);
+    }
+    for (int i = 0; i < EMIT_LOG_CAP; i++) {
+        atomic_store(&data.shared.emit_log[i].used, 0);
+    }
+    atomic_store(&data.shared.emit_log_write_idx, 0);
 
     // Allocate ring buffers. Capacity = MAX_DELAY * SAMPLE_RATE +
     // headroom. We always allocate the same size regardless of the
@@ -553,6 +747,7 @@ int main(int argc, char *argv[]) {
     data.audio.current_delay_samples = (float)initial_target;
     data.audio.rate_phase_acc = 0.0;
     data.audio.current_gain = 1.0f;
+    data.audio.burst_active = 0;
 
     // Ignore SIGPIPE so a client closing the socket mid-write doesn't
     // kill the whole process.

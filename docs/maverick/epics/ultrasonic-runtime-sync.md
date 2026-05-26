@@ -54,3 +54,31 @@ Pi-validated on `syncsonic@10.0.0.89` against the operator's worst-case BT speak
 - Drift correction path: unchanged — feed measured per-speaker lag into the Slice 2 elastic engine's `set_rate_ppm` socket with the ±50 ppm cap from `ROADMAP.md` §4.
 
 The **Open Design Questions** section above is closed for slice 1 planning. The "Ultrasonic vs in-band chirp" question is resolved in favor of ultrasonic; the "Measurement cadence" question still needs CPU-load validation but the 1 Hz hint from the charter is consistent with the slice-0 burst-duration evidence.
+
+## Slice 1 emission strategy (revised 2026-05-25)
+
+The slice-0 architecture description above remains correct for the **detector** half (envelope follower + bandpass + peak detector). The **emission** half was implemented in `backend/syncsonic_ble/helpers/arrival_burst_actuation.py` as `paplay --device=bluez_output.<mac>.1` direct-to-BlueZ-sink; Pi validation 2026-05-25 showed that approach (a) bypasses the `pw_delay_filter` so end-to-end timing can't be measured, and (b) causes audibly choppy music due to two streams competing at the BT sink. See [`../PROJECT_MEMORY.md`](../PROJECT_MEMORY.md) 2026-05-25 entry for the full evidence.
+
+The corrected emission design — call it **Option C** — moves burst generation *into the per-speaker `pw_delay_filter` process itself*. The filter already sits in the music path between `virtual_out` and the BlueZ sink, already has frame-precise output-clock visibility, and already exposes a Unix socket control surface (`/tmp/syncsonic-engine/syncsonic-delay-<mac>.sock`). Slice 1 extends that surface so the operator (and eventually the drift loop) can request a burst and read back the exact output-frame index at which it left the filter.
+
+What this changes for slice 1 scope:
+
+- The burst generator moves from Python (`probe_signals.build_runtime_ultrasonic_burst`) into the C filter, OR Python pre-renders a sample buffer that the filter mixes into its output ring at a requested frame boundary. Decision: planning agent to resolve based on filter performance constraints.
+- The filter's wire protocol grows two commands: `emit_burst` (with frequency / duration / amplitude args) and `query_emit_timestamps` (event stream of `frame_index_emitted` per burst). The existing `set_delay` socket can be reused.
+- `arrival_burst_actuation.py`'s job becomes "issue the socket commands and forward the resulting timestamps to the detector" — much smaller than the current 232-line direct-`paplay` orchestrator.
+- The detector (`analyze_envelope.py`, not yet written) consumes the per-burst `frame_index_emitted` (converted to capture-clock time) plus the mic capture, and reports per-speaker latency.
+- The drift-correction loop is unchanged from the slice-0-findings description: per-speaker measured latency → bounded `set_rate_ppm` to the elastic engine.
+
+**Out of scope for the new slice 1:**
+
+- The detector (`analyze_envelope.py`) — separate slice. Slice 1 ships the emission infrastructure and a manual validation harness; the live detector and drift loop follow.
+- Multi-speaker simultaneous emission — single-speaker first; cadence-coordination across speakers comes after the single-speaker path works.
+
+**Validated boundaries from the slice-0 + 2026-05-25 evidence:**
+
+- Burst at 18.5 kHz with raised-cosine fades produces ~50 dB SNR at the mic on heyday — well above any detection threshold
+- Music masking is not a concern (band is empty of music content)
+- BT codec latency on the test speaker is ~370 ms with ±25 ms variance; the detector's window doesn't need to be tight
+- Filter-resident emission must not introduce its own xruns under the engine's existing load; CPU budget is a real constraint and should be measured as part of slice 1 verification
+
+The slice 1 v1 implementation on `maverick/syncsonic/ultrasonic/slice-1-cadence-based-ultrasonic-envelope-detector-drift-correction-loop-9437d092` (commit `02b581b`) is preserved as a reference for the actuation-manager integration pattern (`ActuationManager.set_manual_delay`, BLE handler shape, scheduling primitives) — the wiring there is fine, only the emission target is wrong.

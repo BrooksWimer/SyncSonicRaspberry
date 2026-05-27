@@ -376,6 +376,117 @@ class EnvelopeDetector:
         return 10.0 * math.log10(max(power, 1e-20))
 
 
+# Slice 3: closed-loop drift correction.
+# Conservative starting gain (0.1) — tune after Pi validation.
+# Spec: docs/maverick/proposals/09-slice-3-implementation-spec.md
+CORRECTION_PPM_GAIN = 0.1
+CORRECTION_SNR_FLOOR_DB = 10.0
+CORRECTION_STABLE_FLOOR = 5
+CORRECTION_PAUSE_AFTER_SKIPS = 3
+
+
+class DriftController:
+    """Per-speaker drift correction state + decision logic.
+
+    Maintains a rolling baseline of (latency_ms - slider_ms) per speaker
+    = intrinsic codec latency. Detects drift as the deviation of the
+    recent rolling mean from the long-term baseline. Applied correction
+    is bounded at +/-max_ppm per ROADMAP section 4.
+
+    Confidence gating: requires stable_count >= smoothing_window AND
+    snr_db >= 10.0 dB before applying any correction for that speaker.
+
+    Auto-pause: if a speaker accumulates 3+ consecutive correction_skipped
+    events AND its SNR is below 10 dB, the controller stops issuing
+    corrections for THAT speaker. Other speakers continue normally.
+    """
+
+    def __init__(
+        self,
+        max_ppm: float = 50.0,
+        smoothing_window: int = 5,
+        gain: float = CORRECTION_PPM_GAIN,
+    ):
+        self.max_ppm = max_ppm
+        self.smoothing_window = smoothing_window
+        self.gain = gain
+        self.baselines: dict[str, float] = {}
+        self.recent_samples: dict[str, list[float]] = {}
+        self.consecutive_skips: dict[str, int] = {}
+        self.paused: set[str] = set()
+
+    def observe(
+        self,
+        mac: str,
+        latency_ms: float,
+        slider_ms: float,
+        snr_db: float,
+        stable_count: int,
+    ) -> Optional[dict[str, Any]]:
+        """Record a measurement; return a JSON-line-ready record dict or None."""
+        codec_ms = latency_ms - slider_ms
+
+        # Update rolling samples
+        recent = self.recent_samples.setdefault(mac, [])
+        recent.append(codec_ms)
+        if len(recent) > self.smoothing_window:
+            recent.pop(0)
+
+        # Establish baseline once we have enough stable measurements
+        if mac not in self.baselines and stable_count >= self.smoothing_window:
+            self.baselines[mac] = sum(recent) / len(recent)
+            return {
+                "event": "correction_proposed",
+                "mac": mac,
+                "reason": "baseline_established",
+                "baseline_codec_ms": self.baselines[mac],
+            }
+
+        # Already paused: no-op
+        if mac in self.paused:
+            return None
+
+        # Confidence gating
+        if stable_count < self.smoothing_window or snr_db < CORRECTION_SNR_FLOOR_DB:
+            self.consecutive_skips[mac] = self.consecutive_skips.get(mac, 0) + 1
+            if (
+                self.consecutive_skips[mac] >= CORRECTION_PAUSE_AFTER_SKIPS
+                and snr_db < CORRECTION_SNR_FLOOR_DB
+            ):
+                self.paused.add(mac)
+                return {
+                    "event": "controller_paused",
+                    "mac": mac,
+                    "reason": f"3+ low-confidence skips, snr={snr_db:.1f}dB",
+                }
+            return {
+                "event": "correction_skipped",
+                "mac": mac,
+                "reason": "low_confidence",
+                "snr_db": snr_db,
+                "stable_count": stable_count,
+            }
+
+        # Compute correction
+        self.consecutive_skips[mac] = 0
+        if mac not in self.baselines:
+            return None
+        recent_mean = sum(recent) / len(recent)
+        drift_ms = recent_mean - self.baselines[mac]
+        applied_ppm = max(
+            -self.max_ppm,
+            min(self.max_ppm, drift_ms * self.gain),
+        )
+        return {
+            "event": "correction_applied",
+            "mac": mac,
+            "baseline_codec_ms": self.baselines[mac],
+            "current_codec_ms": recent_mean,
+            "drift_ppm_estimated": drift_ms * self.gain,
+            "applied_ppm": applied_ppm,
+        }
+
+
 class RuntimeSyncService:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -385,6 +496,17 @@ class RuntimeSyncService:
         self.state = RuntimeSyncState()
         self.stop_event = asyncio.Event()
         self.loop_task: Optional[asyncio.Task[None]] = None
+        # Slice 3: closed-loop drift correction. Opt-in via --enable-correction;
+        # default is measure-only (slice 2 behavior). Spec:
+        # docs/maverick/proposals/09-slice-3-implementation-spec.md
+        self.controller: Optional[DriftController] = (
+            DriftController(
+                max_ppm=args.max_ppm,
+                smoothing_window=args.smoothing_window,
+            )
+            if getattr(args, "enable_correction", False)
+            else None
+        )
 
     async def run(self) -> None:
         await self.capture.start()
@@ -491,6 +613,31 @@ class RuntimeSyncService:
             stable_count=target.stable_count,
         )
 
+        # Slice 3: closed-loop drift correction (opt-in via --enable-correction).
+        # Observe the new measurement; if the controller decides to apply, push
+        # the bounded set_rate_ppm command to this speaker's filter socket.
+        if self.controller is not None:
+            record = self.controller.observe(
+                mac=target.mac,
+                latency_ms=latency_ms,
+                slider_ms=target_delay_ms,
+                snr_db=detection["snr_db"],
+                stable_count=target.stable_count,
+            )
+            if record is not None:
+                _emit(**record)
+                if record["event"] == "correction_applied":
+                    response = _send_filter_command(
+                        target.socket_path,
+                        f"set_rate_ppm {record['applied_ppm']:.3f}",
+                    )
+                    _emit(
+                        "correction_applied_response",
+                        mac=target.mac,
+                        response=response,
+                        applied_ppm=record["applied_ppm"],
+                    )
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mic-source", help="Exact PulseAudio/PipeWire source name for parecord")
@@ -502,6 +649,25 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration-ms", type=int, default=DEFAULT_DURATION_MS)
     parser.add_argument("--amplitude", type=float, default=DEFAULT_AMPLITUDE)
     parser.add_argument("--bt-codec-latency-ms", type=float, default=DEFAULT_BT_CODEC_LATENCY_MS)
+    # Slice 3: closed-loop drift correction flags.
+    # Spec: docs/maverick/proposals/09-slice-3-implementation-spec.md
+    parser.add_argument(
+        "--enable-correction",
+        action="store_true",
+        help="Enable closed-loop drift correction (default: measure-only)",
+    )
+    parser.add_argument(
+        "--max-ppm",
+        type=float,
+        default=50.0,
+        help="Maximum |ppm| correction bound per ROADMAP section 4",
+    )
+    parser.add_argument(
+        "--smoothing-window",
+        type=int,
+        default=5,
+        help="Rolling-mean window for drift estimation",
+    )
     return parser
 
 

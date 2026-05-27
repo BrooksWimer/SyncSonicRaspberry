@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Manual CLI shim for the runtime-sync service.
+
+Usage:
+  runtime-sync ctl status
+  runtime-sync ctl start
+  runtime-sync ctl stop
+  runtime-sync ctl rescan
+  runtime-sync ctl once [MAC]
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import sys
+from pathlib import Path
+
+
+DEFAULT_SOCKET = Path(os.environ.get("SYNCSONIC_RUNTIME_SYNC_SOCKET", "/run/syncsonic/runtime-sync.sock"))
+
+
+def _send(socket_path: Path, command: str) -> str:
+    if not socket_path.exists():
+        raise SystemExit(f"runtime-sync service socket not found: {socket_path}")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5.0)
+        sock.connect(str(socket_path))
+        sock.sendall((command + "\n").encode("utf-8"))
+        buf = b""
+        while b"\n" not in buf and len(buf) < 8192:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    return buf.decode("utf-8", errors="replace").strip()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
+    sub = parser.add_subparsers(dest="mode", required=True)
+    ctl = sub.add_parser("ctl", help="Send a command to the running runtime-sync service")
+    ctl.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
+    if args.mode == "ctl":
+        command = " ".join(args.command).strip() or "status"
+        print(_send(args.socket, command))
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

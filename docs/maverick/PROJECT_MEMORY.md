@@ -349,7 +349,7 @@ Slice 2 = measure-but-don't-correct. The closed-loop correction (feeding measure
 - **Two speakers only for now** (down from three per epic-charter language). Operator reported something off with the third speaker; investigating that is its own work, not in this slice.
 - **15-second cadence per speaker** → 30-second full cycle for two speakers → ~20 measurements per speaker in a 10-minute run.
 - **Detector lives in Python on Pi** (per the use-fast-iterate principle — we measure CPU cost and rewrite to C only if profiling demands).
-- **Wall-clock alignment** between mic capture timestamps and emit_burst issue time. Acceptable for slice 2's slider-correlation experiment (slider moves are 100s of ms; wall-clock-to-audio-clock drift is ~10 ms over the experiment). Audio-clock alignment is deferred to slice 3 where the drift signal itself is ~µs/s.
+- **Wall-clock alignment** between mic capture timestamps and `emit_burst` return time. Acceptable for slice 2's slider-correlation experiment (slider moves are 100s of ms; wall-clock-to-audio-clock drift is ~10 ms over the experiment). Audio-clock alignment is deferred to slice 3 where the drift signal itself is ~µs/s.
 - **`frame_index_emitted` is also logged per emit** even though slice 2 doesn't compute against it — gives slice 3 a clean swap-in for tighter alignment.
 - **Context-aware mic window:** `expected_arrival = t_emit + filter_delay_depth + estimated_BT_codec_latency`; initial margin 250 ms; tighten to 100 ms after 5+ stable measurements per speaker.
 - **5-second warmup** before the first burst — establishes mic noise floor used as detector threshold for the rest of the run.
@@ -363,3 +363,28 @@ Slice 2 = measure-but-don't-correct. The closed-loop correction (feeding measure
 Slice 2 success criterion: after a 10-minute run with operator manually moving filter delay sliders mid-run, the journal log lets us reconstruct per-speaker latency over time AND we can see that slider moves correlate with corresponding shifts in measured arrival. That correlation IS the proof that end-to-end measurement works.
 
 Dispatched as a new Maverick workstream targeting the `ultrasonic-runtime-sync` epic branch.
+
+## 2026-05-27T01:48:55Z — Slice 2 implementation draft: open-loop runtime-sync service
+
+Added the slice-2 measurement path on workstream branch `maverick/syncsonic/ultrasonic/slice-2-open-loop-per-speaker-latency-measurement-130e247e`.
+
+**What changed:**
+- New backend service module `backend/syncsonic_ble/runtime_sync_service.py`.
+- New manual local CLI shim `backend/runtime-sync` for `runtime-sync ctl <cmd>` commands over `/run/syncsonic/runtime-sync.sock`.
+- New optional systemd unit `backend/syncsonic-runtime-sync.service` with `StandardOutput=journal` / `StandardError=journal`.
+
+**Design decisions followed:**
+- Mic capture uses a long-running `parecord` subprocess, with stdout appended into an in-memory `RingBuffer`.
+- Service logs structured JSON-lines via `print(json.dumps(record), flush=True)` for journal capture.
+- Active speaker discovery intersects filter sockets in `/tmp/syncsonic-engine` with `connected_devices_on_adapter()` and degrades to an empty target set on broad probe failure.
+- Filter control is done by an inline `_send_filter_command(socket_path, payload)` helper in the service module, not through `PipeWireTransportManager`.
+
+**Verification so far:**
+- `python3 -m compileall syncsonic_ble` passed from `backend/`.
+- `python3 -m py_compile backend/runtime-sync` passed.
+- `systemd-analyze verify backend/syncsonic-runtime-sync.service` passed.
+- `python3 -m pytest ...` could not run locally because the execution environment lacks `pytest`.
+- Read-only Pi inspection reached `syncsonic@10.0.0.89`: Pi repo is on `ultrasonic-runtime-sync`; `syncsonic.service` is active since 2026-05-25 22:46:04 EDT; current runtime has two `pw_delay_filter` sockets/processes (`F4:6A:DD:D4:F3:C8`, `28:FA:19:B6:0E:3B`) and the existing rolling mic capture process is running.
+
+**Follow-up still needed:**
+- Pi deployment / 10-minute journal validation with manual slider movement remains required before claiming slice-2 hardware success.

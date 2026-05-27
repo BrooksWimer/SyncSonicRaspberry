@@ -282,3 +282,61 @@ Cost: the filter's wire protocol needs extending — a "play this burst at the n
 ### Theoretical caveat to revisit
 
 In-filter burst emission means probe samples don't traverse the `virtual_out → filter input` PipeWire link that music traverses. Operator flagged this as a possible measurement-fidelity gap but expected impact is small relative to BT codec latency (PipeWire-internal hop is typically <5 ms vs ~370 ms codec). Worth measuring once the in-filter path exists; not a blocker for design adoption.
+
+## 2026-05-26T01:11:27.909Z - Slice 1: cadence-based ultrasonic + envelope detector + drift correction loop
+
+- Workstream: 9437d092-fa1e-4a06-9bd1-2ed6db2cd442
+- Completed by: dashboard
+- Epic: ultrasonic-runtime-sync
+- Branch: maverick/syncsonic/ultrasonic/slice-1-cadence-based-ultrasonic-envelope-detector-drift-correction-loop-9437d092
+- Summary: Your repeated instruction matches the implementation direction I’m on: no upstream proposal re-derivation, no muting/ducking, ActuationManager timing metadata, and per-sink `paplay` isolation. Local test execution is blocked by missing Python test dependencies, so I’m collecting the Pi-side read-only evidence next while keeping hardware validation clearly scoped as inspection only.
+
+The Pi is reachable, but the service is currently inactive, so I’m not claiming live hardware playback validati...
+- Planned slice: Dispatch the structured plan to Codex for implementation
+- Latest turn: Your repeated instruction matches the implementation direction I’m on: no upstream proposal re-derivation, no muting/ducking, ActuationManager timing metadata, and per-sink `paplay` isolation. Local test execution is blocked by missing Python test dependencies, so I’m collecting the Pi-side read-only evidence next while keeping hardware validation clearly scoped as inspection only.
+
+The Pi is reachable, but the service is currently inactive, so I’m not claiming live hardware playback validati...
+- Last next action: Verify the changes before moving to review.
+
+## 2026-05-26T01:28:35.658Z - Slice 0: ultrasonic vs in-band probe measurement
+
+- Workstream: 531fcb61-da79-459c-ae92-786bed9c9511
+- Completed by: dashboard
+- Epic: ultrasonic-runtime-sync
+- Branch: maverick/syncsonic/ultrasonic/slice-0-ultrasonic-vs-in-band-probe-measurement-531fcb61
+- Summary: Planning produced a final Codex execution prompt.
+- Planned slice: Dispatch the structured plan
+- Latest turn: Codex App Server adapter shutting down
+- Last next action: Inspect the failed turn output and decide whether to retry or steer the workstream.
+
+## 2026-05-26 — Slice 1 (Option C) shipped + validated
+
+PR [#18](https://github.com/BrooksWimer/SyncSonicRaspberry/pull/18) merged into the `ultrasonic-runtime-sync` epic branch as squash commit `7314834`. Filter-resident ultrasonic burst emission is live on the Pi and produced a clean Pi-validated 24000-sample frame_index delta (= exactly 500 ms × 48 samples/ms) when the configured filter delay was shifted from 113 ms to 613 ms. Heyday's alignment was restored to baseline (`target_delay_samples=5424`) before the workstream archived.
+
+### What's on the epic branch now
+
+- C filter (`backend/tools/pw_delay_filter.c`): burst queue, delayed in-filter burst synthesis, emit timestamp ring, `emit_burst` socket command, `query_emit_timestamps` socket command, `burst_active` query field
+- Python actuation (`backend/syncsonic_ble/helpers/arrival_burst_actuation.py`): thin socket-command wrapper, no direct paplay
+- Service transport (`backend/syncsonic_ble/helpers/pipewire_transport.py`): two new wrapper methods + `-lm` link flag for the audio synthesis math
+- BLE handler `handle_ultrasonic_sync` un-stubbed (still single-speaker, no detector)
+- Manual harness extended (`backend/measurement/_filter_ctl.py emit_burst` and `query_emit_timestamps` subcommands)
+- Service startup script (`backend/start_syncsonic.sh`): `-lm` link flag in the auto-rebuild path so systemd recovery doesn't break on `sinf`/`cosf`
+
+### What's still NOT in the application
+
+Slice 1 only delivered the emission half + a manual validation harness. The integrated drift-correction loop the epic was built for does not yet exist:
+
+- **No detector.** Mic audio is not yet analyzed for burst arrival timestamps. The `frame_index` from emit_log + a mic capture timestamp = per-speaker latency, but the consumer of that math isn't written.
+- **No continuous cadence.** Bursts are issued manually one at a time. The "~1 Hz cadence per active speaker" loop from the epic charter is not running.
+- **No drift feedback.** Measured latencies are not yet fed into the elastic engine's `set_rate_ppm` for bounded rate correction.
+- **No multi-speaker disambiguation.** Single speaker only. The 18.0 / 18.5 / 19.0 / 19.5 kHz frequency rotation idea from the proposal is unimplemented.
+- **No UX surface.** No on/off toggle in `SpeakerConfigScreen.tsx`, no "drift correction: on" status pill, no per-speaker correction visualizer.
+- **No soak validation.** 24-hour music session with varied speaker mixes hasn't been run.
+
+### Epic promotion status
+
+Epic branch is now 3 commits ahead of `main` (slice 0 squash, redirect-decision doc, slice 1 squash). **Stays unmerged.** Promotion to main waits until the full drift-correction loop is shipping end-to-end and a soak session under varied music holds alignment within audible threshold without operator intervention — that's the epic's original success signal and slice 1 is the first of several toward it.
+
+### Workstream cleanup
+
+Workstream `4307e4eb-58a0-46d0-80b3-e0b6cb26e4dc` archived. Pi switched cleanly to the `ultrasonic-runtime-sync` epic branch, deploy artifacts stashed for reference (`pi-deploy-artifacts-2026-05-25-slice1-optionC`). Pi-side stale v1 test file `measurement/test_arrival_burst_actuation.py` removed (it tested APIs Option C deleted). Heyday speaker delay still at 5424 samples (113 ms) per pre-test alignment.

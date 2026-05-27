@@ -28,7 +28,6 @@ import numpy as np
 
 SOCKET_DIR = Path(os.environ.get("SYNCSONIC_FILTER_SOCKET_DIR", "/tmp/syncsonic-engine"))
 FILTER_SOCKET_GLOB = "syncsonic-delay-*.sock"
-CONTROL_SOCKET = Path(os.environ.get("SYNCSONIC_RUNTIME_SYNC_SOCKET", "/run/syncsonic/runtime-sync.sock"))
 BLUEZ_SERVICE_NAME = "org.bluez"
 DBUS_OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 ADAPTER_INTERFACE = "org.bluez.Adapter1"
@@ -351,24 +350,16 @@ class RuntimeSyncService:
         self.state = RuntimeSyncState()
         self.stop_event = asyncio.Event()
         self.loop_task: Optional[asyncio.Task[None]] = None
-        self.server: Optional[asyncio.AbstractServer] = None
 
     async def run(self) -> None:
         await self.capture.start()
-        await self._start_control_socket()
-        if self.args.auto_start:
-            await self.start_measurement()
+        await self.start_measurement()
         await self.stop_event.wait()
         if self.loop_task:
             self.loop_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.loop_task
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
         await self.capture.stop()
-        with contextlib.suppress(OSError):
-            CONTROL_SOCKET.unlink()
 
     async def start_measurement(self) -> dict[str, Any]:
         if self.loop_task and not self.loop_task.done():
@@ -376,14 +367,6 @@ class RuntimeSyncService:
         self.state.measuring = True
         self.loop_task = asyncio.create_task(self._measurement_loop())
         return {"ok": True, "state": "started"}
-
-    async def stop_measurement(self) -> dict[str, Any]:
-        self.state.measuring = False
-        if self.loop_task:
-            self.loop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.loop_task
-        return {"ok": True, "state": "stopped"}
 
     async def _measurement_loop(self) -> None:
         await self.detector.warmup(self.args.warmup_sec)
@@ -473,59 +456,6 @@ class RuntimeSyncService:
             stable_count=target.stable_count,
         )
 
-    async def _start_control_socket(self) -> None:
-        CONTROL_SOCKET.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            CONTROL_SOCKET.unlink()
-        self.server = await asyncio.start_unix_server(self._handle_control, path=str(CONTROL_SOCKET))
-        os.chmod(CONTROL_SOCKET, 0o660)
-        _emit("control_socket_started", path=str(CONTROL_SOCKET))
-
-    async def _handle_control(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            line = (await reader.readline()).decode("utf-8", errors="replace").strip()
-            response = await self._dispatch_control(line)
-            writer.write((json.dumps(response, sort_keys=True) + "\n").encode("utf-8"))
-            await writer.drain()
-        finally:
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
-
-    async def _dispatch_control(self, line: str) -> dict[str, Any]:
-        parts = line.split()
-        cmd = parts[0] if parts else "status"
-        if cmd == "status":
-            return {
-                "ok": True,
-                "measuring": self.state.measuring,
-                "targets": [target.mac for target in self.state.targets],
-                "cycles": self.state.cycles,
-            }
-        if cmd == "start":
-            return await self.start_measurement()
-        if cmd == "stop":
-            return await self.stop_measurement()
-        if cmd == "rescan":
-            self.state.targets = discover_active_speakers(limit=self.args.max_speakers)
-            return {"ok": True, "targets": [target.mac for target in self.state.targets]}
-        if cmd == "once":
-            targets = discover_active_speakers(limit=self.args.max_speakers)
-            if not targets:
-                return {"ok": False, "err": "no_active_speakers"}
-            mac = parts[1].upper() if len(parts) >= 2 else targets[0].mac
-            by_mac = {target.mac: target for target in targets}
-            target = by_mac.get(mac)
-            if not target:
-                return {"ok": False, "err": "speaker_not_active", "mac": mac}
-            await self._measure_once(target)
-            return {"ok": True, "mac": mac}
-        if cmd in {"quit", "shutdown"}:
-            self.stop_event.set()
-            return {"ok": True, "state": "shutting_down"}
-        return {"ok": False, "err": "unknown_command", "cmd": cmd}
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mic-source", help="Exact PulseAudio/PipeWire source name for parecord")
@@ -537,7 +467,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration-ms", type=int, default=DEFAULT_DURATION_MS)
     parser.add_argument("--amplitude", type=float, default=DEFAULT_AMPLITUDE)
     parser.add_argument("--bt-codec-latency-ms", type=float, default=DEFAULT_BT_CODEC_LATENCY_MS)
-    parser.add_argument("--auto-start", action="store_true", help="Start measuring immediately after service boot")
     return parser
 
 

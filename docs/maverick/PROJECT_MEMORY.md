@@ -364,27 +364,32 @@ Slice 2 success criterion: after a 10-minute run with operator manually moving f
 
 Dispatched as a new Maverick workstream targeting the `ultrasonic-runtime-sync` epic branch.
 
-## 2026-05-27T01:48:55Z — Slice 2 implementation draft: open-loop runtime-sync service
 
-Added the slice-2 measurement path on workstream branch `maverick/syncsonic/ultrasonic/slice-2-open-loop-per-speaker-latency-measurement-130e247e`.
+## 2026-05-27 — Slice 2 implementation cleanup: align with design scope
 
-**What changed:**
-- New backend service module `backend/syncsonic_ble/runtime_sync_service.py`.
-- New manual local CLI shim `backend/runtime-sync` for `runtime-sync ctl <cmd>` commands over `/run/syncsonic/runtime-sync.sock`.
-- New optional systemd unit `backend/syncsonic-runtime-sync.service` with `StandardOutput=journal` / `StandardError=journal`.
+The initial slice 2 Codex commit (`e702795`) over-scoped by adding a systemd unit file, a separate CLI shim with Unix-socket IPC, and placing the main service in `backend/syncsonic_ble/` instead of `backend/measurement/`. Operator did a direct-branch cleanup pass (no new Codex turn) to align with the resolved slice 2 scope.
 
-**Design decisions followed:**
-- Mic capture uses a long-running `parecord` subprocess, with stdout appended into an in-memory `RingBuffer`.
-- Service logs structured JSON-lines via `print(json.dumps(record), flush=True)` for journal capture.
-- Active speaker discovery intersects filter sockets in `/tmp/syncsonic-engine` with `connected_devices_on_adapter()` and degrades to an empty target set on broad probe failure.
-- Filter control is done by an inline `_send_filter_command(socket_path, payload)` helper in the service module, not through `PipeWireTransportManager`.
+**What changed in cleanup:**
+- Moved `backend/syncsonic_ble/runtime_sync_service.py` → `backend/measurement/runtime_latency_service.py` (canonical path for measurement scripts; matches slice 0 + slice 1 convention).
+- Deleted `backend/runtime-sync` (the `runtime-sync ctl <cmd>` IPC shim — out of scope; slice 2 is manual-start CLI only).
+- Deleted `backend/syncsonic-runtime-sync.service` (systemd unit — out of scope; manual invocation only).
+- Stripped the Unix-socket control plane from the main service file: removed `CONTROL_SOCKET` constant, `_start_control_socket`, `_handle_control`, `_dispatch_control` methods, the `self.server` attribute, the `--auto-start` CLI arg, and the conditional auto-start path in `run()`. Service now always begins measurement after capture initialization and shuts down cleanly on SIGINT/SIGTERM via the existing `stop_event` handler. Net delta: 71 lines removed, file went from 566 → 495 lines.
 
-**Verification so far:**
-- `python3 -m compileall syncsonic_ble` passed from `backend/`.
-- `python3 -m py_compile backend/runtime-sync` passed.
-- `systemd-analyze verify backend/syncsonic-runtime-sync.service` passed.
-- `python3 -m pytest ...` could not run locally because the execution environment lacks `pytest`.
-- Read-only Pi inspection reached `syncsonic@10.0.0.89`: Pi repo is on `ultrasonic-runtime-sync`; `syncsonic.service` is active since 2026-05-25 22:46:04 EDT; current runtime has two `pw_delay_filter` sockets/processes (`F4:6A:DD:D4:F3:C8`, `28:FA:19:B6:0E:3B`) and the existing rolling mic capture process is running.
+**What survived (the design-compliant core):**
+- Long-running `parecord` subprocess piped into in-memory `RingBuffer` ✓
+- `EnvelopeDetector` with 5-second warmup baseline, sliding-window FFT (50 ms window / 25 ms hop / 17.5–20 kHz band, hanning + RMS comp) ✓
+- Per-burst measurement cycle: query filter delay → `emit_burst` → `query_emit_timestamps` → context-aware window → detect peak → compute latency_ms → JSON-lines log ✓
+- Context-aware window: 250 ms margin per speaker, tightens to 100 ms after 5+ stable measurements; per-speaker rolling estimated_codec_latency starting at 370 ms ✓
+- Filter-socket auto-discovery intersected with `backend/syncsonic_ble/helpers/adapter_helpers.py:connected_devices_on_adapter()`, graceful try/except ✓
+- Inline `_send_filter_command(socket_path, payload)` helper bypassing `PipeWireTransportManager` ✓
+- JSON-lines stdout via `print(json.dumps(record), flush=True)`, operator invokes via `python3 backend/measurement/runtime_latency_service.py [args]` or wrapped under `systemd-cat -t runtime-latency ...` for journald routing ✓
+- CLI flags: `--mic-source`, `--mic-source-prefix`, `--cadence-sec`, `--warmup-sec`, `--max-speakers`, `--freq-hz`, `--duration-ms`, `--amplitude`, `--bt-codec-latency-ms` ✓
+- 2-speaker default (`--max-speakers 2`), per operator scope ✓
 
-**Follow-up still needed:**
-- Pi deployment / 10-minute journal validation with manual slider movement remains required before claiming slice-2 hardware success.
+**Verification:**
+- `python3 -m py_compile backend/measurement/runtime_latency_service.py` passes
+- Pi hardware validation (10-minute slider-correlation run) NOT done yet — that's the next step before merging the workstream branch into the epic.
+
+**Process notes:**
+- The over-scope happened because the original planner's `finalExecutionPrompt` included the systemd-unit + CLI-shim requirements, and a subsequent operator `reset-to-planning` action auto-pipelined into implementation without picking up the operator's corrective instruction (see Maverick Tier 2 use case log).
+- Direct manual cleanup chosen over re-dispatching Codex because the changes are mechanical (file move + delete-extra-files + strip ~71 lines) and re-running the orchestrator risks repeating the same auto-dispatch issue.

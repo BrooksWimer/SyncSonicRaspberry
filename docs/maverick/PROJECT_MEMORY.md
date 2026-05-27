@@ -463,3 +463,7 @@ These two numbers are the new sensor signal slice 3 consumes. The 22-34 ms stdev
 - Reference existing `EnvelopeDetector` / `RingBuffer` / discovery code (slice 2) — leave untouched
 
 Targets `ultrasonic-runtime-sync` epic branch. Epic stays unmerged until slice 4+ soak validation per the epic-promotion gate.
+
+## 2026-05-27 — Slice 3 implementation spec doc added (planner pointer)
+
+The slice 3 planning agent should template the implementation plan directly from [`proposals/09-slice-3-implementation-spec.md`](proposals/09-slice-3-implementation-spec.md) (committed as `030c348` on this epic branch). That doc has the exact class structure (`DriftController`), method signatures (`observe`), integration points (`RuntimeSyncService.__init__` and `_measure_once`), the three CLI flags (`--enable-correction`, `--max-ppm`, `--smoothing-window`), and the five log event kinds with payload fields. Treat the spec doc as a templating reference, not a starting point for re-derivation. The prior planning round mis-named the existing service class (`RuntimeLatencyService` vs. the actual `RuntimeSyncService`) and omitted the per-speaker state model entirely; the spec doc fixes both, so the next planning pass should consult it before writing implementation steps.

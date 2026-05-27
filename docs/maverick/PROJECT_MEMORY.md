@@ -393,3 +393,73 @@ The initial slice 2 Codex commit (`e702795`) over-scoped by adding a systemd uni
 **Process notes:**
 - The over-scope happened because the original planner's `finalExecutionPrompt` included the systemd-unit + CLI-shim requirements, and a subsequent operator `reset-to-planning` action auto-pipelined into implementation without picking up the operator's corrective instruction (see Maverick Tier 2 use case log).
 - Direct manual cleanup chosen over re-dispatching Codex because the changes are mechanical (file move + delete-extra-files + strip ~71 lines) and re-running the orchestrator risks repeating the same auto-dispatch issue.
+
+## 2026-05-27T02:53:06.509Z - Slice 2: open-loop per-speaker latency measurement
+
+- Workstream: 130e247e-6226-41a0-b749-f24afb62b652
+- Completed by: dashboard
+- Epic: ultrasonic-runtime-sync
+- Branch: maverick/syncsonic/ultrasonic/slice-2-open-loop-per-speaker-latency-measurement-130e247e
+- Summary: I’ll first orient against the current branch docs and existing backend utilities, then I’ll make the service changes in this worktree only. Since this touches runtime ultrasonic measurement and service startup, I’ll treat Pi validation as relevant and separate local verification from any remote evidence.
+
+The sandbox failed before any command executed, so I requested and received permission for read-only inspection. I found the ultrasonic runtime epic doc and the standard verification skill d...
+- Latest turn: I’ll first orient against the current branch docs and existing backend utilities, then I’ll make the service changes in this worktree only. Since this touches runtime ultrasonic measurement and service startup, I’ll treat Pi validation as relevant and separate local verification from any remote evidence.
+
+The sandbox failed before any command executed, so I requested and received permission for read-only inspection. I found the ultrasonic runtime epic doc and the standard verification skill d...
+- Last next action: Verify the changes before moving to review.
+
+## 2026-05-27 — Slice 2 shipped + slice 3 dispatched
+
+Slice 2 (open-loop per-speaker latency measurement) merged into the epic as squash commit `1768cc1` via PR [#20](https://github.com/BrooksWimer/SyncSonicRaspberry/pull/20). Pi validation on the operator's 2-speaker setup confirmed end-to-end measurement works: 38/38 bursts detected, slider-to-latency slope = 1.004 and 1.009 (perfect tracking = 1.000), zero missed bursts across slider values 131-1800 ms.
+
+**Per-speaker intrinsic codec latency now measurable (continuous):**
+- `28:FA:19:B6:0E:3B`: 349 ms ± 22 ms, mean SNR 41.7 dB
+- `F4:6A:DD:D4:F3:C8`: 418 ms ± 34 ms, mean SNR 20.2 dB
+
+These two numbers are the new sensor signal slice 3 consumes. The 22-34 ms stdev is mostly FFT-hop quantization (25 ms hop); the true codec-clock drift component is smaller and only emerges over longer time horizons.
+
+### Slice 3 dispatch: closed-loop drift correction during music playback
+
+**Decision: extend the slice 2 service in-place.** Add a controller that consumes the existing per-burst latency stream and feeds bounded `set_rate_ppm` adjustments back into the elastic delay engine. Same process, same measurement loop — just an optional new code path. No new service, no two-process coordination, no IPC.
+
+**Resolved design forks for slice 3 (do NOT re-derive in planning):**
+
+- **Architecture: extend `backend/measurement/runtime_latency_service.py` in-place.** The slice 2 service already has the per-burst measurement loop, the per-speaker rolling state, and the JSON-lines logging. Slice 3 adds a `DriftController` class and a `--enable-correction` CLI flag. Default behavior unchanged (measure-only) so existing invocations keep working; correction is opt-in for slice 3.
+
+- **Controller algorithm: simple proportional control with low-pass smoothing.** Maintain a rolling baseline of (latency_ms - slider_ms) per speaker = intrinsic codec latency. Detect drift as the deviation of the recent rolling mean from the long-term baseline. Apply a small `set_rate_ppm` correction proportional to that deviation. Bounded at ±50 ppm per ROADMAP §4. Tunable smoothing window (default 5 measurements rolling).
+
+- **Confidence gating: require N=5 consecutive measurements per speaker before applying any correction.** SNR must stay above 10 dB and stable_count must be ≥ 5 for that speaker. If either fails, skip the correction cycle for that speaker but keep measuring. Logged as `correction_skipped` with the reason.
+
+- **Operator escape:** the `--enable-correction` flag is the on/off switch at startup; mid-run disable is via `sudo systemctl stop runtime-latency` (the slice 2 SIGINT/SIGTERM path) — there is no separate runtime toggle for slice 3, and that is intentional (slice 3 is single-binary, slice 4+ can add an in-band BLE toggle if the operator hits a reason to want one).
+
+- **Auto-disable safety:** if any speaker accumulates 3+ consecutive `correction_skipped` events (low confidence) AND its rolling SNR drops below 10 dB, the controller stops issuing corrections for THAT speaker (logged as `controller_paused`). The measurement loop continues. Other speakers are unaffected.
+
+- **Clock alignment:** keep slice 2's wall-clock alignment for the FIRST cut of slice 3. The ±25 ms FFT-hop quantization is the dominant noise term right now; audio-clock alignment would only help when the controller becomes responsive enough that wall-clock jitter matters. Document this as a known limitation in the slice 3 implementation, revisit if controller tuning surfaces wall-clock as the bottleneck.
+
+- **2-speaker scope** stays. The architecture should NOT bake in "exactly two" — the controller logic should work for N speakers — but the validation runs and tuning happen on the operator's current 2-speaker rig.
+
+- **Logging: extend slice 2's JSON-lines schema.** Add `correction_proposed`, `correction_applied`, `correction_skipped`, `controller_paused` event kinds. Each carries: speaker_mac, baseline_codec_ms, current_codec_ms, drift_ppm_estimated, applied_ppm, reason (for skip/pause). Operator inspects via `journalctl -u runtime-latency -f` just like slice 2.
+
+- **Set-rate-ppm pathway:** the elastic engine already accepts `rate_ppm` corrections via the same filter socket protocol (`_send_filter_command(socket_path, "set_rate_ppm <ppm>")` per the existing filter wire format). Slice 3's controller uses the same `_send_filter_command` helper slice 2 added; no new transport.
+
+**Validation criterion for slice 3:** a 30-minute music session with the controller enabled, both speakers playing, no operator intervention. At the end, the journal log should show: (a) corrections applied within ±50 ppm bound, (b) measured per-speaker latency staying within ±10 ms of its starting baseline (drift contained), (c) zero `controller_paused` events on a healthy system. If `controller_paused` fires during the session, that is a real signal worth investigating (audio dropout, BT disconnect, etc.) — slice 3 should make those events easy to read in the journal.
+
+**Out of scope (do NOT include in slice 3):**
+- UX surface (the "drift correction: on" status pill in `SpeakerConfigScreen.tsx` is slice 4+)
+- BLE in-band on/off toggle (slice 4+)
+- Multi-speaker disambiguation via frequency rotation (single-speaker-at-a-time time separation per slice 2 still applies)
+- Soak validation beyond 30 min (24-hour soak is slice 4+)
+- Audio-clock alignment refactor (deferred; revisit if wall-clock jitter becomes the bottleneck)
+- Third-speaker scaling investigation (the operator-deferred work from earlier)
+- Any systemd unit file, separate CLI shim, or IPC (slice 2 cleanup lesson — these are operator invocation concerns, not slice deliverables)
+
+**File constraints (so the planner doesn't invent paths):**
+- Modify ONLY `backend/measurement/runtime_latency_service.py` (extend in-place)
+- May add helper functions/classes to the same file
+- Do NOT create new directories (`src/`, `deploy/`, etc. don't exist in this repo)
+- Do NOT create separate CLI shims, systemd unit files, or IPC sockets
+- Do NOT modify `pyproject.toml` (not in active use)
+- Reference existing `_send_filter_command` helper (slice 2) for filter socket calls
+- Reference existing `EnvelopeDetector` / `RingBuffer` / discovery code (slice 2) — leave untouched
+
+Targets `ultrasonic-runtime-sync` epic branch. Epic stays unmerged until slice 4+ soak validation per the epic-promotion gate.

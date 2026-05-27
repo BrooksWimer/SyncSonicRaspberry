@@ -340,3 +340,26 @@ Epic branch is now 3 commits ahead of `main` (slice 0 squash, redirect-decision 
 ### Workstream cleanup
 
 Workstream `4307e4eb-58a0-46d0-80b3-e0b6cb26e4dc` archived. Pi switched cleanly to the `ultrasonic-runtime-sync` epic branch, deploy artifacts stashed for reference (`pi-deploy-artifacts-2026-05-25-slice1-optionC`). Pi-side stale v1 test file `measurement/test_arrival_burst_actuation.py` removed (it tested APIs Option C deleted). Heyday speaker delay still at 5424 samples (113 ms) per pre-test alignment.
+
+## 2026-05-26 — Slice 2 dispatched: open-loop latency measurement (2-speaker scope)
+
+Slice 2 = measure-but-don't-correct. The closed-loop correction (feeding measurements into the elastic engine's `set_rate_ppm`) is deferred to slice 3 so we can watch real per-speaker latency stabilize on hardware before letting it drive anything.
+
+**Scope decided:**
+- **Two speakers only for now** (down from three per epic-charter language). Operator reported something off with the third speaker; investigating that is its own work, not in this slice.
+- **15-second cadence per speaker** → 30-second full cycle for two speakers → ~20 measurements per speaker in a 10-minute run.
+- **Detector lives in Python on Pi** (per the use-fast-iterate principle — we measure CPU cost and rewrite to C only if profiling demands).
+- **Wall-clock alignment** between mic capture timestamps and emit_burst issue time. Acceptable for slice 2's slider-correlation experiment (slider moves are 100s of ms; wall-clock-to-audio-clock drift is ~10 ms over the experiment). Audio-clock alignment is deferred to slice 3 where the drift signal itself is ~µs/s.
+- **`frame_index_emitted` is also logged per emit** even though slice 2 doesn't compute against it — gives slice 3 a clean swap-in for tighter alignment.
+- **Context-aware mic window:** `expected_arrival = t_emit + filter_delay_depth + estimated_BT_codec_latency`; initial margin 250 ms; tighten to 100 ms after 5+ stable measurements per speaker.
+- **5-second warmup** before the first burst — establishes mic noise floor used as detector threshold for the rest of the run.
+- **Slider value logged at each emit:** the service queries the filter's `target_delay_samples` immediately before each `emit_burst` and logs it alongside emit + arrival timestamps.
+- **Log to systemd journal** (`syncsonic.service` log). Operator inspects via `journalctl -u syncsonic.service -f` over SSH.
+- **Missed bursts** (detector finds no peak in window) are logged as a separate event — diagnostic signal for BT dropouts, mic issues, etc.
+- **Manual start/stop** for slice 2 (CLI on Pi). BLE handler / automatic-on-music wiring is slice 3 work.
+
+**Out of scope for slice 2:** any modification to the elastic engine, any `set_rate_ppm` calls, any UX surface, multi-speaker disambiguation via frequency rotation (single-speaker-at-a-time time separation does the disambiguation for 15-s cadence), soak validation.
+
+Slice 2 success criterion: after a 10-minute run with operator manually moving filter delay sliders mid-run, the journal log lets us reconstruct per-speaker latency over time AND we can see that slider moves correlate with corresponding shifts in measured arrival. That correlation IS the proof that end-to-end measurement works.
+
+Dispatched as a new Maverick workstream targeting the `ultrasonic-runtime-sync` epic branch.

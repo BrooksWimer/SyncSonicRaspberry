@@ -90,3 +90,58 @@ The revised workstream branch `maverick/syncsonic/ultrasonic/slice-1-revised-in-
 Pi validation on heyday (`45:7A:D9:00:81:19`) used the live baseline delay instead of disturbing music alignment. Baseline query returned `target_delay_samples=5424` (`113.0 ms`). A validation script compared per-burst scheduling offsets relative to `frames_out_total` immediately before each `emit_burst`: baseline offset was `5424` samples; baseline+500 ms (`613.0 ms`, `29424` samples) offset was `29424` samples; delta was exactly `24000` samples. The script restored heyday to `target_delay_samples=5424`, and a follow-up query confirmed `current_delay_samples_x100=542400`.
 
 Deployment note: `start_syncsonic.sh` also needs `-lm` on its auto-rebuild command. Updating only the Python transport compile command is insufficient because systemd startup rebuilds `tools/pw_delay_filter` directly when the C source is newer.
+
+## Path to full-time runtime alignment (roadmap, 2026-05-26)
+
+Slice 0 + slice 1 delivered the foundation: probe choice (ultrasonic + envelope detection) and filter-resident burst emission with frame-precise emit timestamps. **Three more slices reach "alignment is a constant part of the application running continuously while music plays."**
+
+### Slice 2 — open-loop latency measurement (dispatched 2026-05-26)
+
+Build the per-burst latency measurement subsystem. Single-direction: emission → mic → detector → log. No feedback into the elastic engine.
+
+**Scope:**
+- Python service on Pi that runs continuously when started
+- Captures mic stream from USB measurement source via PipeWire
+- Cycles through active BT speakers at 15-second cadence per speaker (2-speaker scope for the operator's current setup)
+- For each emit cycle: query the speaker's filter delay, issue `emit_burst`, capture the `frame_index_emitted` from `query_emit_timestamps`
+- Detector runs sliding-window FFT (50 ms window, 25 ms hop, 17.5–20 kHz band) on the mic stream within a context-aware window centered on the expected arrival time (filter delay + estimated BT codec latency from prior measurements)
+- Computes `latency_ms = arrival_time - emit_time` per burst using wall-clock alignment between the emit-return monotonic timestamp and the mic-chunk arrival monotonic timestamp
+- Logs every emit, every arrival (or "missed burst"), the slider value at emit, and the computed latency to the systemd journal
+- Operator inspects via `journalctl -u syncsonic.service -f` over SSH
+
+**Validation:** 10-minute run with operator manually moving the filter-delay slider on each speaker. Journal must show that slider moves correlate with corresponding shifts in measured arrival. That's the proof end-to-end measurement works.
+
+**Validated boundaries (assumed from slice 0 + 2026-05-25 evidence):**
+- Burst is mic-detectable at >40 dB SNR through the BT path on each in-use speaker
+- Music playing in parallel does not mask the ultrasonic burst (band is empty of music content)
+- 15-second cadence is well outside any plausible BT codec latency (~370 ms on heyday), so bursts cannot overlap
+
+### Slice 3 — closed-loop drift correction during music playback
+
+Take the measurement stream from slice 2 and feed it into the elastic engine's `set_rate_ppm` to maintain alignment automatically while music plays.
+
+**Scope (provisional, refine when slice 2 measurements are in hand):**
+- Wire the slice 2 measurement service into the actuation manager / elastic engine
+- Bounded correction: ±50 ppm cap per `ROADMAP.md` §4
+- Confidence gating: only correct when N consecutive measurements per speaker agree within tolerance — never apply a correction based on a single noisy measurement
+- Operator escape: a CLI / BLE command to disable correction immediately
+- Auto-disable on detector confidence drop (missed bursts, SNR collapse, etc.) so correction silently stops rather than going wrong
+- Probably switch from wall-clock to audio-clock alignment here since drift signal is at the µs/s scale where wall-clock noise matters
+
+**Two-speaker scope** stays for slice 3. The architecture should not bake in "exactly two speakers" — but the validation runs and tuning happen with the operator's current setup.
+
+After slice 3 lands and runs cleanly for at least one music session, **"runtime alignment is a constant part of the application" is true for the 2-speaker case**.
+
+### Slice 4+ — hardening before epic promotion
+
+Bringing the runtime loop from "works on the operator's setup" to "ready for epic → main promotion" requires:
+
+- **Multi-speaker scaling beyond 2.** Investigate what was "off" with the third speaker. Add frequency rotation (18.0 / 18.5 / 19.0 / 19.5 kHz across speakers) if simultaneous emission becomes valuable for higher measurement rates.
+- **UX surface.** Toggle in `SpeakerConfigScreen.tsx`, "drift correction: on" status pill, per-speaker correction magnitude visualizer. Coordinates with the `ui-polish` epic.
+- **Soak validation.** 24-hour music session with varied speaker mixes under network/codec stress, holding alignment within audible threshold with zero operator intervention.
+
+Slice 4+ may shake out into multiple discrete workstreams; sizing comes from what slice 3 surfaces.
+
+### Epic promotion gate
+
+The `ultrasonic-runtime-sync` epic branch promotes to `main` only after slice 4+'s soak validation passes. Until then the epic stays unmerged — operator continues to opt in to alignment via the slice 3 service start command.

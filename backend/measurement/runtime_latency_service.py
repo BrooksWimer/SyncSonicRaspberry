@@ -3,6 +3,36 @@
 Slice 2 deliberately measures only: filter-resident ultrasonic burst
 emission, USB mic capture, envelope detection, and JSON-lines journal
 records. It does not feed measurements back into ``set_rate_ppm``.
+
+Invocation (manual CLI; runs as the syncsonic user so it can access
+the filter sockets and the service's PipeWire/Pulse runtime):
+
+    sudo systemd-run --unit=runtime-latency \\
+        --uid=syncsonic --gid=syncsonic \\
+        --working-directory=/home/syncsonic/SyncSonicPi \\
+        --setenv=PULSE_SERVER=unix:/run/syncsonic/pulse/native \\
+        --setenv=RESERVED_HCI=hci3 \\
+        --setenv=RESERVED_ADAPTER_MAC=2C:CF:67:CE:57:91 \\
+        --setenv=PYTHONUNBUFFERED=1 \\
+        python3 /home/syncsonic/SyncSonicPi/backend/measurement/runtime_latency_service.py \\
+        --max-speakers 2
+
+The four ``--setenv`` lines are mandatory:
+- ``PULSE_SERVER`` points at the syncsonic-owned PulseAudio runtime
+  so ``parecord`` can read the USB mic source. Without it the service
+  fails to start capture because the default PulseAudio path is empty.
+- ``RESERVED_HCI`` and ``RESERVED_ADAPTER_MAC`` are required by
+  ``syncsonic_ble.helpers.adapter_helpers`` to pick the BlueZ HCI
+  adapter that owns the speaker connections. Values mirror what
+  ``syncsonic.service`` reads from ``/etc/default/syncsonic`` -- query
+  that file on the Pi for the canonical values.
+- ``PYTHONUNBUFFERED=1`` ensures JSON-line records flush immediately
+  to journald rather than buffering until the buffer fills.
+
+Stop with ``sudo systemctl stop runtime-latency`` (sends SIGTERM, the
+service handles via the existing ``stop_event``).
+
+Inspect log with ``sudo journalctl -u runtime-latency -f``.
 """
 
 from __future__ import annotations
@@ -17,6 +47,11 @@ import signal
 import socket
 import subprocess
 import sys
+# Slice 2 lives at backend/measurement/runtime_latency_service.py — add
+# backend/ to sys.path so imports like `from syncsonic_ble.helpers...` resolve.
+_BACKEND_DIR = __import__("pathlib").Path(__file__).resolve().parent.parent
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
 import time
 from collections import deque
 from dataclasses import dataclass, field

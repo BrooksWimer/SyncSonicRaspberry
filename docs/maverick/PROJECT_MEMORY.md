@@ -467,3 +467,51 @@ Targets `ultrasonic-runtime-sync` epic branch. Epic stays unmerged until slice 4
 ## 2026-05-27 — Slice 3 implementation spec doc added (planner pointer)
 
 The slice 3 planning agent should template the implementation plan directly from [`proposals/09-slice-3-implementation-spec.md`](proposals/09-slice-3-implementation-spec.md) (committed as `030c348` on this epic branch). That doc has the exact class structure (`DriftController`), method signatures (`observe`), integration points (`RuntimeSyncService.__init__` and `_measure_once`), the three CLI flags (`--enable-correction`, `--max-ppm`, `--smoothing-window`), and the five log event kinds with payload fields. Treat the spec doc as a templating reference, not a starting point for re-derivation. The prior planning round mis-named the existing service class (`RuntimeLatencyService` vs. the actual `RuntimeSyncService`) and omitted the per-speaker state model entirely; the spec doc fixes both, so the next planning pass should consult it before writing implementation steps.
+
+## 2026-05-27 - Slice 3 Pi validation attempt: correction loop exercised, closeout gate failed
+
+Slice 3 was merged into the `ultrasonic-runtime-sync` epic as squash commit `67ddbe9` via PR #21, then Pi-tested from the epic head on `syncsonic@10.0.0.89`.
+
+**Setup performed by Codex:**
+- Pi checkout switched from the old slice-2 workstream branch to `ultrasonic-runtime-sync` and fast-forwarded to `67ddbe9`.
+- Pre-existing Pi local edit to `backend/measurement/runtime_latency_service.py` was preserved in `stash@{0}` (`pre-slice3-validation-preserve-slice2-runtime-file`) before checkout.
+- The Pi still has two pre-existing untracked artifacts: `SyncSonic Reliable Alignment Actuation for Multi-Speaker Playback.pdf` and `backend/tools/pw_delay_filter`.
+- Local checks before Pi run: `python -m compileall syncsonic_ble measurement` and `python -m pytest measurement -v` both passed from `backend/` (14 tests).
+- Pi readiness: `syncsonic.service` stayed active; two BlueZ sinks were RUNNING (`28:FA:19:B6:0E:3B`, `F4:6A:DD:D4:F3:C8`); USB mic source was RUNNING; both filter sockets existed under `/tmp/syncsonic-engine/`.
+
+**Validation command:**
+
+```bash
+sudo systemd-run --unit=runtime-latency --uid=syncsonic --gid=syncsonic \
+  --working-directory=/home/syncsonic/SyncSonicPi \
+  --setenv=PULSE_SERVER=unix:/run/syncsonic/pulse/native \
+  --setenv=RESERVED_HCI=hci3 \
+  --setenv=RESERVED_ADAPTER_MAC=2C:CF:67:CE:57:91 \
+  --setenv=PYTHONUNBUFFERED=1 \
+  python3 /home/syncsonic/SyncSonicPi/backend/measurement/runtime_latency_service.py \
+  --max-speakers 2 --enable-correction
+```
+
+Run window: `runtime-latency.service` active from 2026-05-27 21:12:04 EDT to 2026-05-27 21:44:50 EDT. The transient unit was stopped afterward with `sudo systemctl stop runtime-latency`; `syncsonic.service` remained active.
+
+**Journal evidence:**
+- Event counts: `burst_emit=124`, `burst_arrival=122`, `burst_missed=2`, `correction_proposed=2`, `correction_applied=107`, `correction_applied_response=107`, `correction_skipped=13`, `controller_paused=0`.
+- `28:FA:19:B6:0E:3B`: 60 arrivals, baseline codec `366.856 ms`, latency range `477.649..602.658 ms`, min SNR `13.61 dB`, avg SNR `24.70 dB`, 50 applied corrections, max `|applied_ppm|=4.813`, max `|current_codec_ms - baseline_codec_ms|=48.134 ms`, final codec delta `-11.323 ms`.
+- `F4:6A:DD:D4:F3:C8`: 62 arrivals, baseline codec `436.032 ms`, latency range `519.984..623.248 ms`, min SNR `12.46 dB`, avg SNR `17.15 dB`, 57 applied corrections, max `|applied_ppm|=4.561`, max `|current_codec_ms - baseline_codec_ms|=45.613 ms`, final codec delta `-16.043 ms`.
+
+**Acceptance result: FAILED.**
+- Pass: `correction_proposed` appeared once per speaker after baseline establishment.
+- Pass: `correction_applied` appeared for both speakers.
+- Pass: all `|applied_ppm|` values stayed far below the +/-50 ppm bound.
+- Fail: per-speaker `current_codec_ms` did not stay within +/-10 ms of baseline across the run.
+- Pass: zero `controller_paused` events.
+- Operator-audible uninterrupted music check: pending operator confirmation at doc time.
+
+**Diagnosis from logs + code read:**
+- The controller did not saturate or pause. The failure is the stability of the measurement signal feeding the controller.
+- `EnvelopeDetector.detect()` uses a `50 ms` FFT window and `25 ms` hop (`WINDOW_MS=50.0`, `HOP_MS=25.0`), then `DriftController` defaults to a 5-sample rolling mean. The run's latency histogram clustered in 25 ms-scale steps, matching the detector hop.
+- A replay of the recorded codec samples suggests a pure smoothing-window retune helps but is not a clean closeout by itself: simulated max abs codec delta at window 15 was `9.87 ms` for `28:FA...` but `15.01 ms` for `F4:6A...`; window 21 was `7.61 ms` for `28:FA...` and `11.82 ms` for `F4:6A...`; window 31 got both under 10 ms but would delay baseline/correction enough to change the slice-3 operating behavior.
+- Therefore the next slice should not promote to slice 4+ yet. Recommended next work is a slice 3 tuning retry focused on detector resolution and controller smoothing: reduce detector hop granularity (for example 25 ms -> 5 ms), consider separating "baseline establishment window" from "correction smoothing window", then rerun the same 30-minute 2-speaker Pi validation.
+
+**Planning implication:**
+Do not mark the epic functionally feature-complete for the 2-speaker case yet. Slice 4+ planning (third speaker, UX surface, 24-hour soak) should wait until a slice 3 tuning retry passes the 30-minute 2-speaker closeout gate.

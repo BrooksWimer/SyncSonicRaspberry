@@ -564,3 +564,44 @@ Branch: `codex/ultrasonic-sample-clock-pattern` from `ultrasonic-runtime-sync`.
 - `backend/measurement/runtime_latency_service.py` now tracks mic sample indices and exposes `--detector-mode {peak,onset,pattern}`, `--pattern-bursts`, `--pattern-gap-ms`, and `--pattern-tolerance-ms`.
 - `backend/measurement/test_runtime_latency_service.py` covers the new pure detector math.
 - Local verification passed: `python -m compileall syncsonic_ble measurement`; `python -m pytest measurement -v` (17 tests).
+
+## 2026-05-28 - Slice 3b Pi smoke: pattern detector runs, correction-grade stability not proven
+
+Branch: `codex/ultrasonic-sample-clock-pattern` at commit `6d6bf26`.
+
+**Setup performed by Codex:**
+- Pi checkout switched to `codex/ultrasonic-sample-clock-pattern` and fast-forwarded to `6d6bf26`.
+- `syncsonic.service` stayed active; the transient `runtime-latency.service` was stopped after the smoke run; `syncsonic.service` remained active afterward.
+- Pi still has the pre-existing untracked artifacts: `SyncSonic Reliable Alignment Actuation for Multi-Speaker Playback.pdf` and `backend/tools/pw_delay_filter`.
+- Local verification before Pi run: `python -m compileall syncsonic_ble measurement` passed; `python -m pytest measurement -v` passed (17 tests).
+- Pi verification before runtime: `python3 -m compileall /home/syncsonic/SyncSonicPi/backend/measurement/runtime_latency_service.py /home/syncsonic/SyncSonicPi/backend/measurement/test_runtime_latency_service.py` passed. Pi-side pytest was not run because `pytest` is not installed on the Pi.
+
+**Validation command:**
+
+```bash
+sudo systemd-run --unit=runtime-latency --uid=syncsonic --gid=syncsonic \
+  --working-directory=/home/syncsonic/SyncSonicPi \
+  --setenv=PULSE_SERVER=unix:/run/syncsonic/pulse/native \
+  --setenv=RESERVED_HCI=hci3 \
+  --setenv=RESERVED_ADAPTER_MAC=2C:CF:67:CE:57:91 \
+  --setenv=PYTHONUNBUFFERED=1 \
+  python3 /home/syncsonic/SyncSonicPi/backend/measurement/runtime_latency_service.py \
+  --max-speakers 2 --detector-mode pattern --pattern-bursts 3 --duration-ms 50 --pattern-gap-ms 300
+```
+
+Run window: `runtime-latency.service` active starting 2026-05-27 22:48:28 EDT. The unit was stopped afterward with `sudo systemctl stop runtime-latency`.
+
+**Journal evidence:**
+- Event counts: `burst_pattern_emit=21`, `burst_pattern_arrival=5`, `burst_pattern_missed=1`, `detector_warmup=1`, `device_discovery=4`, `mic_capture_started=1`, `mic_capture_stopped=1`, `service_starting=1`, `service_stopped=1`.
+- `28:FA:19:B6:0E:3B`: 3 pattern arrivals, SNR min/avg `12.52/12.89 dB`, max/avg `pattern_mean_abs_error_ms=2.06/1.20`, max absolute per-burst matched error `4.83 ms`, `sample_clock_drift_ms` min/max/final `-5.25/45.17/-5.25`, candidate count range `3..7`.
+- `F4:6A:DD:D4:F3:C8`: 2 pattern arrivals and 1 missed pattern, SNR min/avg `12.00/12.33 dB`, max/avg `pattern_mean_abs_error_ms=2.06/1.28`, max absolute per-burst matched error `5.50 ms`, `sample_clock_drift_ms` min/max/final `-6.77/0.00/-6.77`, candidate count range `3..8`.
+
+**Acceptance result: PARTIAL.**
+- Pass: pattern mode executed end-to-end on the Pi against both live speakers.
+- Pass: logs include exact filter `emit_frame_index` values, continuous mic `arrival_sample_index` values, matched arrival sample indices, `sample_clock_delta_ms`, baseline-subtracted `sample_clock_drift_ms`, and `pattern_mean_abs_error_ms`.
+- Pass: successful pattern arrivals had internal spacing error under 10 ms.
+- Not yet pass: one `pattern_not_matched` event on `F4:6A:DD:D4:F3:C8`.
+- Not yet pass: `28:FA:19:B6:0E:3B` showed one `sample_clock_drift_ms` outlier at `45.17 ms`, so the run does not yet prove the sample-clock drift signal is correction-grade.
+
+**Planning implication:**
+The new measurement path is the right direction: exact filter-frame emission timing plus continuous mic sample indices removes the 50 ms / 25 ms legacy peak-window ambiguity from the successful pattern matches. The next implementation step should harden pattern acquisition before reconnecting the controller: improve per-burst onset selection and pattern-match confidence handling, and log enough evidence to explain misses/outliers. Do not feed pattern mode into `DriftController` until a longer Pi run shows zero pattern misses and bounded `sample_clock_drift_ms` across both speakers.

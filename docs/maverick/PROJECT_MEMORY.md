@@ -516,3 +516,17 @@ Run window: `runtime-latency.service` active from 2026-05-27 21:12:04 EDT to 202
 
 **Planning implication:**
 Do not mark the epic functionally feature-complete for the 2-speaker case yet. Slice 4+ planning (third speaker, UX surface, 24-hour soak) should wait until a slice 3 tuning retry passes the 30-minute 2-speaker closeout gate.
+
+### Follow-up interpretation: slice 2 proof boundary vs. slice 3 precision requirement
+
+After Brooks confirmed the music sounded stable for the whole slice 3 run, treat the numeric failure as a measurement-semantics problem until proven otherwise.
+
+Important distinction: slice 2 proved **large-signal relative tracking**. The validation moved filter delays across 131-1800 ms and showed measured latency moved with the slider (`slope=1.004` and `1.009`). That is strong evidence that the burst traverses the intended speaker path and the detector can recover coarse arrival shifts. It is not the same as proving each steady-state burst timestamp is precise to +/-10 ms. The slice 2 closeout already recorded 22-34 ms per-speaker spread and called out 25 ms FFT-hop quantization as a dominant noise term.
+
+Slice 3 did **not** materially change the detector path. Diffing slice 2 (`1768cc1`) to slice 3 (`67ddbe9`) shows `EnvelopeDetector`, `WINDOW_MS=50.0`, `HOP_MS=25.0`, `expected_arrival`, and `latency_ms` calculation are unchanged; slice 3 adds `DriftController`, correction logs, and `set_rate_ppm` calls around the same measurement stream.
+
+The likely disconnect is that `EnvelopeDetector.detect()` is a **peak-energy window picker**, not a true onset / time-of-arrival estimator. It scans the detection interval and returns the center timestamp of the highest-power 50 ms FFT window. The emitted ultrasonic burst is 100 ms long. That means several valid 50 ms windows can sit inside the same physical burst, and small envelope/codec/noise differences can move the chosen "arrival" between adjacent 25 ms hop buckets even while audible playback remains stable.
+
+The slice 3 journal supports this: `arrival_monotonic - expected_arrival_monotonic` clustered in exact 25 ms buckets. `28:FA:19:B6:0E:3B` ranged from about `-50` to `+75 ms`; `F4:6A:DD:D4:F3:C8` ranged from about `0` to `+100 ms`. That shape looks like window-choice ambiguity across a burst envelope, not a slow physical drift of the speaker path.
+
+Planning correction: do not frame the next step as generic experimentation or simple window widening. First tighten the measurement definition: decide whether runtime correction needs burst **onset**, burst **center**, or a stable envelope landmark, then implement/log that estimator explicitly. Candidate work should be justified against this explanation before changing controller gain or starting slice 4+.

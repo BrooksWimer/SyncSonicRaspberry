@@ -621,4 +621,37 @@ The sample-clock delta is now the mean delta across the whole matched burst sequ
 
 **Still out of scope:** this does not feed pattern results into `DriftController`; it only hardens the measurement signal and its diagnostics.
 
-**Local verification:** `python -m compileall syncsonic_ble measurement` passed; `python -m pytest measurement -v` passed (19 tests).
+**Local verification:** `python -m compileall syncsonic_ble measurement` passed; `python -m pytest measurement -v` passed (20 tests).
+
+### Pi confirmation at `6621741`
+
+Pi checkout fast-forwarded to `6621741`; Pi compile passed for `backend/measurement/runtime_latency_service.py` and `backend/measurement/test_runtime_latency_service.py`. Pi-side pytest was not run because `pytest` is not installed on the Pi.
+
+Command:
+
+```bash
+sudo systemd-run --unit=runtime-latency --uid=syncsonic --gid=syncsonic \
+  --working-directory=/home/syncsonic/SyncSonicPi \
+  --setenv=PULSE_SERVER=unix:/run/syncsonic/pulse/native \
+  --setenv=RESERVED_HCI=hci3 \
+  --setenv=RESERVED_ADAPTER_MAC=2C:CF:67:CE:57:91 \
+  --setenv=PYTHONUNBUFFERED=1 \
+  python3 /home/syncsonic/SyncSonicPi/backend/measurement/runtime_latency_service.py \
+  --max-speakers 2 --detector-mode pattern --pattern-bursts 3 --duration-ms 50 \
+  --pattern-gap-ms 300 --pattern-clock-tolerance-ms 20 --pattern-min-snr-db 9
+```
+
+Run window started 2026-05-27 23:44:05 EDT. `runtime-latency.service` was stopped afterward; `syncsonic.service` remained active.
+
+Evidence summary:
+- Event counts: `burst_pattern_emit=30`, `burst_pattern_arrival=10`, `burst_pattern_missed=0`, `service_stopped=1`.
+- `28:FA:19:B6:0E:3B`: 5 arrivals; selection `best_spacing=1`, `clock_prior=4`; SNR min/avg `9.02/9.24 dB`; max matched error `8.67 ms`; max pattern clock spread `8.67 ms`; max `|pattern_clock_prior_error_ms|=9.97`; max `|sample_clock_drift_ms|=18.92`; total rejected alternate clock groups `2`.
+- `F4:6A:DD:D4:F3:C8`: 5 arrivals; selection `best_spacing=1`, `clock_prior=4`; SNR min/avg `9.38/9.86 dB`; max matched error `6.17 ms`; max pattern clock spread `6.17 ms`; max `|pattern_clock_prior_error_ms|=7.44`; max `|sample_clock_drift_ms|=15.81`; total rejected alternate clock groups `3`.
+
+Acceptance result: PARTIAL.
+- Pass: exact filter-frame + mic-sample pattern mode ran end-to-end for both speakers.
+- Pass: lower pattern candidate floor eliminated the `F4` no-candidate misses in this smoke run.
+- Pass: the clock prior rejected alternate sequence groups and prevented the previous 45 ms-style jump.
+- Not yet pass: baseline-relative `sample_clock_drift_ms` still exceeded 10 ms on both speakers. The likely remaining problem is the low-SNR onset landmark moving inside the burst envelope, not missing emit timing or sequence spacing.
+
+Planning implication: the next pass should keep the exact emit-frame/pattern architecture but refine the mic-side landmark. Candidate directions: log best-unprioritized match fields on arrivals, score viable matches with both clock-prior error and pattern geometry, or replace threshold-crossing onset with a demodulated ultrasonic envelope / slope landmark. Do not feed pattern mode into `DriftController` yet.

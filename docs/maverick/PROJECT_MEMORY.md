@@ -700,3 +700,17 @@ Acceptance result: PARTIAL.
 - Not yet pass: baseline-relative `sample_clock_drift_ms` still exceeded 10 ms on both speakers over the 4 minute smoke run.
 
 Planning implication: the remaining error no longer looks primarily like "we cannot find the burst." The envelope landmark found complete sequences with high SNR and tight internal spacing, but both speakers still showed a same-direction negative slope over time. That points at clock-domain alignment: mic sample indices and PipeWire filter-frame emit indices are both nominally 48 kHz, but they are not proven to be the same clock over minutes. The next slice should model the relative mic-vs-emit clock slope before treating baseline-subtracted deltas as speaker drift. A correction-grade pipeline should separate common-mode clock-domain slope from per-speaker residual drift, then feed only the residual into `DriftController`.
+
+## 2026-05-28 - Slice 3d started: common-mode subtraction + observe-only proposals
+
+Branch: `codex/ultrasonic-sample-clock-pattern`.
+
+**Design correction:** the listener cares about relative speaker timing, not whether every speaker drifts together against the mic capture process clock. Pattern-mode sample-clock deltas now have a pure `RelativeDriftEstimator` that baselines each speaker, computes a recent group common-mode drift from active peers, subtracts it, and emits observe-only `relative_correction_proposed` / `relative_correction_skipped` records. It does not call `set_rate_ppm`.
+
+**New CLI flag:** `--enable-relative-proposals` turns on the observe-only logs for pattern mode. `--relative-gain-ppm-per-ms` defaults to `5.0`, and `--relative-peer-max-age-sec` defaults to `90.0`. Legacy `--enable-correction` remains unchanged and should still not be used with pattern mode until the relative proposal stream is Pi-validated.
+
+**Offline replay against the 2026-05-28 13:36:52 EDT Pi smoke:** no new live run was performed. Replaying the 16 existing `burst_pattern_arrival` rows through the new estimator produced 1 initial `insufficient_recent_peers` skip and 15 proposals with `smoothing_window=1`: absolute per-speaker baseline drift max `28.611 ms`, group-relative residual max `3.312 ms`, proposed ppm range `-4.115..16.562`, final common clock slope `-108.190 ppm`. With the runtime default `smoothing_window=5`, the same rows produced 8 warmup/peer skips and 8 proposals: max smoothed residual `2.566 ms`, proposed ppm range `-0.917..12.830`. This supports the operator's read: most of the previously alarming same-direction drift is common-mode and should not drive per-speaker actuation.
+
+**Local verification:** `python -m compileall syncsonic_ble measurement` passed; `python -m pytest measurement -v` passed (25 tests); `python measurement/runtime_latency_service.py --help` shows the new observe-only flags.
+
+**Next validation step:** deploy this branch to the Pi and run pattern mode with `--enable-relative-proposals`, but without `--enable-correction`. Success for that pass is stable `relative_correction_proposed` records with small group-relative residuals and no actuator writes. Only after that should pattern residuals be wired into `set_rate_ppm`.

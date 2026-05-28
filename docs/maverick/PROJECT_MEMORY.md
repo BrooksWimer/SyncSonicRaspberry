@@ -505,11 +505,12 @@ Run window: `runtime-latency.service` active from 2026-05-27 21:12:04 EDT to 202
 - Pass: all `|applied_ppm|` values stayed far below the +/-50 ppm bound.
 - Fail: per-speaker `current_codec_ms` did not stay within +/-10 ms of baseline across the run.
 - Pass: zero `controller_paused` events.
-- Operator-audible uninterrupted music check: pending operator confirmation at doc time.
+- Pass: operator-audible uninterrupted music check. Brooks reported after the run that playback "sounded super great and really stable the whole time," with no perceived instability during the validation window.
 
 **Diagnosis from logs + code read:**
 - The controller did not saturate or pause. The failure is the stability of the measurement signal feeding the controller.
 - `EnvelopeDetector.detect()` uses a `50 ms` FFT window and `25 ms` hop (`WINDOW_MS=50.0`, `HOP_MS=25.0`), then `DriftController` defaults to a 5-sample rolling mean. The run's latency histogram clustered in 25 ms-scale steps, matching the detector hop.
+- Because the operator-audible result was stable while the journaled codec estimate wandered, treat this as a measurement-fidelity disconnect first, not evidence that audible speaker alignment was unstable.
 - A replay of the recorded codec samples suggests a pure smoothing-window retune helps but is not a clean closeout by itself: simulated max abs codec delta at window 15 was `9.87 ms` for `28:FA...` but `15.01 ms` for `F4:6A...`; window 21 was `7.61 ms` for `28:FA...` and `11.82 ms` for `F4:6A...`; window 31 got both under 10 ms but would delay baseline/correction enough to change the slice-3 operating behavior.
 - Therefore the next slice should not promote to slice 4+ yet. Recommended next work is a slice 3 tuning retry focused on detector resolution and controller smoothing: reduce detector hop granularity (for example 25 ms -> 5 ms), consider separating "baseline establishment window" from "correction smoothing window", then rerun the same 30-minute 2-speaker Pi validation.
 

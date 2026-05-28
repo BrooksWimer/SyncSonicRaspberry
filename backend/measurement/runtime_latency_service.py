@@ -96,6 +96,8 @@ ENVELOPE_SMOOTH_MS = 2.0
 ENVELOPE_REFRACTORY_MS = 25.0
 ENVELOPE_EDGE_PRE_MS = 4.0
 ENVELOPE_EDGE_POST_MS = 8.0
+RELATIVE_CORRECTION_GAIN_PPM_PER_MS = 5.0
+RELATIVE_PEER_MAX_AGE_SEC = 90.0
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
 
@@ -1018,6 +1020,218 @@ class DriftController:
         }
 
 
+@dataclass
+class RelativeClockObservation:
+    mac: str
+    monotonic: float
+    delta_samples: float
+    drift_samples: float
+    snr_db: float
+    stable_count: int
+
+
+class RelativeDriftEstimator:
+    """Group-relative sample-clock drift estimator.
+
+    Pattern mode produces ``arrival_sample_index - emit_frame_index``. That
+    delta is useful, but it contains both speaker latency and any shared slope
+    between the mic capture clock and the PipeWire/filter frame clock. This
+    estimator removes the common-mode part before proposing any per-speaker
+    correction, so speakers that move together produce near-zero proposals.
+
+    Positive residual means this speaker is late relative to the group. In the
+    C filter, positive ``set_rate_ppm`` increases effective delay over time, so
+    a positive residual maps to a negative proposed rate.
+    """
+
+    def __init__(
+        self,
+        max_ppm: float = 50.0,
+        smoothing_window: int = 5,
+        gain_ppm_per_ms: float = RELATIVE_CORRECTION_GAIN_PPM_PER_MS,
+        peer_max_age_sec: float = RELATIVE_PEER_MAX_AGE_SEC,
+    ) -> None:
+        self.max_ppm = max_ppm
+        self.smoothing_window = max(1, int(smoothing_window))
+        self.gain_ppm_per_ms = float(gain_ppm_per_ms)
+        self.peer_max_age_sec = max(0.0, float(peer_max_age_sec))
+        self.baselines: dict[str, float] = {}
+        self.latest: dict[str, RelativeClockObservation] = {}
+        self.recent_residuals_ms: dict[str, list[float]] = {}
+        self.common_history: list[tuple[float, float]] = []
+
+    def observe(
+        self,
+        *,
+        mac: str,
+        monotonic: float,
+        delta_samples: float,
+        snr_db: float,
+        stable_count: int,
+        pattern_mean_abs_error_ms: Optional[float] = None,
+        pattern_clock_delta_spread_ms: Optional[float] = None,
+    ) -> dict[str, Any]:
+        mac = mac.upper()
+        if mac not in self.baselines:
+            self.baselines[mac] = float(delta_samples)
+        drift_samples = float(delta_samples) - self.baselines[mac]
+        obs = RelativeClockObservation(
+            mac=mac,
+            monotonic=float(monotonic),
+            delta_samples=float(delta_samples),
+            drift_samples=drift_samples,
+            snr_db=float(snr_db),
+            stable_count=int(stable_count),
+        )
+        self.latest[mac] = obs
+
+        active = self._active_observations(float(monotonic))
+        if len(active) < 2:
+            return self._skip_record(
+                obs,
+                reason="insufficient_recent_peers",
+                active=active,
+                pattern_mean_abs_error_ms=pattern_mean_abs_error_ms,
+                pattern_clock_delta_spread_ms=pattern_clock_delta_spread_ms,
+            )
+
+        common_drift_samples = self._median([item.drift_samples for item in active])
+        common_drift_ms = common_drift_samples * 1000.0 / SAMPLE_RATE
+        self._remember_common(float(monotonic), common_drift_samples)
+        residual_samples = drift_samples - common_drift_samples
+        residual_ms = residual_samples * 1000.0 / SAMPLE_RATE
+
+        recent = self.recent_residuals_ms.setdefault(mac, [])
+        recent.append(residual_ms)
+        if len(recent) > self.smoothing_window:
+            recent.pop(0)
+        recent_residual_ms = sum(recent) / len(recent)
+
+        fields = self._base_record(
+            obs,
+            active=active,
+            common_drift_ms=common_drift_ms,
+            residual_ms=residual_ms,
+            recent_residual_ms=recent_residual_ms,
+            pattern_mean_abs_error_ms=pattern_mean_abs_error_ms,
+            pattern_clock_delta_spread_ms=pattern_clock_delta_spread_ms,
+        )
+
+        if stable_count < self.smoothing_window:
+            return {
+                "event": "relative_correction_skipped",
+                "reason": "warming_up",
+                **fields,
+            }
+        if snr_db < CORRECTION_SNR_FLOOR_DB:
+            return {
+                "event": "relative_correction_skipped",
+                "reason": "low_snr",
+                **fields,
+            }
+
+        proposed_uncapped = -recent_residual_ms * self.gain_ppm_per_ms
+        proposed_ppm = self._clamp_ppm(proposed_uncapped)
+        return {
+            "event": "relative_correction_proposed",
+            "reason": "group_residual",
+            "proposed_rate_ppm_uncapped": proposed_uncapped,
+            "proposed_rate_ppm": proposed_ppm,
+            "gain_ppm_per_ms": self.gain_ppm_per_ms,
+            "set_rate_ppm_sign": "negative_reduces_delay_positive_increases_delay",
+            **fields,
+        }
+
+    def _active_observations(self, now: float) -> list[RelativeClockObservation]:
+        return [
+            obs
+            for obs in self.latest.values()
+            if now - obs.monotonic <= self.peer_max_age_sec
+        ]
+
+    def _remember_common(self, monotonic: float, common_drift_samples: float) -> None:
+        self.common_history.append((monotonic, common_drift_samples))
+        max_len = max(4, self.smoothing_window * 4)
+        if len(self.common_history) > max_len:
+            self.common_history = self.common_history[-max_len:]
+
+    def _base_record(
+        self,
+        obs: RelativeClockObservation,
+        *,
+        active: list[RelativeClockObservation],
+        common_drift_ms: Optional[float],
+        residual_ms: Optional[float],
+        recent_residual_ms: Optional[float],
+        pattern_mean_abs_error_ms: Optional[float],
+        pattern_clock_delta_spread_ms: Optional[float],
+    ) -> dict[str, Any]:
+        return {
+            "mac": obs.mac,
+            "sample_clock_delta_ms": obs.delta_samples * 1000.0 / SAMPLE_RATE,
+            "speaker_sample_clock_drift_ms": obs.drift_samples * 1000.0 / SAMPLE_RATE,
+            "group_common_drift_ms": common_drift_ms,
+            "relative_residual_ms": residual_ms,
+            "recent_relative_residual_ms": recent_residual_ms,
+            "common_clock_slope_ppm": self._common_slope_ppm(),
+            "active_peer_count": len(active),
+            "active_peer_macs": sorted(item.mac for item in active),
+            "peer_max_age_sec": self.peer_max_age_sec,
+            "stable_count": obs.stable_count,
+            "snr_db": obs.snr_db,
+            "pattern_mean_abs_error_ms": pattern_mean_abs_error_ms,
+            "pattern_clock_delta_spread_ms": pattern_clock_delta_spread_ms,
+        }
+
+    def _skip_record(
+        self,
+        obs: RelativeClockObservation,
+        *,
+        reason: str,
+        active: list[RelativeClockObservation],
+        pattern_mean_abs_error_ms: Optional[float],
+        pattern_clock_delta_spread_ms: Optional[float],
+    ) -> dict[str, Any]:
+        return {
+            "event": "relative_correction_skipped",
+            "reason": reason,
+            **self._base_record(
+                obs,
+                active=active,
+                common_drift_ms=None,
+                residual_ms=None,
+                recent_residual_ms=None,
+                pattern_mean_abs_error_ms=pattern_mean_abs_error_ms,
+                pattern_clock_delta_spread_ms=pattern_clock_delta_spread_ms,
+            ),
+        }
+
+    def _common_slope_ppm(self) -> Optional[float]:
+        if len(self.common_history) < 2:
+            return None
+        t0 = self.common_history[0][0]
+        xs = [item[0] - t0 for item in self.common_history]
+        ys = [item[1] for item in self.common_history]
+        mean_x = sum(xs) / len(xs)
+        mean_y = sum(ys) / len(ys)
+        denom = sum((x - mean_x) ** 2 for x in xs)
+        if denom <= 0.0:
+            return None
+        slope_samples_per_sec = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+        return slope_samples_per_sec / SAMPLE_RATE * 1_000_000.0
+
+    def _clamp_ppm(self, value: float) -> float:
+        return max(-self.max_ppm, min(self.max_ppm, float(value)))
+
+    @staticmethod
+    def _median(values: list[float]) -> float:
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[mid]
+        return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
 def _current_emit_entry(entries: list[Any]) -> Optional[dict[str, Any]]:
     parsed = [entry for entry in entries if isinstance(entry, dict) and "frame_index" in entry]
     if not parsed:
@@ -1069,6 +1283,16 @@ class RuntimeSyncService:
                 smoothing_window=args.smoothing_window,
             )
             if getattr(args, "enable_correction", False)
+            else None
+        )
+        self.relative_estimator: Optional[RelativeDriftEstimator] = (
+            RelativeDriftEstimator(
+                max_ppm=args.max_ppm,
+                smoothing_window=args.smoothing_window,
+                gain_ppm_per_ms=args.relative_gain_ppm_per_ms,
+                peer_max_age_sec=args.relative_peer_max_age_sec,
+            )
+            if getattr(args, "enable_relative_proposals", False)
             else None
         )
 
@@ -1380,6 +1604,21 @@ class RuntimeSyncService:
             stable_count=target.stable_count,
             **sample_clock,
         )
+        if self.relative_estimator is not None and "sample_clock_delta_samples" in sample_clock:
+            record = self.relative_estimator.observe(
+                mac=target.mac,
+                monotonic=float(
+                    detection.get("sample_clock_anchor_monotonic")
+                    or detection.get("arrival_monotonic")
+                    or emit_records[0]["emit_monotonic"]
+                ),
+                delta_samples=float(sample_clock["sample_clock_delta_samples"]),
+                snr_db=float(detection["snr_db"]),
+                stable_count=target.stable_count,
+                pattern_mean_abs_error_ms=detection.get("pattern_mean_abs_error_ms"),
+                pattern_clock_delta_spread_ms=detection.get("pattern_clock_delta_spread_ms"),
+            )
+            _emit(**record)
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1452,6 +1691,23 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Rolling-mean window for drift estimation",
+    )
+    parser.add_argument(
+        "--enable-relative-proposals",
+        action="store_true",
+        help="Log group-relative correction proposals from pattern sample-clock measurements without actuating",
+    )
+    parser.add_argument(
+        "--relative-gain-ppm-per-ms",
+        type=float,
+        default=RELATIVE_CORRECTION_GAIN_PPM_PER_MS,
+        help="Observe-only proportional gain for relative residual ms -> proposed ppm",
+    )
+    parser.add_argument(
+        "--relative-peer-max-age-sec",
+        type=float,
+        default=RELATIVE_PEER_MAX_AGE_SEC,
+        help="Maximum age of another speaker's last pattern measurement for common-mode subtraction",
     )
     return parser
 

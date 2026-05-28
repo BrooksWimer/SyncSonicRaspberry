@@ -90,6 +90,12 @@ ONSET_HOP_MS = 2.5
 PATTERN_TOLERANCE_MS = 35.0
 PATTERN_CLOCK_TOLERANCE_MS = 20.0
 PATTERN_MIN_SNR_DB = 9.0
+PATTERN_LANDMARK = "envelope"
+ENVELOPE_MIX_LOW_PASS_MS = 1.5
+ENVELOPE_SMOOTH_MS = 2.0
+ENVELOPE_REFRACTORY_MS = 25.0
+ENVELOPE_EDGE_PRE_MS = 4.0
+ENVELOPE_EDGE_POST_MS = 8.0
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
 
@@ -411,6 +417,8 @@ class EnvelopeDetector:
         expected_delta_samples: Optional[float] = None,
         clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
         min_snr_db: float = PATTERN_MIN_SNR_DB,
+        landmark: str = PATTERN_LANDMARK,
+        carrier_hz: float = DEFAULT_FREQ_HZ,
     ) -> Optional[dict[str, Any]]:
         analysis = await self.analyze_pattern(
             start_time,
@@ -420,6 +428,8 @@ class EnvelopeDetector:
             expected_delta_samples=expected_delta_samples,
             clock_tolerance_ms=clock_tolerance_ms,
             min_snr_db=min_snr_db,
+            landmark=landmark,
+            carrier_hz=carrier_hz,
         )
         return analysis.get("selected")
 
@@ -432,6 +442,8 @@ class EnvelopeDetector:
         expected_delta_samples: Optional[float] = None,
         clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
         min_snr_db: float = PATTERN_MIN_SNR_DB,
+        landmark: str = PATTERN_LANDMARK,
+        carrier_hz: float = DEFAULT_FREQ_HZ,
     ) -> dict[str, Any]:
         window = await self.ring.read_window_with_index(start_time, end_time)
         return self.analyze_pattern_in_samples(
@@ -444,6 +456,8 @@ class EnvelopeDetector:
             expected_delta_samples=expected_delta_samples,
             clock_tolerance_ms=clock_tolerance_ms,
             min_snr_db=min_snr_db,
+            landmark=landmark,
+            carrier_hz=carrier_hz,
         )
 
     @classmethod
@@ -515,6 +529,8 @@ class EnvelopeDetector:
         expected_delta_samples: Optional[float] = None,
         clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
         min_snr_db: float = PATTERN_MIN_SNR_DB,
+        landmark: str = PATTERN_LANDMARK,
+        carrier_hz: float = DEFAULT_FREQ_HZ,
     ) -> Optional[dict[str, Any]]:
         analysis = cls.analyze_pattern_in_samples(
             samples,
@@ -526,6 +542,8 @@ class EnvelopeDetector:
             expected_delta_samples=expected_delta_samples,
             clock_tolerance_ms=clock_tolerance_ms,
             min_snr_db=min_snr_db,
+            landmark=landmark,
+            carrier_hz=carrier_hz,
         )
         return analysis.get("selected")
 
@@ -541,6 +559,8 @@ class EnvelopeDetector:
         expected_delta_samples: Optional[float] = None,
         clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
         min_snr_db: float = PATTERN_MIN_SNR_DB,
+        landmark: str = PATTERN_LANDMARK,
+        carrier_hz: float = DEFAULT_FREQ_HZ,
     ) -> dict[str, Any]:
         analysis: dict[str, Any] = {
             "candidate_count": 0,
@@ -549,17 +569,27 @@ class EnvelopeDetector:
             "pattern_clock_prior_delta_samples": expected_delta_samples,
             "pattern_clock_prior_tolerance_ms": clock_tolerance_ms if expected_delta_samples is not None else None,
             "pattern_min_snr_db": min_snr_db,
+            "pattern_landmark": landmark,
+            "pattern_carrier_hz": carrier_hz,
         }
         if not emit_frame_indices:
             analysis["reject_reason"] = "missing_emit_frame_indices"
             return analysis
-        candidates, onset_scan = cls._onset_scan(
-            samples,
-            base_sample_index,
-            noise_floor_db,
-            min_snr_db=min_snr_db,
-        )
-        analysis.update(onset_scan)
+        if landmark == "envelope":
+            candidates, landmark_scan = cls._demodulated_envelope_scan(
+                samples,
+                base_sample_index,
+                carrier_hz=carrier_hz,
+                min_snr_db=min_snr_db,
+            )
+        else:
+            candidates, landmark_scan = cls._onset_scan(
+                samples,
+                base_sample_index,
+                noise_floor_db,
+                min_snr_db=min_snr_db,
+            )
+        analysis.update(landmark_scan)
         analysis["candidate_count"] = len(candidates)
         if not candidates:
             analysis["reject_reason"] = "no_onset_candidates"
@@ -587,6 +617,7 @@ class EnvelopeDetector:
                         "error_samples": error_samples,
                         "power_db": nearest["power_db"],
                         "snr_db": nearest["snr_db"],
+                        "landmark_offset_ms": nearest.get("landmark_offset_ms"),
                     }
                 )
                 total_abs_error += abs(error_samples)
@@ -650,13 +681,18 @@ class EnvelopeDetector:
             + ((clock_anchor_sample_index - base_sample_index) / SAMPLE_RATE),
             "clock_delta_samples": clock_delta_samples,
             "peak_power_db": max(powers),
-            "noise_floor_db": noise_floor_db,
+            "noise_floor_db": analysis.get("envelope_noise_floor_db", noise_floor_db),
             "snr_db": min(snrs),
             "detector_mode": "pattern",
             "candidate_count": len(candidates),
             "pattern_min_snr_db": min_snr_db,
+            "pattern_landmark": landmark,
+            "pattern_carrier_hz": carrier_hz,
             "matched_arrival_sample_indices": [int(match["sample_index"]) for match in best["matched"]],
             "matched_error_ms": [match["error_samples"] * 1000.0 / SAMPLE_RATE for match in best["matched"]],
+            "matched_landmark_offset_ms": [
+                match.get("landmark_offset_ms") for match in best["matched"]
+            ],
             "pattern_mean_abs_error_ms": best["mean_abs_error_samples"] * 1000.0 / SAMPLE_RATE,
             "pattern_max_abs_error_ms": best["max_abs_error_samples"] * 1000.0 / SAMPLE_RATE,
             "pattern_clock_delta_spread_ms": best["clock_delta_spread_samples"] * 1000.0 / SAMPLE_RATE,
@@ -664,6 +700,16 @@ class EnvelopeDetector:
             "pattern_match_count": len(matches),
             "pattern_rejected_by_clock_count": analysis["pattern_rejected_by_clock_count"],
         }
+        for key in (
+            "envelope_noise_floor_db",
+            "envelope_threshold_db",
+            "envelope_peak_db",
+            "envelope_peak_snr_db",
+            "envelope_mix_low_pass_ms",
+            "envelope_smooth_ms",
+        ):
+            if key in analysis:
+                selected[key] = analysis[key]
         if expected_delta_samples is not None:
             selected["pattern_clock_prior_delta_samples"] = expected_delta_samples
             selected["pattern_clock_prior_error_ms"] = (
@@ -753,6 +799,99 @@ class EnvelopeDetector:
                     last_sample_index = sample_index
             previous_above = above
         return candidates, scan
+
+    @classmethod
+    def _demodulated_envelope_scan(
+        cls,
+        samples: np.ndarray,
+        base_sample_index: int,
+        carrier_hz: float,
+        min_snr_db: float,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        envelope = cls._demodulated_envelope(samples, base_sample_index, carrier_hz)
+        threshold_floor = 1e-9
+        envelope_db = 20.0 * np.log10(np.maximum(envelope, threshold_floor))
+        scan: dict[str, Any] = {
+            "envelope_noise_floor_db": None,
+            "envelope_threshold_db": None,
+            "envelope_peak_db": None,
+            "envelope_peak_snr_db": None,
+            "envelope_mix_low_pass_ms": ENVELOPE_MIX_LOW_PASS_MS,
+            "envelope_smooth_ms": ENVELOPE_SMOOTH_MS,
+            "envelope_refractory_ms": ENVELOPE_REFRACTORY_MS,
+            "envelope_edge_pre_ms": ENVELOPE_EDGE_PRE_MS,
+            "envelope_edge_post_ms": ENVELOPE_EDGE_POST_MS,
+        }
+        if len(envelope_db) == 0:
+            return [], scan
+        noise_floor_db = float(np.percentile(envelope_db, 35.0))
+        peak_db = float(np.max(envelope_db))
+        threshold_db = noise_floor_db + min_snr_db
+        scan.update(
+            {
+                "envelope_noise_floor_db": noise_floor_db,
+                "envelope_threshold_db": threshold_db,
+                "envelope_peak_db": peak_db,
+                "envelope_peak_snr_db": peak_db - noise_floor_db,
+            }
+        )
+        if peak_db < threshold_db:
+            return [], scan
+
+        refractory_samples = max(1, int(round(ENVELOPE_REFRACTORY_MS * SAMPLE_RATE / 1000.0)))
+        pre_samples = max(1, int(round(ENVELOPE_EDGE_PRE_MS * SAMPLE_RATE / 1000.0)))
+        post_samples = max(1, int(round(ENVELOPE_EDGE_POST_MS * SAMPLE_RATE / 1000.0)))
+        candidates: list[dict[str, Any]] = []
+        above = envelope_db >= threshold_db
+        previous_above = False
+        last_sample_index = -refractory_samples
+        for idx, is_above in enumerate(above):
+            if bool(is_above) and not previous_above:
+                sample_index = base_sample_index + idx
+                if sample_index - last_sample_index >= refractory_samples:
+                    edge_start = max(0, idx - pre_samples)
+                    edge_end = min(len(envelope), idx + post_samples + 1)
+                    edge = envelope[edge_start:edge_end]
+                    if len(edge) >= 2:
+                        slope = np.diff(edge)
+                        slope_idx = int(np.argmax(slope))
+                        landmark_offset = edge_start + slope_idx + 1
+                    else:
+                        landmark_offset = idx
+                    peak_end = min(len(envelope), idx + refractory_samples)
+                    local_peak_db = float(np.max(envelope_db[idx:peak_end])) if peak_end > idx else float(envelope_db[idx])
+                    landmark_sample_index = base_sample_index + landmark_offset
+                    candidates.append(
+                        {
+                            "sample_index": landmark_sample_index,
+                            "threshold_sample_index": sample_index,
+                            "power_db": local_peak_db,
+                            "snr_db": local_peak_db - noise_floor_db,
+                            "landmark_offset_ms": (landmark_offset - idx) * 1000.0 / SAMPLE_RATE,
+                        }
+                    )
+                    last_sample_index = landmark_sample_index
+            previous_above = bool(is_above)
+        return candidates, scan
+
+    @staticmethod
+    def _demodulated_envelope(
+        samples: np.ndarray,
+        base_sample_index: int,
+        carrier_hz: float,
+    ) -> np.ndarray:
+        if len(samples) == 0:
+            return np.zeros(0, dtype=np.float64)
+        sample_indices = base_sample_index + np.arange(len(samples), dtype=np.float64)
+        phase = -2.0 * np.pi * carrier_hz * sample_indices / SAMPLE_RATE
+        mixed = samples.astype(np.float64) * np.exp(1j * phase)
+        mix_window = max(1, int(round(ENVELOPE_MIX_LOW_PASS_MS * SAMPLE_RATE / 1000.0)))
+        mixed = np.convolve(mixed, np.ones(mix_window, dtype=np.float64) / mix_window, mode="same")
+        envelope = 2.0 * np.abs(mixed)
+        smooth_window = max(1, int(round(ENVELOPE_SMOOTH_MS * SAMPLE_RATE / 1000.0)))
+        if smooth_window > 1:
+            envelope = np.convolve(envelope, np.ones(smooth_window, dtype=np.float64) / smooth_window, mode="same")
+        return envelope
 
     @staticmethod
     def _band_power_db(samples: np.ndarray) -> float:
@@ -1166,6 +1305,8 @@ class RuntimeSyncService:
             expected_delta_samples=clock_prior_delta_samples,
             clock_tolerance_ms=self.args.pattern_clock_tolerance_ms,
             min_snr_db=self.args.pattern_min_snr_db,
+            landmark=self.args.pattern_landmark,
+            carrier_hz=self.args.freq_hz,
         )
         detection = analysis.get("selected")
         if not detection:
@@ -1215,9 +1356,12 @@ class RuntimeSyncService:
             candidate_count=detection.get("candidate_count"),
             matched_arrival_sample_indices=detection.get("matched_arrival_sample_indices"),
             matched_error_ms=detection.get("matched_error_ms"),
+            matched_landmark_offset_ms=detection.get("matched_landmark_offset_ms"),
             pattern_mean_abs_error_ms=detection.get("pattern_mean_abs_error_ms"),
             pattern_max_abs_error_ms=detection.get("pattern_max_abs_error_ms"),
             pattern_min_snr_db=detection.get("pattern_min_snr_db"),
+            pattern_landmark=detection.get("pattern_landmark"),
+            pattern_carrier_hz=detection.get("pattern_carrier_hz"),
             pattern_clock_delta_spread_ms=detection.get("pattern_clock_delta_spread_ms"),
             pattern_selection_reason=detection.get("pattern_selection_reason"),
             pattern_match_count=detection.get("pattern_match_count"),
@@ -1225,6 +1369,10 @@ class RuntimeSyncService:
             pattern_clock_prior_delta_samples=detection.get("pattern_clock_prior_delta_samples"),
             pattern_clock_prior_error_ms=detection.get("pattern_clock_prior_error_ms"),
             pattern_clock_prior_tolerance_ms=detection.get("pattern_clock_prior_tolerance_ms"),
+            envelope_noise_floor_db=detection.get("envelope_noise_floor_db"),
+            envelope_threshold_db=detection.get("envelope_threshold_db"),
+            envelope_peak_db=detection.get("envelope_peak_db"),
+            envelope_peak_snr_db=detection.get("envelope_peak_snr_db"),
             sample_clock_anchor_sample_index=detection.get("sample_clock_anchor_sample_index"),
             sample_clock_anchor_monotonic=detection.get("sample_clock_anchor_monotonic"),
             emit_frame_indices=emit_frame_indices,
@@ -1279,6 +1427,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=PATTERN_MIN_SNR_DB,
         help="Minimum ultrasonic-band SNR for onset candidates in pattern mode",
+    )
+    parser.add_argument(
+        "--pattern-landmark",
+        choices=("envelope", "onset"),
+        default=PATTERN_LANDMARK,
+        help="Mic-side timing landmark for pattern mode",
     )
     # Slice 3: closed-loop drift correction flags.
     # Spec: docs/maverick/proposals/09-slice-3-implementation-spec.md

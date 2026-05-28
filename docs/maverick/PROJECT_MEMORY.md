@@ -655,3 +655,15 @@ Acceptance result: PARTIAL.
 - Not yet pass: baseline-relative `sample_clock_drift_ms` still exceeded 10 ms on both speakers. The likely remaining problem is the low-SNR onset landmark moving inside the burst envelope, not missing emit timing or sequence spacing.
 
 Planning implication: the next pass should keep the exact emit-frame/pattern architecture but refine the mic-side landmark. Candidate directions: log best-unprioritized match fields on arrivals, score viable matches with both clock-prior error and pattern geometry, or replace threshold-crossing onset with a demodulated ultrasonic envelope / slope landmark. Do not feed pattern mode into `DriftController` yet.
+
+## 2026-05-28 - Slice 3c started: demodulated envelope landmark
+
+Branch: `codex/ultrasonic-sample-clock-pattern`.
+
+**Design correction:** pattern mode now has a demodulated ultrasonic envelope landmark. Instead of timing the first FFT-window threshold crossing, the detector mixes the mic samples down at the configured burst carrier (`--freq-hz`, default 18.5 kHz), low-passes the complex baseband signal, smooths the magnitude envelope, and uses the leading-edge slope as the mic-side arrival landmark. Pattern matching, exact filter `emit_frame_indices`, sample-clock averaging across the full burst sequence, and clock-prior gating remain in place.
+
+**Compatibility:** legacy `peak` and `onset` detector modes are unchanged. Pattern mode defaults to `--pattern-landmark envelope`, with `--pattern-landmark onset` retained for A/B comparison against the previous threshold-crossing path.
+
+**Local intent:** reduce low-SNR landmark movement inside the burst envelope while preserving the zero-miss acquisition improvement from the `--pattern-min-snr-db 9` pass. Still measurement-only; pattern results do not feed `DriftController` yet.
+
+**Local verification:** `python -m compileall syncsonic_ble measurement` passed; `python -m pytest measurement -v` passed (21 tests).

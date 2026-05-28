@@ -88,8 +88,10 @@ def test_pattern_detector_matches_emit_spacing_in_mic_sample_indices() -> None:
     assert match is not None
     assert match["detector_mode"] == "pattern"
     observed = match["matched_arrival_sample_indices"]
-    assert [sample - observed[0] for sample in observed] == offsets
-    assert max(abs(error) for error in match["matched_error_ms"]) <= 0.001
+    observed_offsets = [sample - observed[0] for sample in observed]
+    assert max(abs(observed - expected) for observed, expected in zip(observed_offsets, offsets)) <= 24
+    assert max(abs(error) for error in match["matched_error_ms"]) <= 0.5
+    assert match["pattern_landmark"] == "envelope"
 
 
 def test_pattern_detector_uses_clock_prior_to_avoid_late_echo_group() -> None:
@@ -174,13 +176,11 @@ def test_pattern_detector_has_independent_candidate_snr_floor() -> None:
     offsets = [0, 14_336, 28_672]
     duration = int(0.030 * SAMPLE_RATE)
     total = first + offsets[-1] + duration + 8_000
-    samples = np.zeros(total, dtype=np.float32)
+    t = np.arange(total, dtype=np.float64) / SAMPLE_RATE
+    samples = (0.25 * np.sin(2.0 * np.pi * 18_500.0 * t)).astype(np.float32)
     for offset in offsets:
         samples += _tone(first + offset, duration, total)
 
-    onset_window = int(0.010 * SAMPLE_RATE)
-    onset_power = EnvelopeDetector._band_power_db(samples[first : first + onset_window])
-    noise_floor = onset_power - 10.5
     base_sample = 500_000
     emit_frames = [1_000_000 + offset for offset in offsets]
 
@@ -188,7 +188,7 @@ def test_pattern_detector_has_independent_candidate_snr_floor() -> None:
         samples,
         base_time=0.0,
         base_sample_index=base_sample,
-        noise_floor_db=noise_floor,
+        noise_floor_db=-90.0,
         emit_frame_indices=emit_frames,
         tolerance_ms=5.0,
         min_snr_db=12.0,
@@ -197,7 +197,7 @@ def test_pattern_detector_has_independent_candidate_snr_floor() -> None:
         samples,
         base_time=0.0,
         base_sample_index=base_sample,
-        noise_floor_db=noise_floor,
+        noise_floor_db=-90.0,
         emit_frame_indices=emit_frames,
         tolerance_ms=5.0,
         min_snr_db=9.0,
@@ -207,3 +207,39 @@ def test_pattern_detector_has_independent_candidate_snr_floor() -> None:
     assert pattern_floor is not None
     assert pattern_floor["pattern_min_snr_db"] == 9.0
     assert pattern_floor["snr_db"] >= 9.0
+
+
+def test_demodulated_envelope_pattern_uses_leading_edge_not_loudest_window() -> None:
+    first = 12_000
+    offsets = [0, 14_336, 28_672]
+    duration = int(0.050 * SAMPLE_RATE)
+    bump_offset = int(0.025 * SAMPLE_RATE)
+    bump_duration = int(0.010 * SAMPLE_RATE)
+    total = first + offsets[-1] + duration + 8_000
+    samples = np.zeros(total, dtype=np.float32)
+    for offset in offsets:
+        samples += _tone(first + offset, duration, total, freq_hz=18_500.0) * 0.25
+        samples += _tone(first + offset + bump_offset, bump_duration, total, freq_hz=18_500.0) * 0.75
+
+    base_sample = 500_000
+    emit_frames = [1_000_000 + offset for offset in offsets]
+    match = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        min_snr_db=9.0,
+    )
+    peak = EnvelopeDetector.detect_peak_in_samples(
+        samples[first - 2_000 : first + 5_000],
+        base_time=0.0,
+        base_sample_index=base_sample + first - 2_000,
+        noise_floor_db=-90.0,
+    )
+
+    assert match is not None
+    assert peak is not None
+    assert abs(match["arrival_sample_index"] - (base_sample + first)) <= 480
+    assert peak["arrival_sample_index"] - match["arrival_sample_index"] >= int(0.020 * SAMPLE_RATE)

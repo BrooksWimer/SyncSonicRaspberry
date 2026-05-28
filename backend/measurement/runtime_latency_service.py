@@ -89,6 +89,7 @@ ONSET_WINDOW_MS = 10.0
 ONSET_HOP_MS = 2.5
 PATTERN_TOLERANCE_MS = 35.0
 PATTERN_CLOCK_TOLERANCE_MS = 20.0
+PATTERN_MIN_SNR_DB = 9.0
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
 
@@ -409,6 +410,7 @@ class EnvelopeDetector:
         tolerance_ms: float = PATTERN_TOLERANCE_MS,
         expected_delta_samples: Optional[float] = None,
         clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
+        min_snr_db: float = PATTERN_MIN_SNR_DB,
     ) -> Optional[dict[str, Any]]:
         analysis = await self.analyze_pattern(
             start_time,
@@ -417,6 +419,7 @@ class EnvelopeDetector:
             tolerance_ms=tolerance_ms,
             expected_delta_samples=expected_delta_samples,
             clock_tolerance_ms=clock_tolerance_ms,
+            min_snr_db=min_snr_db,
         )
         return analysis.get("selected")
 
@@ -428,6 +431,7 @@ class EnvelopeDetector:
         tolerance_ms: float = PATTERN_TOLERANCE_MS,
         expected_delta_samples: Optional[float] = None,
         clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
+        min_snr_db: float = PATTERN_MIN_SNR_DB,
     ) -> dict[str, Any]:
         window = await self.ring.read_window_with_index(start_time, end_time)
         return self.analyze_pattern_in_samples(
@@ -439,6 +443,7 @@ class EnvelopeDetector:
             tolerance_ms=tolerance_ms,
             expected_delta_samples=expected_delta_samples,
             clock_tolerance_ms=clock_tolerance_ms,
+            min_snr_db=min_snr_db,
         )
 
     @classmethod
@@ -509,6 +514,7 @@ class EnvelopeDetector:
         tolerance_ms: float = PATTERN_TOLERANCE_MS,
         expected_delta_samples: Optional[float] = None,
         clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
+        min_snr_db: float = PATTERN_MIN_SNR_DB,
     ) -> Optional[dict[str, Any]]:
         analysis = cls.analyze_pattern_in_samples(
             samples,
@@ -519,6 +525,7 @@ class EnvelopeDetector:
             tolerance_ms=tolerance_ms,
             expected_delta_samples=expected_delta_samples,
             clock_tolerance_ms=clock_tolerance_ms,
+            min_snr_db=min_snr_db,
         )
         return analysis.get("selected")
 
@@ -533,6 +540,7 @@ class EnvelopeDetector:
         tolerance_ms: float = PATTERN_TOLERANCE_MS,
         expected_delta_samples: Optional[float] = None,
         clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
+        min_snr_db: float = PATTERN_MIN_SNR_DB,
     ) -> dict[str, Any]:
         analysis: dict[str, Any] = {
             "candidate_count": 0,
@@ -540,11 +548,18 @@ class EnvelopeDetector:
             "pattern_rejected_by_clock_count": 0,
             "pattern_clock_prior_delta_samples": expected_delta_samples,
             "pattern_clock_prior_tolerance_ms": clock_tolerance_ms if expected_delta_samples is not None else None,
+            "pattern_min_snr_db": min_snr_db,
         }
         if not emit_frame_indices:
             analysis["reject_reason"] = "missing_emit_frame_indices"
             return analysis
-        candidates = cls._onset_candidates(samples, base_sample_index, noise_floor_db)
+        candidates, onset_scan = cls._onset_scan(
+            samples,
+            base_sample_index,
+            noise_floor_db,
+            min_snr_db=min_snr_db,
+        )
+        analysis.update(onset_scan)
         analysis["candidate_count"] = len(candidates)
         if not candidates:
             analysis["reject_reason"] = "no_onset_candidates"
@@ -639,6 +654,7 @@ class EnvelopeDetector:
             "snr_db": min(snrs),
             "detector_mode": "pattern",
             "candidate_count": len(candidates),
+            "pattern_min_snr_db": min_snr_db,
             "matched_arrival_sample_indices": [int(match["sample_index"]) for match in best["matched"]],
             "matched_error_ms": [match["error_samples"] * 1000.0 / SAMPLE_RATE for match in best["matched"]],
             "pattern_mean_abs_error_ms": best["mean_abs_error_samples"] * 1000.0 / SAMPLE_RATE,
@@ -677,16 +693,47 @@ class EnvelopeDetector:
         samples: np.ndarray,
         base_sample_index: int,
         noise_floor_db: float,
+        min_snr_db: float = MIN_SNR_DB,
     ) -> list[dict[str, Any]]:
+        candidates, _scan = cls._onset_scan(
+            samples,
+            base_sample_index,
+            noise_floor_db,
+            min_snr_db=min_snr_db,
+        )
+        return candidates
+
+    @classmethod
+    def _onset_scan(
+        cls,
+        samples: np.ndarray,
+        base_sample_index: int,
+        noise_floor_db: float,
+        min_snr_db: float,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         window = max(1, int(SAMPLE_RATE * ONSET_WINDOW_MS / 1000.0))
         hop = max(1, int(SAMPLE_RATE * ONSET_HOP_MS / 1000.0))
+        threshold = noise_floor_db + min_snr_db
+        scan: dict[str, Any] = {
+            "onset_threshold_db": threshold,
+            "onset_min_snr_db": min_snr_db,
+            "onset_window_ms": ONSET_WINDOW_MS,
+            "onset_hop_ms": ONSET_HOP_MS,
+            "onset_bin_count": 0,
+            "onset_max_power_db": None,
+            "onset_max_snr_db": None,
+        }
         if len(samples) < window:
-            return []
-        threshold = noise_floor_db + MIN_SNR_DB
+            return [], scan
         bins: list[tuple[int, float]] = []
         for idx in range(0, len(samples) - window + 1, hop):
             power = cls._band_power_db(samples[idx : idx + window])
             bins.append((idx, power))
+        scan["onset_bin_count"] = len(bins)
+        if bins:
+            max_power = max(power for _idx, power in bins)
+            scan["onset_max_power_db"] = max_power
+            scan["onset_max_snr_db"] = max_power - noise_floor_db
         candidates: list[dict[str, Any]] = []
         previous_above = False
         refractory = max(window, int(0.5 * window))
@@ -705,7 +752,7 @@ class EnvelopeDetector:
                     )
                     last_sample_index = sample_index
             previous_above = above
-        return candidates
+        return candidates, scan
 
     @staticmethod
     def _band_power_db(samples: np.ndarray) -> float:
@@ -1118,6 +1165,7 @@ class RuntimeSyncService:
             tolerance_ms=self.args.pattern_tolerance_ms,
             expected_delta_samples=clock_prior_delta_samples,
             clock_tolerance_ms=self.args.pattern_clock_tolerance_ms,
+            min_snr_db=self.args.pattern_min_snr_db,
         )
         detection = analysis.get("selected")
         if not detection:
@@ -1169,6 +1217,7 @@ class RuntimeSyncService:
             matched_error_ms=detection.get("matched_error_ms"),
             pattern_mean_abs_error_ms=detection.get("pattern_mean_abs_error_ms"),
             pattern_max_abs_error_ms=detection.get("pattern_max_abs_error_ms"),
+            pattern_min_snr_db=detection.get("pattern_min_snr_db"),
             pattern_clock_delta_spread_ms=detection.get("pattern_clock_delta_spread_ms"),
             pattern_selection_reason=detection.get("pattern_selection_reason"),
             pattern_match_count=detection.get("pattern_match_count"),
@@ -1224,6 +1273,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=PATTERN_CLOCK_TOLERANCE_MS,
         help="Maximum cycle-to-cycle sample-clock delta jump allowed for a pattern match",
+    )
+    parser.add_argument(
+        "--pattern-min-snr-db",
+        type=float,
+        default=PATTERN_MIN_SNR_DB,
+        help="Minimum ultrasonic-band SNR for onset candidates in pattern mode",
     )
     # Slice 3: closed-loop drift correction flags.
     # Spec: docs/maverick/proposals/09-slice-3-implementation-spec.md

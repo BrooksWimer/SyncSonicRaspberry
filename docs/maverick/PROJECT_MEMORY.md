@@ -617,6 +617,8 @@ Branch: `codex/ultrasonic-sample-clock-pattern`.
 
 The sample-clock delta is now the mean delta across the whole matched burst sequence instead of only the first onset. Pattern miss logs include candidate count, match count, best unprioritized spacing error, best unprioritized sample-clock error, and whether a prior was reset after repeated clock-prior mismatches.
 
+**Pi smoke follow-up:** the continuity gate did remove the previous 45 ms-style late-pattern jump, but the quieter `F4:6A:DD:D4:F3:C8` path still missed several measurements with `candidate_count=0`. That means the next issue is acquisition sensitivity, not clock continuity. Pattern mode now has an independent `--pattern-min-snr-db` candidate floor (default `9.0 dB`) and miss logs include onset scan threshold/max-power/max-SNR fields so future Pi runs can distinguish "burst absent" from "burst present but below the old 12 dB onset floor."
+
 **Still out of scope:** this does not feed pattern results into `DriftController`; it only hardens the measurement signal and its diagnostics.
 
 **Local verification:** `python -m compileall syncsonic_ble measurement` passed; `python -m pytest measurement -v` passed (19 tests).

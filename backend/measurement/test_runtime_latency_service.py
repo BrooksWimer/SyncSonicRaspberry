@@ -167,3 +167,43 @@ def test_pattern_detector_rejects_groups_that_jump_outside_clock_prior() -> None
     assert analysis["best_unprioritized_pattern_mean_abs_error_ms"] < 2.0
     assert analysis["best_unprioritized_pattern_clock_prior_error_ms"] > 35.0
     assert "selected" not in analysis
+
+
+def test_pattern_detector_has_independent_candidate_snr_floor() -> None:
+    first = 12_000
+    offsets = [0, 14_336, 28_672]
+    duration = int(0.030 * SAMPLE_RATE)
+    total = first + offsets[-1] + duration + 8_000
+    samples = np.zeros(total, dtype=np.float32)
+    for offset in offsets:
+        samples += _tone(first + offset, duration, total)
+
+    onset_window = int(0.010 * SAMPLE_RATE)
+    onset_power = EnvelopeDetector._band_power_db(samples[first : first + onset_window])
+    noise_floor = onset_power - 10.5
+    base_sample = 500_000
+    emit_frames = [1_000_000 + offset for offset in offsets]
+
+    strict = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=noise_floor,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        min_snr_db=12.0,
+    )
+    pattern_floor = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=noise_floor,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        min_snr_db=9.0,
+    )
+
+    assert strict is None
+    assert pattern_floor is not None
+    assert pattern_floor["pattern_min_snr_db"] == 9.0
+    assert pattern_floor["snr_db"] >= 9.0

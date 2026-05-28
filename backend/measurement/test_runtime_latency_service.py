@@ -90,3 +90,80 @@ def test_pattern_detector_matches_emit_spacing_in_mic_sample_indices() -> None:
     observed = match["matched_arrival_sample_indices"]
     assert [sample - observed[0] for sample in observed] == offsets
     assert max(abs(error) for error in match["matched_error_ms"]) <= 0.001
+
+
+def test_pattern_detector_uses_clock_prior_to_avoid_late_echo_group() -> None:
+    first = 12_000
+    emit_offsets = [0, 14_336, 28_672]
+    true_offsets = [0, 14_456, 28_552]
+    echo_offset = 2_168
+    duration = int(0.006 * SAMPLE_RATE)
+    total = first + emit_offsets[-1] + echo_offset + duration + 8_000
+    samples = np.zeros(total, dtype=np.float32)
+    for offset in true_offsets:
+        samples += _tone(first + offset, duration, total)
+    for offset in emit_offsets:
+        samples += _tone(first + echo_offset + offset, duration, total)
+
+    base_sample = 500_000
+    emit_frames = [1_000_000 + offset for offset in emit_offsets]
+    expected_delta = base_sample + first - emit_frames[0]
+
+    unprioritized = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+    )
+    prioritized = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        expected_delta_samples=expected_delta,
+        clock_tolerance_ms=20.0,
+    )
+
+    assert unprioritized is not None
+    assert prioritized is not None
+    assert unprioritized["arrival_sample_index"] - prioritized["arrival_sample_index"] > 1_400
+    assert abs(prioritized["arrival_sample_index"] - (base_sample + first)) <= 480
+    assert prioritized["pattern_selection_reason"] == "clock_prior"
+    assert abs(prioritized["pattern_clock_prior_error_ms"]) < 10.0
+
+
+def test_pattern_detector_rejects_groups_that_jump_outside_clock_prior() -> None:
+    first = 12_000
+    offsets = [0, 14_336, 28_672]
+    late_jump = 2_400
+    duration = int(0.006 * SAMPLE_RATE)
+    total = first + offsets[-1] + late_jump + duration + 8_000
+    samples = np.zeros(total, dtype=np.float32)
+    for offset in offsets:
+        samples += _tone(first + late_jump + offset, duration, total)
+
+    base_sample = 500_000
+    emit_frames = [1_000_000 + offset for offset in offsets]
+    expected_delta = base_sample + first - emit_frames[0]
+
+    analysis = EnvelopeDetector.analyze_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        expected_delta_samples=expected_delta,
+        clock_tolerance_ms=20.0,
+    )
+
+    assert analysis["reject_reason"] == "clock_prior_mismatch"
+    assert analysis["pattern_match_count"] == 1
+    assert analysis["pattern_rejected_by_clock_count"] == 1
+    assert analysis["best_unprioritized_pattern_mean_abs_error_ms"] < 2.0
+    assert analysis["best_unprioritized_pattern_clock_prior_error_ms"] > 35.0
+    assert "selected" not in analysis

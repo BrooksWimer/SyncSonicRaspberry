@@ -606,3 +606,17 @@ Run window: `runtime-latency.service` active starting 2026-05-27 22:48:28 EDT. T
 
 **Planning implication:**
 The new measurement path is the right direction: exact filter-frame emission timing plus continuous mic sample indices removes the 50 ms / 25 ms legacy peak-window ambiguity from the successful pattern matches. The next implementation step should harden pattern acquisition before reconnecting the controller: improve per-burst onset selection and pattern-match confidence handling, and log enough evidence to explain misses/outliers. Do not feed pattern mode into `DriftController` until a longer Pi run shows zero pattern misses and bounded `sample_clock_drift_ms` across both speakers.
+
+## 2026-05-28 - Slice 3b next pass: continuity-gated pattern acquisition
+
+Branch: `codex/ultrasonic-sample-clock-pattern`.
+
+**Design correction:** spacing alone is not enough. The first Pi smoke proved the detector can find a three-burst sequence, but a whole matched sequence can still land on a late burst/echo landmark and jump the sample-clock delta by tens of milliseconds while preserving good internal spacing. The matcher now uses two stages:
+- Find all candidate groups whose observed mic onset spacing matches the exact filter `emit_frame_indices`.
+- Once a speaker has a previous accepted sample-clock delta, choose only groups whose mean `arrival_sample_index - emit_frame_index` stays within `--pattern-clock-tolerance-ms` of the last accepted cycle.
+
+The sample-clock delta is now the mean delta across the whole matched burst sequence instead of only the first onset. Pattern miss logs include candidate count, match count, best unprioritized spacing error, best unprioritized sample-clock error, and whether a prior was reset after repeated clock-prior mismatches.
+
+**Still out of scope:** this does not feed pattern results into `DriftController`; it only hardens the measurement signal and its diagnostics.
+
+**Local verification:** `python -m compileall syncsonic_ble measurement` passed; `python -m pytest measurement -v` passed (19 tests).

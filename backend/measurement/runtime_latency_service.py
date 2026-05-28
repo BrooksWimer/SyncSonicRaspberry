@@ -88,6 +88,7 @@ HOP_MS = 25.0
 ONSET_WINDOW_MS = 10.0
 ONSET_HOP_MS = 2.5
 PATTERN_TOLERANCE_MS = 35.0
+PATTERN_CLOCK_TOLERANCE_MS = 20.0
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
 
@@ -356,6 +357,8 @@ class SpeakerTarget:
     stable_count: int = 0
     last_latency_ms: Optional[float] = None
     sample_clock_baseline_samples: Optional[float] = None
+    last_sample_clock_delta_samples: Optional[float] = None
+    pattern_clock_reject_count: int = 0
 
 
 @dataclass
@@ -404,15 +407,38 @@ class EnvelopeDetector:
         end_time: float,
         emit_frame_indices: list[int],
         tolerance_ms: float = PATTERN_TOLERANCE_MS,
+        expected_delta_samples: Optional[float] = None,
+        clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
     ) -> Optional[dict[str, Any]]:
+        analysis = await self.analyze_pattern(
+            start_time,
+            end_time,
+            emit_frame_indices,
+            tolerance_ms=tolerance_ms,
+            expected_delta_samples=expected_delta_samples,
+            clock_tolerance_ms=clock_tolerance_ms,
+        )
+        return analysis.get("selected")
+
+    async def analyze_pattern(
+        self,
+        start_time: float,
+        end_time: float,
+        emit_frame_indices: list[int],
+        tolerance_ms: float = PATTERN_TOLERANCE_MS,
+        expected_delta_samples: Optional[float] = None,
+        clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
+    ) -> dict[str, Any]:
         window = await self.ring.read_window_with_index(start_time, end_time)
-        return self.detect_pattern_in_samples(
+        return self.analyze_pattern_in_samples(
             window.samples,
             window.start_time,
             window.start_index,
             self.noise_floor_db,
             emit_frame_indices,
             tolerance_ms=tolerance_ms,
+            expected_delta_samples=expected_delta_samples,
+            clock_tolerance_ms=clock_tolerance_ms,
         )
 
     @classmethod
@@ -481,19 +507,55 @@ class EnvelopeDetector:
         noise_floor_db: float,
         emit_frame_indices: list[int],
         tolerance_ms: float = PATTERN_TOLERANCE_MS,
+        expected_delta_samples: Optional[float] = None,
+        clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
     ) -> Optional[dict[str, Any]]:
+        analysis = cls.analyze_pattern_in_samples(
+            samples,
+            base_time,
+            base_sample_index,
+            noise_floor_db,
+            emit_frame_indices,
+            tolerance_ms=tolerance_ms,
+            expected_delta_samples=expected_delta_samples,
+            clock_tolerance_ms=clock_tolerance_ms,
+        )
+        return analysis.get("selected")
+
+    @classmethod
+    def analyze_pattern_in_samples(
+        cls,
+        samples: np.ndarray,
+        base_time: float,
+        base_sample_index: int,
+        noise_floor_db: float,
+        emit_frame_indices: list[int],
+        tolerance_ms: float = PATTERN_TOLERANCE_MS,
+        expected_delta_samples: Optional[float] = None,
+        clock_tolerance_ms: float = PATTERN_CLOCK_TOLERANCE_MS,
+    ) -> dict[str, Any]:
+        analysis: dict[str, Any] = {
+            "candidate_count": 0,
+            "pattern_match_count": 0,
+            "pattern_rejected_by_clock_count": 0,
+            "pattern_clock_prior_delta_samples": expected_delta_samples,
+            "pattern_clock_prior_tolerance_ms": clock_tolerance_ms if expected_delta_samples is not None else None,
+        }
         if not emit_frame_indices:
-            return None
+            analysis["reject_reason"] = "missing_emit_frame_indices"
+            return analysis
         candidates = cls._onset_candidates(samples, base_sample_index, noise_floor_db)
+        analysis["candidate_count"] = len(candidates)
         if not candidates:
-            return None
+            analysis["reject_reason"] = "no_onset_candidates"
+            return analysis
         emit_offsets = [frame - emit_frame_indices[0] for frame in emit_frame_indices]
         tolerance_samples = int(round(tolerance_ms * SAMPLE_RATE / 1000.0))
-        best: Optional[dict[str, Any]] = None
+        matches: list[dict[str, Any]] = []
         for start in candidates:
             matched: list[dict[str, float]] = []
             total_abs_error = 0.0
-            for expected_offset in emit_offsets:
+            for emit_frame, expected_offset in zip(emit_frame_indices, emit_offsets):
                 expected_sample = start["sample_index"] + expected_offset
                 nearest = min(
                     candidates,
@@ -506,6 +568,7 @@ class EnvelopeDetector:
                     {
                         "sample_index": nearest["sample_index"],
                         "expected_sample_index": expected_sample,
+                        "emit_frame_index": emit_frame,
                         "error_samples": error_samples,
                         "power_db": nearest["power_db"],
                         "snr_db": nearest["snr_db"],
@@ -514,22 +577,63 @@ class EnvelopeDetector:
                 total_abs_error += abs(error_samples)
             if len(matched) != len(emit_offsets):
                 continue
-            score = total_abs_error / max(1, len(matched))
-            if best is None or score < best["mean_abs_error_samples"]:
-                best = {
-                    "first": start,
-                    "matched": matched,
-                    "mean_abs_error_samples": score,
-                }
-        if best is None:
-            return None
+            clock_deltas = [
+                float(match["sample_index"] - match["emit_frame_index"]) for match in matched
+            ]
+            mean_abs_error_samples = total_abs_error / max(1, len(matched))
+            clock_delta_samples = float(sum(clock_deltas) / len(clock_deltas))
+            match = {
+                "first": start,
+                "matched": matched,
+                "mean_abs_error_samples": mean_abs_error_samples,
+                "max_abs_error_samples": max(abs(match["error_samples"]) for match in matched),
+                "clock_delta_samples": clock_delta_samples,
+                "clock_delta_spread_samples": max(clock_deltas) - min(clock_deltas),
+            }
+            if expected_delta_samples is not None:
+                match["clock_prior_error_samples"] = clock_delta_samples - expected_delta_samples
+            matches.append(match)
+        analysis["pattern_match_count"] = len(matches)
+        if not matches:
+            analysis["reject_reason"] = "pattern_not_matched"
+            return analysis
+        best_unprioritized = min(matches, key=lambda match: match["mean_abs_error_samples"])
+        analysis.update(cls._pattern_match_debug(best_unprioritized, prefix="best_unprioritized"))
+        if expected_delta_samples is not None:
+            clock_tolerance_samples = clock_tolerance_ms * SAMPLE_RATE / 1000.0
+            viable = [
+                match
+                for match in matches
+                if abs(match["clock_prior_error_samples"]) <= clock_tolerance_samples
+            ]
+            analysis["pattern_rejected_by_clock_count"] = len(matches) - len(viable)
+            if not viable:
+                analysis["reject_reason"] = "clock_prior_mismatch"
+                return analysis
+            best = min(
+                viable,
+                key=lambda match: (
+                    abs(match["clock_prior_error_samples"]),
+                    match["mean_abs_error_samples"],
+                ),
+            )
+            selection_reason = "clock_prior"
+        else:
+            best = best_unprioritized
+            selection_reason = "best_spacing"
         first = best["first"]
         offset = first["sample_index"] - base_sample_index
         snrs = [match["snr_db"] for match in best["matched"]]
         powers = [match["power_db"] for match in best["matched"]]
-        return {
+        clock_delta_samples = best["clock_delta_samples"]
+        clock_anchor_sample_index = emit_frame_indices[0] + clock_delta_samples
+        selected = {
             "arrival_monotonic": base_time + (offset / SAMPLE_RATE),
             "arrival_sample_index": first["sample_index"],
+            "sample_clock_anchor_sample_index": clock_anchor_sample_index,
+            "sample_clock_anchor_monotonic": base_time
+            + ((clock_anchor_sample_index - base_sample_index) / SAMPLE_RATE),
+            "clock_delta_samples": clock_delta_samples,
             "peak_power_db": max(powers),
             "noise_floor_db": noise_floor_db,
             "snr_db": min(snrs),
@@ -538,6 +642,33 @@ class EnvelopeDetector:
             "matched_arrival_sample_indices": [int(match["sample_index"]) for match in best["matched"]],
             "matched_error_ms": [match["error_samples"] * 1000.0 / SAMPLE_RATE for match in best["matched"]],
             "pattern_mean_abs_error_ms": best["mean_abs_error_samples"] * 1000.0 / SAMPLE_RATE,
+            "pattern_max_abs_error_ms": best["max_abs_error_samples"] * 1000.0 / SAMPLE_RATE,
+            "pattern_clock_delta_spread_ms": best["clock_delta_spread_samples"] * 1000.0 / SAMPLE_RATE,
+            "pattern_selection_reason": selection_reason,
+            "pattern_match_count": len(matches),
+            "pattern_rejected_by_clock_count": analysis["pattern_rejected_by_clock_count"],
+        }
+        if expected_delta_samples is not None:
+            selected["pattern_clock_prior_delta_samples"] = expected_delta_samples
+            selected["pattern_clock_prior_error_ms"] = (
+                best["clock_prior_error_samples"] * 1000.0 / SAMPLE_RATE
+            )
+            selected["pattern_clock_prior_tolerance_ms"] = clock_tolerance_ms
+        analysis["selected"] = selected
+        return analysis
+
+    @staticmethod
+    def _pattern_match_debug(match: dict[str, Any], prefix: str) -> dict[str, Any]:
+        return {
+            f"{prefix}_pattern_mean_abs_error_ms": match["mean_abs_error_samples"] * 1000.0 / SAMPLE_RATE,
+            f"{prefix}_pattern_max_abs_error_ms": match["max_abs_error_samples"] * 1000.0 / SAMPLE_RATE,
+            f"{prefix}_sample_clock_delta_ms": match["clock_delta_samples"] * 1000.0 / SAMPLE_RATE,
+            f"{prefix}_pattern_clock_delta_spread_ms": match["clock_delta_spread_samples"] * 1000.0 / SAMPLE_RATE,
+            f"{prefix}_pattern_clock_prior_error_ms": (
+                match.get("clock_prior_error_samples", 0.0) * 1000.0 / SAMPLE_RATE
+                if "clock_prior_error_samples" in match
+                else None
+            ),
         }
 
     @classmethod
@@ -718,10 +849,11 @@ def _sample_clock_fields(
         return {}
     emit_frame_index = int(entry["frame_index"])
     arrival_sample_index = int(detection["arrival_sample_index"])
-    delta_samples = arrival_sample_index - emit_frame_index
+    delta_samples = float(detection.get("clock_delta_samples", arrival_sample_index - emit_frame_index))
     if target.sample_clock_baseline_samples is None:
         target.sample_clock_baseline_samples = float(delta_samples)
     drift_samples = float(delta_samples) - target.sample_clock_baseline_samples
+    target.last_sample_clock_delta_samples = float(delta_samples)
     return {
         "emit_frame_index": emit_frame_index,
         "arrival_sample_index": arrival_sample_index,
@@ -781,6 +913,10 @@ class RuntimeSyncService:
                     target.stable_count = previous[target.mac].stable_count
                     target.last_latency_ms = previous[target.mac].last_latency_ms
                     target.sample_clock_baseline_samples = previous[target.mac].sample_clock_baseline_samples
+                    target.last_sample_clock_delta_samples = previous[
+                        target.mac
+                    ].last_sample_clock_delta_samples
+                    target.pattern_clock_reject_count = previous[target.mac].pattern_clock_reject_count
             self.state.targets = discovered
             if not self.state.targets:
                 _emit("measurement_idle", reason="no_active_speakers")
@@ -974,27 +1110,46 @@ class RuntimeSyncService:
             return
 
         emit_frame_indices = [int(entry["frame_index"]) for entry in emit_entries[: self.args.pattern_bursts]]
-        detection = await self.detector.detect_pattern(
+        clock_prior_delta_samples = target.last_sample_clock_delta_samples
+        analysis = await self.detector.analyze_pattern(
             detect_start,
             detect_end,
             emit_frame_indices,
             tolerance_ms=self.args.pattern_tolerance_ms,
+            expected_delta_samples=clock_prior_delta_samples,
+            clock_tolerance_ms=self.args.pattern_clock_tolerance_ms,
         )
+        detection = analysis.get("selected")
         if not detection:
             target.stable_count = 0
+            reject_reason = analysis.get("reject_reason", "pattern_not_matched")
+            if reject_reason == "clock_prior_mismatch":
+                target.pattern_clock_reject_count += 1
+            else:
+                target.pattern_clock_reject_count = 0
+            pattern_clock_reject_count = target.pattern_clock_reject_count
+            reset_clock_prior = pattern_clock_reject_count >= 3
+            if reset_clock_prior:
+                target.sample_clock_baseline_samples = None
+                target.last_sample_clock_delta_samples = None
+                target.pattern_clock_reject_count = 0
             _emit(
                 "burst_pattern_missed",
                 mac=target.mac,
-                reason="pattern_not_matched",
+                reason=reject_reason,
                 emit_frame_indices=emit_frame_indices,
                 frame_entries=entries,
                 detect_start_monotonic=detect_start,
                 detect_end_monotonic=detect_end,
+                pattern_clock_reject_count=pattern_clock_reject_count,
+                reset_clock_prior=reset_clock_prior,
+                **analysis,
             )
             return
 
         latency_ms = (detection["arrival_monotonic"] - emit_records[0]["emit_monotonic"]) * 1000.0
         target.stable_count += 1
+        target.pattern_clock_reject_count = 0
         target.last_latency_ms = latency_ms
         sample_clock = _sample_clock_fields(target, detection, [emit_entries[0]])
         _emit(
@@ -1013,6 +1168,16 @@ class RuntimeSyncService:
             matched_arrival_sample_indices=detection.get("matched_arrival_sample_indices"),
             matched_error_ms=detection.get("matched_error_ms"),
             pattern_mean_abs_error_ms=detection.get("pattern_mean_abs_error_ms"),
+            pattern_max_abs_error_ms=detection.get("pattern_max_abs_error_ms"),
+            pattern_clock_delta_spread_ms=detection.get("pattern_clock_delta_spread_ms"),
+            pattern_selection_reason=detection.get("pattern_selection_reason"),
+            pattern_match_count=detection.get("pattern_match_count"),
+            pattern_rejected_by_clock_count=detection.get("pattern_rejected_by_clock_count"),
+            pattern_clock_prior_delta_samples=detection.get("pattern_clock_prior_delta_samples"),
+            pattern_clock_prior_error_ms=detection.get("pattern_clock_prior_error_ms"),
+            pattern_clock_prior_tolerance_ms=detection.get("pattern_clock_prior_tolerance_ms"),
+            sample_clock_anchor_sample_index=detection.get("sample_clock_anchor_sample_index"),
+            sample_clock_anchor_monotonic=detection.get("sample_clock_anchor_monotonic"),
             emit_frame_indices=emit_frame_indices,
             frame_entries=entries,
             stable_count=target.stable_count,
@@ -1053,6 +1218,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=PATTERN_TOLERANCE_MS,
         help="Maximum per-burst timing mismatch allowed when matching a pattern",
+    )
+    parser.add_argument(
+        "--pattern-clock-tolerance-ms",
+        type=float,
+        default=PATTERN_CLOCK_TOLERANCE_MS,
+        help="Maximum cycle-to-cycle sample-clock delta jump allowed for a pattern match",
     )
     # Slice 3: closed-loop drift correction flags.
     # Spec: docs/maverick/proposals/09-slice-3-implementation-spec.md

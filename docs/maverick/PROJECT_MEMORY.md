@@ -593,6 +593,7 @@ Run window: `runtime-latency.service` active starting 2026-05-27 22:48:28 EDT. T
 
 **Journal evidence:**
 - Event counts: `burst_pattern_emit=21`, `burst_pattern_arrival=5`, `burst_pattern_missed=1`, `detector_warmup=1`, `device_discovery=4`, `mic_capture_started=1`, `mic_capture_stopped=1`, `service_starting=1`, `service_stopped=1`.
+- The event count includes one final three-burst pattern that was interrupted by stopping the transient unit before it produced either an arrival or missed-pattern outcome.
 - `28:FA:19:B6:0E:3B`: 3 pattern arrivals, SNR min/avg `12.52/12.89 dB`, max/avg `pattern_mean_abs_error_ms=2.06/1.20`, max absolute per-burst matched error `4.83 ms`, `sample_clock_drift_ms` min/max/final `-5.25/45.17/-5.25`, candidate count range `3..7`.
 - `F4:6A:DD:D4:F3:C8`: 2 pattern arrivals and 1 missed pattern, SNR min/avg `12.00/12.33 dB`, max/avg `pattern_mean_abs_error_ms=2.06/1.28`, max absolute per-burst matched error `5.50 ms`, `sample_clock_drift_ms` min/max/final `-6.77/0.00/-6.77`, candidate count range `3..8`.
 

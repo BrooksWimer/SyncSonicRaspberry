@@ -58,8 +58,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Iterable, Optional
 
-import dbus
 import numpy as np
+
+try:
+    import dbus
+except ImportError:  # pragma: no cover - desktop tests can exercise pure detector math without DBus.
+    dbus = None  # type: ignore[assignment]
 
 SOCKET_DIR = Path(os.environ.get("SYNCSONIC_FILTER_SOCKET_DIR", "/tmp/syncsonic-engine"))
 FILTER_SOCKET_GLOB = "syncsonic-delay-*.sock"
@@ -81,6 +85,9 @@ STABLE_WINDOW_MARGIN_MS = 100.0
 STABLE_MEASUREMENT_COUNT = 5
 WINDOW_MS = 50.0
 HOP_MS = 25.0
+ONSET_WINDOW_MS = 10.0
+ONSET_HOP_MS = 2.5
+PATTERN_TOLERANCE_MS = 35.0
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
 
@@ -147,6 +154,8 @@ def _scan_filter_sockets() -> dict[str, Path]:
 
 def _connected_speaker_macs() -> set[str]:
     """Return connected BlueZ devices, degrading to empty on any probe failure."""
+    if dbus is None:
+        raise RuntimeError("dbus module unavailable")
     from syncsonic_ble.helpers.adapter_helpers import connected_devices_on_adapter
 
     bus = dbus.SystemBus()
@@ -182,17 +191,27 @@ def discover_active_speakers(limit: int = 2) -> list["SpeakerTarget"]:
 class SampleChunk:
     start_time: float
     end_time: float
+    start_index: int
+    end_index: int
     samples: np.ndarray
 
 
+@dataclass
+class SampleWindow:
+    samples: np.ndarray
+    start_time: float
+    start_index: int
+
+
 class RingBuffer:
-    """Timestamped in-memory sample ring fed by a long-running parecord task."""
+    """Timestamped and sample-indexed mic ring fed by long-running parecord."""
 
     def __init__(self, sample_rate: int = SAMPLE_RATE, capacity_sec: float = 20.0) -> None:
         self.sample_rate = sample_rate
         self.capacity_samples = int(sample_rate * capacity_sec)
         self._chunks: Deque[SampleChunk] = deque()
         self._samples = 0
+        self._next_sample_index = 0
         self._lock = asyncio.Lock()
 
     async def append(self, pcm: bytes, end_time: float) -> None:
@@ -203,8 +222,17 @@ class RingBuffer:
             return
         samples = np.frombuffer(pcm[:usable], dtype="<i2").astype(np.float32) / 32768.0
         duration = len(samples) / self.sample_rate
-        chunk = SampleChunk(start_time=end_time - duration, end_time=end_time, samples=samples)
         async with self._lock:
+            start_index = self._next_sample_index
+            end_index = start_index + len(samples)
+            self._next_sample_index = end_index
+            chunk = SampleChunk(
+                start_time=end_time - duration,
+                end_time=end_time,
+                start_index=start_index,
+                end_index=end_index,
+                samples=samples,
+            )
             self._chunks.append(chunk)
             self._samples += len(samples)
             while self._samples > self.capacity_samples and self._chunks:
@@ -212,9 +240,14 @@ class RingBuffer:
                 self._samples -= len(removed.samples)
 
     async def read_window(self, start_time: float, end_time: float) -> tuple[np.ndarray, float]:
+        window = await self.read_window_with_index(start_time, end_time)
+        return window.samples, window.start_time
+
+    async def read_window_with_index(self, start_time: float, end_time: float) -> SampleWindow:
         async with self._lock:
             pieces: list[np.ndarray] = []
             first_time: Optional[float] = None
+            first_index: Optional[int] = None
             for chunk in self._chunks:
                 if chunk.end_time <= start_time:
                     continue
@@ -226,10 +259,15 @@ class RingBuffer:
                     continue
                 if first_time is None:
                     first_time = chunk.start_time + (start_idx / self.sample_rate)
+                    first_index = chunk.start_index + start_idx
                 pieces.append(chunk.samples[start_idx:end_idx])
         if not pieces:
-            return np.zeros(0, dtype=np.float32), start_time
-        return np.concatenate(pieces), first_time if first_time is not None else start_time
+            return SampleWindow(np.zeros(0, dtype=np.float32), start_time, 0)
+        return SampleWindow(
+            np.concatenate(pieces),
+            first_time if first_time is not None else start_time,
+            first_index if first_index is not None else 0,
+        )
 
 
 class ParecordCapture:
@@ -317,6 +355,7 @@ class SpeakerTarget:
     socket_path: Path
     stable_count: int = 0
     last_latency_ms: Optional[float] = None
+    sample_clock_baseline_samples: Optional[float] = None
 
 
 @dataclass
@@ -338,8 +377,52 @@ class EnvelopeDetector:
         self.noise_floor_db = self._band_power_db(samples) if len(samples) else -90.0
         _emit("detector_warmup", duration_sec=duration_sec, noise_floor_db=self.noise_floor_db)
 
-    async def detect(self, start_time: float, end_time: float) -> Optional[dict[str, float]]:
-        samples, base_time = await self.ring.read_window(start_time, end_time)
+    async def detect(
+        self,
+        start_time: float,
+        end_time: float,
+        mode: str = "peak",
+    ) -> Optional[dict[str, Any]]:
+        window = await self.ring.read_window_with_index(start_time, end_time)
+        if mode == "onset":
+            return self.detect_onset_in_samples(
+                window.samples,
+                window.start_time,
+                window.start_index,
+                self.noise_floor_db,
+            )
+        return self.detect_peak_in_samples(
+            window.samples,
+            window.start_time,
+            window.start_index,
+            self.noise_floor_db,
+        )
+
+    async def detect_pattern(
+        self,
+        start_time: float,
+        end_time: float,
+        emit_frame_indices: list[int],
+        tolerance_ms: float = PATTERN_TOLERANCE_MS,
+    ) -> Optional[dict[str, Any]]:
+        window = await self.ring.read_window_with_index(start_time, end_time)
+        return self.detect_pattern_in_samples(
+            window.samples,
+            window.start_time,
+            window.start_index,
+            self.noise_floor_db,
+            emit_frame_indices,
+            tolerance_ms=tolerance_ms,
+        )
+
+    @classmethod
+    def detect_peak_in_samples(
+        cls,
+        samples: np.ndarray,
+        base_time: float,
+        base_sample_index: int,
+        noise_floor_db: float,
+    ) -> Optional[dict[str, Any]]:
         window = int(SAMPLE_RATE * WINDOW_MS / 1000.0)
         hop = int(SAMPLE_RATE * HOP_MS / 1000.0)
         if len(samples) < window:
@@ -347,20 +430,151 @@ class EnvelopeDetector:
         best_db = -200.0
         best_idx = 0
         for idx in range(0, len(samples) - window + 1, hop):
-            power = self._band_power_db(samples[idx : idx + window])
+            power = cls._band_power_db(samples[idx : idx + window])
             if power > best_db:
                 best_db = power
                 best_idx = idx
-        snr_db = best_db - self.noise_floor_db
+        snr_db = best_db - noise_floor_db
         if snr_db < MIN_SNR_DB:
             return None
-        arrival_time = base_time + ((best_idx + (window / 2)) / SAMPLE_RATE)
+        arrival_offset = best_idx + (window / 2)
+        arrival_time = base_time + (arrival_offset / SAMPLE_RATE)
+        arrival_sample_index = base_sample_index + int(round(arrival_offset))
         return {
             "arrival_monotonic": arrival_time,
+            "arrival_sample_index": arrival_sample_index,
             "peak_power_db": best_db,
-            "noise_floor_db": self.noise_floor_db,
+            "noise_floor_db": noise_floor_db,
             "snr_db": snr_db,
+            "detector_mode": "peak",
         }
+
+    @classmethod
+    def detect_onset_in_samples(
+        cls,
+        samples: np.ndarray,
+        base_time: float,
+        base_sample_index: int,
+        noise_floor_db: float,
+    ) -> Optional[dict[str, Any]]:
+        candidates = cls._onset_candidates(samples, base_sample_index, noise_floor_db)
+        if not candidates:
+            return None
+        first = candidates[0]
+        offset = first["sample_index"] - base_sample_index
+        return {
+            "arrival_monotonic": base_time + (offset / SAMPLE_RATE),
+            "arrival_sample_index": first["sample_index"],
+            "peak_power_db": first["power_db"],
+            "noise_floor_db": noise_floor_db,
+            "snr_db": first["snr_db"],
+            "detector_mode": "onset",
+            "candidate_count": len(candidates),
+        }
+
+    @classmethod
+    def detect_pattern_in_samples(
+        cls,
+        samples: np.ndarray,
+        base_time: float,
+        base_sample_index: int,
+        noise_floor_db: float,
+        emit_frame_indices: list[int],
+        tolerance_ms: float = PATTERN_TOLERANCE_MS,
+    ) -> Optional[dict[str, Any]]:
+        if not emit_frame_indices:
+            return None
+        candidates = cls._onset_candidates(samples, base_sample_index, noise_floor_db)
+        if not candidates:
+            return None
+        emit_offsets = [frame - emit_frame_indices[0] for frame in emit_frame_indices]
+        tolerance_samples = int(round(tolerance_ms * SAMPLE_RATE / 1000.0))
+        best: Optional[dict[str, Any]] = None
+        for start in candidates:
+            matched: list[dict[str, float]] = []
+            total_abs_error = 0.0
+            for expected_offset in emit_offsets:
+                expected_sample = start["sample_index"] + expected_offset
+                nearest = min(
+                    candidates,
+                    key=lambda candidate: abs(candidate["sample_index"] - expected_sample),
+                )
+                error_samples = nearest["sample_index"] - expected_sample
+                if abs(error_samples) > tolerance_samples:
+                    break
+                matched.append(
+                    {
+                        "sample_index": nearest["sample_index"],
+                        "expected_sample_index": expected_sample,
+                        "error_samples": error_samples,
+                        "power_db": nearest["power_db"],
+                        "snr_db": nearest["snr_db"],
+                    }
+                )
+                total_abs_error += abs(error_samples)
+            if len(matched) != len(emit_offsets):
+                continue
+            score = total_abs_error / max(1, len(matched))
+            if best is None or score < best["mean_abs_error_samples"]:
+                best = {
+                    "first": start,
+                    "matched": matched,
+                    "mean_abs_error_samples": score,
+                }
+        if best is None:
+            return None
+        first = best["first"]
+        offset = first["sample_index"] - base_sample_index
+        snrs = [match["snr_db"] for match in best["matched"]]
+        powers = [match["power_db"] for match in best["matched"]]
+        return {
+            "arrival_monotonic": base_time + (offset / SAMPLE_RATE),
+            "arrival_sample_index": first["sample_index"],
+            "peak_power_db": max(powers),
+            "noise_floor_db": noise_floor_db,
+            "snr_db": min(snrs),
+            "detector_mode": "pattern",
+            "candidate_count": len(candidates),
+            "matched_arrival_sample_indices": [int(match["sample_index"]) for match in best["matched"]],
+            "matched_error_ms": [match["error_samples"] * 1000.0 / SAMPLE_RATE for match in best["matched"]],
+            "pattern_mean_abs_error_ms": best["mean_abs_error_samples"] * 1000.0 / SAMPLE_RATE,
+        }
+
+    @classmethod
+    def _onset_candidates(
+        cls,
+        samples: np.ndarray,
+        base_sample_index: int,
+        noise_floor_db: float,
+    ) -> list[dict[str, Any]]:
+        window = max(1, int(SAMPLE_RATE * ONSET_WINDOW_MS / 1000.0))
+        hop = max(1, int(SAMPLE_RATE * ONSET_HOP_MS / 1000.0))
+        if len(samples) < window:
+            return []
+        threshold = noise_floor_db + MIN_SNR_DB
+        bins: list[tuple[int, float]] = []
+        for idx in range(0, len(samples) - window + 1, hop):
+            power = cls._band_power_db(samples[idx : idx + window])
+            bins.append((idx, power))
+        candidates: list[dict[str, Any]] = []
+        previous_above = False
+        refractory = max(window, int(0.5 * window))
+        last_sample_index = -refractory
+        for idx, power in bins:
+            above = power >= threshold
+            if above and not previous_above:
+                sample_index = base_sample_index + idx
+                if sample_index - last_sample_index >= refractory:
+                    candidates.append(
+                        {
+                            "sample_index": sample_index,
+                            "power_db": power,
+                            "snr_db": power - noise_floor_db,
+                        }
+                    )
+                    last_sample_index = sample_index
+            previous_above = above
+        return candidates
 
     @staticmethod
     def _band_power_db(samples: np.ndarray) -> float:
@@ -487,6 +701,38 @@ class DriftController:
         }
 
 
+def _current_emit_entry(entries: list[Any]) -> Optional[dict[str, Any]]:
+    parsed = [entry for entry in entries if isinstance(entry, dict) and "frame_index" in entry]
+    if not parsed:
+        return None
+    return max(parsed, key=lambda entry: int(entry.get("frame_index") or 0))
+
+
+def _sample_clock_fields(
+    target: SpeakerTarget,
+    detection: dict[str, Any],
+    entries: list[Any],
+) -> dict[str, Any]:
+    entry = _current_emit_entry(entries)
+    if entry is None or "arrival_sample_index" not in detection:
+        return {}
+    emit_frame_index = int(entry["frame_index"])
+    arrival_sample_index = int(detection["arrival_sample_index"])
+    delta_samples = arrival_sample_index - emit_frame_index
+    if target.sample_clock_baseline_samples is None:
+        target.sample_clock_baseline_samples = float(delta_samples)
+    drift_samples = float(delta_samples) - target.sample_clock_baseline_samples
+    return {
+        "emit_frame_index": emit_frame_index,
+        "arrival_sample_index": arrival_sample_index,
+        "sample_clock_delta_samples": delta_samples,
+        "sample_clock_delta_ms": delta_samples * 1000.0 / SAMPLE_RATE,
+        "sample_clock_baseline_samples": target.sample_clock_baseline_samples,
+        "sample_clock_drift_samples": drift_samples,
+        "sample_clock_drift_ms": drift_samples * 1000.0 / SAMPLE_RATE,
+    }
+
+
 class RuntimeSyncService:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -534,6 +780,7 @@ class RuntimeSyncService:
                 if target.mac in previous:
                     target.stable_count = previous[target.mac].stable_count
                     target.last_latency_ms = previous[target.mac].last_latency_ms
+                    target.sample_clock_baseline_samples = previous[target.mac].sample_clock_baseline_samples
             self.state.targets = discovered
             if not self.state.targets:
                 _emit("measurement_idle", reason="no_active_speakers")
@@ -547,9 +794,13 @@ class RuntimeSyncService:
             self.state.cycles += 1
 
     async def _measure_once(self, target: SpeakerTarget) -> None:
+        if self.args.detector_mode == "pattern":
+            await self._measure_pattern(target)
+            return
         query = _send_filter_command(target.socket_path, "query") or {}
         target_delay_samples = int(query.get("target_delay_samples") or 0)
         target_delay_ms = (target_delay_samples / SAMPLE_RATE) * 1000.0
+        _send_filter_command(target.socket_path, "query_emit_timestamps")
         emit_issue_monotonic = time.monotonic()
         emit_payload = (
             f"emit_burst {int(round(self.args.freq_hz * 10))} "
@@ -579,7 +830,7 @@ class RuntimeSyncService:
         await asyncio.sleep(max(0.0, detect_end - time.monotonic()))
 
         entries = (_send_filter_command(target.socket_path, "query_emit_timestamps") or {}).get("entries", [])
-        detection = await self.detector.detect(detect_start, detect_end)
+        detection = await self.detector.detect(detect_start, detect_end, mode=self.args.detector_mode)
         if not detection:
             target.stable_count = 0
             _emit(
@@ -597,11 +848,13 @@ class RuntimeSyncService:
         latency_ms = (detection["arrival_monotonic"] - emit_monotonic) * 1000.0
         target.stable_count += 1
         target.last_latency_ms = latency_ms
+        sample_clock = _sample_clock_fields(target, detection, entries)
         _emit(
             "burst_arrival",
             mac=target.mac,
             emit_monotonic=emit_monotonic,
             arrival_monotonic=detection["arrival_monotonic"],
+            detector_mode=detection.get("detector_mode", self.args.detector_mode),
             expected_arrival_monotonic=expected_arrival,
             latency_ms=latency_ms,
             slider_target_delay_samples=target_delay_samples,
@@ -609,8 +862,10 @@ class RuntimeSyncService:
             peak_power_db=detection["peak_power_db"],
             noise_floor_db=detection["noise_floor_db"],
             snr_db=detection["snr_db"],
+            candidate_count=detection.get("candidate_count"),
             frame_entries=entries,
             stable_count=target.stable_count,
+            **sample_clock,
         )
 
         # Slice 3: closed-loop drift correction (opt-in via --enable-correction).
@@ -638,6 +893,132 @@ class RuntimeSyncService:
                         applied_ppm=record["applied_ppm"],
                     )
 
+    async def _measure_pattern(self, target: SpeakerTarget) -> None:
+        query = _send_filter_command(target.socket_path, "query") or {}
+        target_delay_samples = int(query.get("target_delay_samples") or 0)
+        target_delay_ms = (target_delay_samples / SAMPLE_RATE) * 1000.0
+        _send_filter_command(target.socket_path, "query_emit_timestamps")
+
+        emit_records: list[dict[str, Any]] = []
+        emit_payload = (
+            f"emit_burst {int(round(self.args.freq_hz * 10))} "
+            f"{int(self.args.duration_ms)} {int(round(self.args.amplitude * 1000))}"
+        )
+        pattern_gap_sec = max(
+            self.args.pattern_gap_ms / 1000.0,
+            (target_delay_samples / SAMPLE_RATE) + (self.args.duration_ms / 1000.0) + 0.020,
+        )
+        for pattern_index in range(self.args.pattern_bursts):
+            emit_issue_monotonic = time.monotonic()
+            ack = _send_filter_command(target.socket_path, emit_payload)
+            emit_monotonic = time.monotonic()
+            record = {
+                "pattern_index": pattern_index,
+                "emit_issue_monotonic": emit_issue_monotonic,
+                "emit_monotonic": emit_monotonic,
+                "ack": ack,
+            }
+            emit_records.append(record)
+            _emit(
+                "burst_pattern_emit",
+                mac=target.mac,
+                socket_path=str(target.socket_path),
+                pattern_index=pattern_index,
+                pattern_bursts=self.args.pattern_bursts,
+                emit_issue_monotonic=emit_issue_monotonic,
+                emit_monotonic=emit_monotonic,
+                filter_query=query if pattern_index == 0 else None,
+                slider_target_delay_samples=target_delay_samples,
+                slider_target_delay_ms=target_delay_ms,
+                pattern_gap_sec=pattern_gap_sec,
+                ack=ack,
+            )
+            if not ack or not ack.get("ok"):
+                _emit("burst_emit_failed", mac=target.mac, ack=ack, pattern_index=pattern_index)
+                return
+            if pattern_index < self.args.pattern_bursts - 1:
+                await asyncio.sleep(pattern_gap_sec)
+
+        margin_ms = STABLE_WINDOW_MARGIN_MS if target.stable_count >= STABLE_MEASUREMENT_COUNT else INITIAL_WINDOW_MARGIN_MS
+        first_expected = (
+            emit_records[0]["emit_monotonic"]
+            + (target_delay_samples / SAMPLE_RATE)
+            + (self.args.bt_codec_latency_ms / 1000.0)
+        )
+        last_expected = (
+            emit_records[-1]["emit_monotonic"]
+            + (target_delay_samples / SAMPLE_RATE)
+            + (self.args.bt_codec_latency_ms / 1000.0)
+        )
+        detect_start = first_expected - (margin_ms / 1000.0)
+        detect_end = last_expected + (margin_ms / 1000.0) + (self.args.duration_ms / 1000.0)
+        await asyncio.sleep(max(0.0, detect_end - time.monotonic()))
+
+        entries = (_send_filter_command(target.socket_path, "query_emit_timestamps") or {}).get("entries", [])
+        emit_entries = sorted(
+            [entry for entry in entries if isinstance(entry, dict) and "frame_index" in entry],
+            key=lambda entry: int(entry["frame_index"]),
+        )
+        if len(emit_entries) < self.args.pattern_bursts:
+            target.stable_count = 0
+            _emit(
+                "burst_pattern_missed",
+                mac=target.mac,
+                reason="missing_emit_timestamps",
+                expected_emit_count=self.args.pattern_bursts,
+                emit_entry_count=len(emit_entries),
+                frame_entries=entries,
+                detect_start_monotonic=detect_start,
+                detect_end_monotonic=detect_end,
+            )
+            return
+
+        emit_frame_indices = [int(entry["frame_index"]) for entry in emit_entries[: self.args.pattern_bursts]]
+        detection = await self.detector.detect_pattern(
+            detect_start,
+            detect_end,
+            emit_frame_indices,
+            tolerance_ms=self.args.pattern_tolerance_ms,
+        )
+        if not detection:
+            target.stable_count = 0
+            _emit(
+                "burst_pattern_missed",
+                mac=target.mac,
+                reason="pattern_not_matched",
+                emit_frame_indices=emit_frame_indices,
+                frame_entries=entries,
+                detect_start_monotonic=detect_start,
+                detect_end_monotonic=detect_end,
+            )
+            return
+
+        latency_ms = (detection["arrival_monotonic"] - emit_records[0]["emit_monotonic"]) * 1000.0
+        target.stable_count += 1
+        target.last_latency_ms = latency_ms
+        sample_clock = _sample_clock_fields(target, detection, [emit_entries[0]])
+        _emit(
+            "burst_pattern_arrival",
+            mac=target.mac,
+            emit_monotonic=emit_records[0]["emit_monotonic"],
+            arrival_monotonic=detection["arrival_monotonic"],
+            detector_mode="pattern",
+            latency_ms=latency_ms,
+            slider_target_delay_samples=target_delay_samples,
+            slider_target_delay_ms=target_delay_ms,
+            peak_power_db=detection["peak_power_db"],
+            noise_floor_db=detection["noise_floor_db"],
+            snr_db=detection["snr_db"],
+            candidate_count=detection.get("candidate_count"),
+            matched_arrival_sample_indices=detection.get("matched_arrival_sample_indices"),
+            matched_error_ms=detection.get("matched_error_ms"),
+            pattern_mean_abs_error_ms=detection.get("pattern_mean_abs_error_ms"),
+            emit_frame_indices=emit_frame_indices,
+            frame_entries=entries,
+            stable_count=target.stable_count,
+            **sample_clock,
+        )
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mic-source", help="Exact PulseAudio/PipeWire source name for parecord")
@@ -649,6 +1030,30 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration-ms", type=int, default=DEFAULT_DURATION_MS)
     parser.add_argument("--amplitude", type=float, default=DEFAULT_AMPLITUDE)
     parser.add_argument("--bt-codec-latency-ms", type=float, default=DEFAULT_BT_CODEC_LATENCY_MS)
+    parser.add_argument(
+        "--detector-mode",
+        choices=("peak", "onset", "pattern"),
+        default="peak",
+        help="Measurement detector: legacy peak window, onset threshold, or multi-burst pattern",
+    )
+    parser.add_argument(
+        "--pattern-bursts",
+        type=int,
+        default=3,
+        help="Number of bursts to emit per speaker when --detector-mode=pattern",
+    )
+    parser.add_argument(
+        "--pattern-gap-ms",
+        type=float,
+        default=300.0,
+        help="Minimum wall-clock gap between pattern burst commands; expanded when filter delay is longer",
+    )
+    parser.add_argument(
+        "--pattern-tolerance-ms",
+        type=float,
+        default=PATTERN_TOLERANCE_MS,
+        help="Maximum per-burst timing mismatch allowed when matching a pattern",
+    )
     # Slice 3: closed-loop drift correction flags.
     # Spec: docs/maverick/proposals/09-slice-3-implementation-spec.md
     parser.add_argument(
@@ -673,6 +1078,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 async def _amain(argv: Optional[Iterable[str]] = None) -> int:
     args = _build_parser().parse_args(list(argv) if argv is not None else None)
+    if args.detector_mode == "pattern" and args.pattern_bursts < 2:
+        raise SystemExit("--pattern-bursts must be >= 2 when --detector-mode=pattern")
     service = RuntimeSyncService(args)
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):

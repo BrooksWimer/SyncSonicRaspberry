@@ -530,3 +530,37 @@ The likely disconnect is that `EnvelopeDetector.detect()` is a **peak-energy win
 The slice 3 journal supports this: `arrival_monotonic - expected_arrival_monotonic` clustered in exact 25 ms buckets. `28:FA:19:B6:0E:3B` ranged from about `-50` to `+75 ms`; `F4:6A:DD:D4:F3:C8` ranged from about `0` to `+100 ms`. That shape looks like window-choice ambiguity across a burst envelope, not a slow physical drift of the speaker path.
 
 Planning correction: do not frame the next step as generic experimentation or simple window widening. First tighten the measurement definition: decide whether runtime correction needs burst **onset**, burst **center**, or a stable envelope landmark, then implement/log that estimator explicitly. Candidate work should be justified against this explanation before changing controller gain or starting slice 4+.
+
+## 2026-05-28 - Slice 3b started: sample-clock + pattern measurement
+
+Branch: `codex/ultrasonic-sample-clock-pattern` from `ultrasonic-runtime-sync`.
+
+**Request:** build the measurement path Brooks sketched after the slice 3 validation mismatch: exact filter-side burst timing, continuously indexed mic capture, and a burst pattern detector before any more controller tuning.
+
+**Epic lane:** `ultrasonic-runtime-sync`.
+
+**Scope for this branch:**
+- Keep the existing peak detector as the default so slice 2/3 invocations remain backwards-compatible.
+- Add mic sample indexing to `RingBuffer` so every detection can report `arrival_sample_index` in the continuous capture stream.
+- Use the filter's existing `query_emit_timestamps` `frame_index` as the emitted-burst clock evidence and log baseline-subtracted `sample_clock_drift_ms`.
+- Add optional detector modes:
+  - `peak`: legacy loudest 50 ms window center.
+  - `onset`: first high-frequency threshold crossing using a shorter 10 ms window / 2.5 ms hop.
+  - `pattern`: emit multiple bursts, read exact emitted frame indices, then match the observed mic onset spacing to the emitted-frame spacing.
+- Keep pattern mode measurement-only for now. Do not feed pattern results into `DriftController` until Pi logs prove the new sample-clock drift signal is stable.
+
+**Out of scope for this branch:**
+- UX changes, BLE toggles, third-speaker scaling, or 24-hour soak.
+- Controller gain changes.
+- PipeWire/Pulse clock-provider refactors. This branch logs the evidence needed to decide whether a deeper clock-alignment refactor is still necessary.
+
+**Acceptance criteria:**
+- Local: `python -m compileall syncsonic_ble measurement` passes.
+- Local: `python -m pytest measurement -v` passes, including synthetic tests for mic sample indexing, onset-vs-peak timing, and pattern spacing match.
+- Pi measurement run (next): transient `runtime-latency` with `--detector-mode pattern --pattern-bursts 3 --duration-ms 50 --pattern-gap-ms 300` logs `burst_pattern_arrival` for both speakers with `emit_frame_index`, `arrival_sample_index`, `sample_clock_delta_ms`, `sample_clock_drift_ms`, `matched_arrival_sample_indices`, and `pattern_mean_abs_error_ms`.
+- Pi pass criterion for the measurement slice is not "alignment corrected"; it is "sample-clock drift is materially smoother than the legacy `current_codec_ms` signal and pattern match error stays under 10 ms." Only after that should the controller consume it.
+
+**Current local implementation state:**
+- `backend/measurement/runtime_latency_service.py` now tracks mic sample indices and exposes `--detector-mode {peak,onset,pattern}`, `--pattern-bursts`, `--pattern-gap-ms`, and `--pattern-tolerance-ms`.
+- `backend/measurement/test_runtime_latency_service.py` covers the new pure detector math.
+- Local verification passed: `python -m compileall syncsonic_ble measurement`; `python -m pytest measurement -v` (17 tests).

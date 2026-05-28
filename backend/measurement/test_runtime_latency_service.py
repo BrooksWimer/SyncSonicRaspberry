@@ -1,0 +1,383 @@
+from __future__ import annotations
+
+import asyncio
+import sys
+import types
+from pathlib import Path
+
+import numpy as np
+
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
+sys.modules.setdefault("dbus", types.SimpleNamespace(SystemBus=lambda: None))
+
+from measurement.runtime_latency_service import (  # noqa: E402
+    EnvelopeDetector,
+    RelativeDriftEstimator,
+    RingBuffer,
+    SAMPLE_RATE,
+)
+
+
+def _tone(start: int, duration: int, total: int, freq_hz: float = 18_500.0) -> np.ndarray:
+    samples = np.zeros(total, dtype=np.float32)
+    t = np.arange(duration, dtype=np.float64) / SAMPLE_RATE
+    samples[start : start + duration] = (0.8 * np.sin(2.0 * np.pi * freq_hz * t)).astype(np.float32)
+    return samples
+
+
+def test_ring_buffer_tracks_absolute_mic_sample_indices() -> None:
+    async def run() -> None:
+        ring = RingBuffer(capacity_sec=1.0)
+        first = (np.arange(4800, dtype=np.int16)).tobytes()
+        second = (np.arange(4800, 9600, dtype=np.int16)).tobytes()
+        await ring.append(first, end_time=10.0)
+        await ring.append(second, end_time=10.1)
+        window = await ring.read_window_with_index(9.95, 10.05)
+        assert 2399 <= window.start_index <= 2400
+        assert 4799 <= len(window.samples) <= 4802
+
+    asyncio.run(run())
+
+
+def test_onset_detector_reports_burst_start_not_peak_window_center() -> None:
+    burst_start = 9_600
+    burst_duration = int(0.100 * SAMPLE_RATE)
+    samples = _tone(burst_start, burst_duration, total=24_000)
+
+    onset = EnvelopeDetector.detect_onset_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=100_000,
+        noise_floor_db=-90.0,
+    )
+    peak = EnvelopeDetector.detect_peak_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=100_000,
+        noise_floor_db=-90.0,
+    )
+
+    assert onset is not None
+    assert peak is not None
+    assert abs(onset["arrival_sample_index"] - (100_000 + burst_start)) <= 480
+    assert peak["arrival_sample_index"] - onset["arrival_sample_index"] >= int(0.020 * SAMPLE_RATE)
+
+
+def test_pattern_detector_matches_emit_spacing_in_mic_sample_indices() -> None:
+    first = 12_000
+    offsets = [0, 12_000, 27_000]
+    duration = int(0.030 * SAMPLE_RATE)
+    total = first + offsets[-1] + duration + 10_000
+    samples = np.zeros(total, dtype=np.float32)
+    for offset in offsets:
+        samples += _tone(first + offset, duration, total)
+
+    base_sample = 500_000
+    emit_frames = [1_000_000 + offset for offset in offsets]
+    match = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+    )
+
+    assert match is not None
+    assert match["detector_mode"] == "pattern"
+    observed = match["matched_arrival_sample_indices"]
+    observed_offsets = [sample - observed[0] for sample in observed]
+    assert max(abs(observed - expected) for observed, expected in zip(observed_offsets, offsets)) <= 24
+    assert max(abs(error) for error in match["matched_error_ms"]) <= 0.5
+    assert match["pattern_landmark"] == "envelope"
+
+
+def test_pattern_detector_uses_clock_prior_to_avoid_late_echo_group() -> None:
+    first = 12_000
+    emit_offsets = [0, 14_336, 28_672]
+    true_offsets = [0, 14_456, 28_552]
+    echo_offset = 2_168
+    duration = int(0.006 * SAMPLE_RATE)
+    total = first + emit_offsets[-1] + echo_offset + duration + 8_000
+    samples = np.zeros(total, dtype=np.float32)
+    for offset in true_offsets:
+        samples += _tone(first + offset, duration, total)
+    for offset in emit_offsets:
+        samples += _tone(first + echo_offset + offset, duration, total)
+
+    base_sample = 500_000
+    emit_frames = [1_000_000 + offset for offset in emit_offsets]
+    expected_delta = base_sample + first - emit_frames[0]
+
+    unprioritized = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+    )
+    prioritized = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        expected_delta_samples=expected_delta,
+        clock_tolerance_ms=20.0,
+    )
+
+    assert unprioritized is not None
+    assert prioritized is not None
+    assert unprioritized["arrival_sample_index"] - prioritized["arrival_sample_index"] > 1_400
+    assert abs(prioritized["arrival_sample_index"] - (base_sample + first)) <= 480
+    assert prioritized["pattern_selection_reason"] == "clock_prior"
+    assert abs(prioritized["pattern_clock_prior_error_ms"]) < 10.0
+
+
+def test_pattern_detector_rejects_groups_that_jump_outside_clock_prior() -> None:
+    first = 12_000
+    offsets = [0, 14_336, 28_672]
+    late_jump = 2_400
+    duration = int(0.006 * SAMPLE_RATE)
+    total = first + offsets[-1] + late_jump + duration + 8_000
+    samples = np.zeros(total, dtype=np.float32)
+    for offset in offsets:
+        samples += _tone(first + late_jump + offset, duration, total)
+
+    base_sample = 500_000
+    emit_frames = [1_000_000 + offset for offset in offsets]
+    expected_delta = base_sample + first - emit_frames[0]
+
+    analysis = EnvelopeDetector.analyze_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        expected_delta_samples=expected_delta,
+        clock_tolerance_ms=20.0,
+    )
+
+    assert analysis["reject_reason"] == "clock_prior_mismatch"
+    assert analysis["pattern_match_count"] == 1
+    assert analysis["pattern_rejected_by_clock_count"] == 1
+    assert analysis["best_unprioritized_pattern_mean_abs_error_ms"] < 2.0
+    assert analysis["best_unprioritized_pattern_clock_prior_error_ms"] > 35.0
+    assert "selected" not in analysis
+
+
+def test_pattern_detector_has_independent_candidate_snr_floor() -> None:
+    first = 12_000
+    offsets = [0, 14_336, 28_672]
+    duration = int(0.030 * SAMPLE_RATE)
+    total = first + offsets[-1] + duration + 8_000
+    t = np.arange(total, dtype=np.float64) / SAMPLE_RATE
+    samples = (0.25 * np.sin(2.0 * np.pi * 18_500.0 * t)).astype(np.float32)
+    for offset in offsets:
+        samples += _tone(first + offset, duration, total)
+
+    base_sample = 500_000
+    emit_frames = [1_000_000 + offset for offset in offsets]
+
+    strict = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        min_snr_db=12.0,
+    )
+    pattern_floor = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        min_snr_db=9.0,
+    )
+
+    assert strict is None
+    assert pattern_floor is not None
+    assert pattern_floor["pattern_min_snr_db"] == 9.0
+    assert pattern_floor["snr_db"] >= 9.0
+
+
+def test_demodulated_envelope_pattern_uses_leading_edge_not_loudest_window() -> None:
+    first = 12_000
+    offsets = [0, 14_336, 28_672]
+    duration = int(0.050 * SAMPLE_RATE)
+    bump_offset = int(0.025 * SAMPLE_RATE)
+    bump_duration = int(0.010 * SAMPLE_RATE)
+    total = first + offsets[-1] + duration + 8_000
+    samples = np.zeros(total, dtype=np.float32)
+    for offset in offsets:
+        samples += _tone(first + offset, duration, total, freq_hz=18_500.0) * 0.25
+        samples += _tone(first + offset + bump_offset, bump_duration, total, freq_hz=18_500.0) * 0.75
+
+    base_sample = 500_000
+    emit_frames = [1_000_000 + offset for offset in offsets]
+    match = EnvelopeDetector.detect_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        min_snr_db=9.0,
+    )
+    peak = EnvelopeDetector.detect_peak_in_samples(
+        samples[first - 2_000 : first + 5_000],
+        base_time=0.0,
+        base_sample_index=base_sample + first - 2_000,
+        noise_floor_db=-90.0,
+    )
+
+    assert match is not None
+    assert peak is not None
+    assert abs(match["arrival_sample_index"] - (base_sample + first)) <= 480
+    assert peak["arrival_sample_index"] - match["arrival_sample_index"] >= int(0.020 * SAMPLE_RATE)
+
+
+def _samples_from_ms(value_ms: float) -> float:
+    return value_ms * SAMPLE_RATE / 1000.0
+
+
+def test_relative_estimator_subtracts_slice_3c_common_mode_drift() -> None:
+    estimator = RelativeDriftEstimator(
+        smoothing_window=1,
+        gain_ppm_per_ms=5.0,
+        peer_max_age_sec=60.0,
+    )
+    drifts_ms = {
+        "28:FA:19:B6:0E:3B": [
+            0.0,
+            -0.5416666666666666,
+            -2.9444444443409643,
+            -5.875,
+            -10.36111111100763,
+            -14.25,
+            -20.32638888899237,
+            -23.416666666666668,
+        ],
+        "F4:6A:DD:D4:F3:C8": [
+            0.0,
+            -0.7152777779847383,
+            -4.784722222325702,
+            -9.534722222325703,
+            -15.895833333333334,
+            -20.875,
+            -24.9722222223257,
+            -28.61111111131807,
+        ],
+    }
+    base = {
+        "28:FA:19:B6:0E:3B": 2_000_000.0,
+        "F4:6A:DD:D4:F3:C8": 2_500_000.0,
+    }
+    records = []
+    for idx in range(8):
+        t = idx * 33.2
+        for speaker_idx, mac in enumerate(drifts_ms):
+            records.append(
+                estimator.observe(
+                    mac=mac,
+                    monotonic=t + speaker_idx * 0.1,
+                    delta_samples=base[mac] + _samples_from_ms(drifts_ms[mac][idx]),
+                    snr_db=25.0,
+                    stable_count=5,
+                    pattern_mean_abs_error_ms=1.0,
+                    pattern_clock_delta_spread_ms=2.0,
+                )
+            )
+
+    proposals = [record for record in records if record["event"] == "relative_correction_proposed"]
+    residuals = [abs(record["relative_residual_ms"]) for record in proposals]
+    assert max(abs(value) for values in drifts_ms.values() for value in values) > 28.0
+    assert max(residuals) < 3.4
+    assert proposals[-1]["common_clock_slope_ppm"] < -100.0
+    assert abs(proposals[-1]["relative_residual_ms"]) < 3.0
+
+
+def test_relative_estimator_detects_one_speaker_residual_and_sign() -> None:
+    estimator = RelativeDriftEstimator(
+        smoothing_window=1,
+        gain_ppm_per_ms=5.0,
+        peer_max_age_sec=60.0,
+    )
+    base = {"A": 1_000_000.0, "B": 2_000_000.0}
+    record = None
+    for idx, common_ms in enumerate([0.0, -4.0, -8.0, -12.0]):
+        t = idx * 30.0
+        estimator.observe(
+            mac="A",
+            monotonic=t,
+            delta_samples=base["A"] + _samples_from_ms(common_ms),
+            snr_db=25.0,
+            stable_count=5,
+        )
+        record = estimator.observe(
+            mac="B",
+            monotonic=t + 0.1,
+            delta_samples=base["B"] + _samples_from_ms(common_ms + idx * 2.0),
+            snr_db=25.0,
+            stable_count=5,
+        )
+
+    assert record is not None
+    assert record["event"] == "relative_correction_proposed"
+    assert record["relative_residual_ms"] > 0.0
+    assert record["proposed_rate_ppm"] < 0.0
+    assert record["set_rate_ppm_sign"] == "negative_reduces_delay_positive_increases_delay"
+
+
+def test_relative_estimator_waits_for_recent_peer() -> None:
+    estimator = RelativeDriftEstimator(peer_max_age_sec=10.0)
+    first = estimator.observe(
+        mac="A",
+        monotonic=0.0,
+        delta_samples=1_000_000.0,
+        snr_db=25.0,
+        stable_count=5,
+    )
+    second = estimator.observe(
+        mac="B",
+        monotonic=20.0,
+        delta_samples=2_000_000.0,
+        snr_db=25.0,
+        stable_count=5,
+    )
+
+    assert first["event"] == "relative_correction_skipped"
+    assert first["reason"] == "insufficient_recent_peers"
+    assert second["event"] == "relative_correction_skipped"
+    assert second["reason"] == "insufficient_recent_peers"
+
+
+def test_relative_estimator_gates_low_confidence_proposals() -> None:
+    estimator = RelativeDriftEstimator(smoothing_window=3, peer_max_age_sec=60.0)
+    warmup = estimator.observe(
+        mac="A",
+        monotonic=0.0,
+        delta_samples=1_000_000.0,
+        snr_db=25.0,
+        stable_count=1,
+    )
+    low_snr = estimator.observe(
+        mac="B",
+        monotonic=0.1,
+        delta_samples=2_000_000.0,
+        snr_db=8.0,
+        stable_count=5,
+    )
+
+    assert warmup["reason"] == "insufficient_recent_peers"
+    assert low_snr["event"] == "relative_correction_skipped"
+    assert low_snr["reason"] == "low_snr"

@@ -667,3 +667,36 @@ Branch: `codex/ultrasonic-sample-clock-pattern`.
 **Local intent:** reduce low-SNR landmark movement inside the burst envelope while preserving the zero-miss acquisition improvement from the `--pattern-min-snr-db 9` pass. Still measurement-only; pattern results do not feed `DriftController` yet.
 
 **Local verification:** `python -m compileall syncsonic_ble measurement` passed; `python -m pytest measurement -v` passed (21 tests).
+
+### Pi smoke at `cc777b0`
+
+Pi checkout fast-forwarded to `cc777b0`; Pi compile passed for `backend/measurement/runtime_latency_service.py` and `backend/measurement/test_runtime_latency_service.py`. Pi-side pytest was not run. The transient `runtime-latency.service` was stopped after the run; `syncsonic.service` remained active. The Pi still has the pre-existing untracked artifacts `SyncSonic Reliable Alignment Actuation for Multi-Speaker Playback.pdf` and `backend/tools/pw_delay_filter`.
+
+Command:
+
+```bash
+sudo systemd-run --unit=runtime-latency --uid=syncsonic --gid=syncsonic \
+  --working-directory=/home/syncsonic/SyncSonicPi \
+  --setenv=PULSE_SERVER=unix:/run/syncsonic/pulse/native \
+  --setenv=RESERVED_HCI=hci3 \
+  --setenv=RESERVED_ADAPTER_MAC=2C:CF:67:CE:57:91 \
+  --setenv=PYTHONUNBUFFERED=1 \
+  python3 /home/syncsonic/SyncSonicPi/backend/measurement/runtime_latency_service.py \
+  --max-speakers 2 --detector-mode pattern --pattern-landmark envelope \
+  --pattern-bursts 3 --duration-ms 50 --pattern-gap-ms 300 \
+  --pattern-clock-tolerance-ms 20 --pattern-min-snr-db 9
+```
+
+Run window started 2026-05-28 13:36:52 EDT. Evidence summary:
+- Event counts: `burst_pattern_emit=51`, `burst_pattern_arrival=16`, `burst_pattern_missed=0`, `service_stopped=1`.
+- `28:FA:19:B6:0E:3B`: 8 arrivals; selection `best_spacing=1`, `clock_prior=7`; SNR min/avg `20.18/25.92 dB`; envelope peak SNR min/avg `26.83/30.77 dB`; max matched error `6.65 ms`; max pattern clock spread `6.65 ms`; max `|pattern_clock_prior_error_ms|=6.08`; max `|sample_clock_drift_ms|=23.42`; drift trend approximately `-6.50 ms/min` (`-108 ppm` equivalent).
+- `F4:6A:DD:D4:F3:C8`: 8 arrivals; selection `best_spacing=1`, `clock_prior=7`; SNR min/avg `21.23/25.71 dB`; envelope peak SNR min/avg `25.47/30.03 dB`; max matched error `4.75 ms`; max pattern clock spread `4.75 ms`; max `|pattern_clock_prior_error_ms|=6.36`; max `|sample_clock_drift_ms|=28.61`; drift trend approximately `-8.12 ms/min` (`-135 ppm` equivalent).
+
+Acceptance result: PARTIAL.
+- Pass: envelope landmark mode ran end-to-end for both live speakers.
+- Pass: zero pattern misses across 16 arrivals.
+- Pass: acquisition SNR improved sharply compared with the previous threshold-onset pass.
+- Pass: intra-pattern geometry stayed inside the 10 ms measurement target, with bounded clock-prior corrections.
+- Not yet pass: baseline-relative `sample_clock_drift_ms` still exceeded 10 ms on both speakers over the 4 minute smoke run.
+
+Planning implication: the remaining error no longer looks primarily like "we cannot find the burst." The envelope landmark found complete sequences with high SNR and tight internal spacing, but both speakers still showed a same-direction negative slope over time. That points at clock-domain alignment: mic sample indices and PipeWire filter-frame emit indices are both nominally 48 kHz, but they are not proven to be the same clock over minutes. The next slice should model the relative mic-vs-emit clock slope before treating baseline-subtracted deltas as speaker drift. A correction-grade pipeline should separate common-mode clock-domain slope from per-speaker residual drift, then feed only the residual into `DriftController`.

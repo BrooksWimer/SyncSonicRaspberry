@@ -28,6 +28,44 @@ The operator has prior ultrasonic experiments on old branches that proved the bu
 - The actual visual design of the UX surface is `ui-polish`. This epic owns the data path; coordinate the visual.
 - Any changes to the engine interfaces (new Unix socket commands, new IPC fields) need to land in the engine on `main` first, then this epic builds on top.
 
+## Roadmap
+
+_Current best plan, refreshed 2026-05-30. Detailed slice prose for the older slices lives in the **Path to full-time runtime alignment** section below; this section is the canonical short-form for what is done, what is next, and why._
+
+### Done
+
+- **Slice 0** — Open-question experiment (ultrasonic vs in-band). Resolved: ultrasonic wins.
+- **Slice 1** — Filter-resident ultrasonic burst emission. `pw_delay_filter` gained `emit_burst` + `query_emit_timestamps`. Pi-validated.
+- **Slice 2** — Open-loop latency measurement service. Per-burst arrival measurement against active speakers, journal-logged.
+- **Slice 3** — Pattern measurement + relative proposal generation. Computes what timing adjustments WOULD be applied, without actuating.
+- **Slice 3 follow-up** — Measurement cleanup + pattern/relative-proposal CLI flags. (workstream `f16ede00`, 2026-05-30, software-only verified)
+
+### Next
+
+- **Slice 4** — Live observation of proposed adjustments. Observe-only on Pi across varied audio; record what the slice-3 proposals would actuate. Validate proposals match reality before committing actuators.
+  - Verification scope: `software-plus-pi`
+  - Listening not a verification gate (no audible behavior change)
+  - Risks: proposals may be unstable under SNR variation; capture conditions where confidence breaks down
+
+### Later (subject to discovery)
+
+- **Slice 5** — Closed-loop actuation. Turn validated proposals into bounded `set_rate_ppm` adjustments to the elastic engine. Confidence-gated, operator-disable-able. Live test on the two-speaker setup.
+  - Verification scope: `software-pi-and-listening` — first slice that changes audible behavior
+- **Slice 6** — Hardening + soak. Multi-speaker beyond two, UX surface (coordinated with `ui-polish`), 24-hour soak under stress. Promotion gate.
+
+### Strategy decisions on record
+
+- **Ultrasonic > in-band chirp.** Decided slice 0; burst detection survives codec mangling, in-band did not.
+- **Envelope FFT detection, NOT cross-correlation.** Decided slice 0; A2DP codecs destroy phase/shape, preserve energy.
+- **Filter-resident emission, NOT direct-to-BlueZ.** Decided slice 1 revision; direct `paplay` bypasses the delay filter and causes audible chop.
+- **Bounded rate adjustment.** Per `ROADMAP.md` section 4 — never jump filter delay during music; cap at the documented limit.
+- **Two-speaker scope first.** Architecture must not bake in N=2, but tuning + validation done on the operator current setup; multi-speaker is slice 6.
+- **Single-direction first, closed-loop second.** Measurement (slices 2/3) shipped before actuation (slice 5) so we can validate proposals against reality without risking audio.
+
+### Promotion gate
+
+`ultrasonic-runtime-sync` → `main` only after slice 6 soak validation passes. Until then, opt in via the slice-3 service start command.
+
 ## Planning Guidance
 
 - Architecturally downstream of the coordinated engine on `main`. Branches from `main`. Don't reintroduce the `foundation/neutral-minimal` lineage.

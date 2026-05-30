@@ -145,3 +145,7 @@ Slice 4+ may shake out into multiple discrete workstreams; sizing comes from wha
 ### Epic promotion gate
 
 The `ultrasonic-runtime-sync` epic branch promotes to `main` only after slice 4+'s soak validation passes. Until then the epic stays unmerged — operator continues to opt in to alignment via the slice 3 service start command.
+
+## Progress log (auto)
+
+- 2026-05-30 — Slice 3 follow-up measurement cleanup (f16ede00-2681-4720-8da1-66c5f8cb86dc): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/f16ede00-2681-4720-8da1-66c5f8cb86dc.md

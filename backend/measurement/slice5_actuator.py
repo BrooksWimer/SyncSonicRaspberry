@@ -129,6 +129,54 @@ class SpeakerActuator:
             self._suspend(mac, state, "CONFIDENCE_DROP")
             return self._result(mac, state.state, "CONFIDENCE_DROP")
 
+        # --- Slider stage: fires in WARMING_UP and ACTIVE ---
+        # The slider responds to RESIDUAL directly, not to ppm, so it can
+        # safely fire even when the ppm proposal is clamped at the cap and
+        # even before the actuator has reached ACTIVE. This solves the
+        # chicken-and-egg case where a large initial offset keeps ppm
+        # proposals clamped and prevents the warmup gate from ever clearing.
+        residual_ms = _proposal_float(
+            proposal,
+            "residual_ms",
+            fallback_keys=("relative_residual_ms", "recent_relative_residual_ms"),
+            default=0.0,
+        )
+        current_filter_delay_ms = _proposal_float(
+            proposal,
+            "current_filter_delay_ms",
+            fallback_keys=("slider_target_delay_ms",),
+            default=0.0,
+        )
+        if abs(residual_ms) > self.slider_threshold_ms and state.state in (WARMING_UP, ACTIVE):
+            # Sign: positive residual = speaker LATE relative to group ->
+            # reduce delay (audio leaves filter sooner -> plays sooner).
+            # new_delay = current_delay - residual.
+            target_delay_ms = max(0.0, current_filter_delay_ms - residual_ms)
+            target_delay_samples = int(round(target_delay_ms * self.sample_rate / 1000.0))
+            response = self._write(mac, f"set_delay {target_delay_ms:.3f}")
+            self.logger.info(
+                json.dumps(
+                    {
+                        "event": "slice5_slider_adjustment",
+                        "timestamp_iso": _timestamp_iso(),
+                        "mac": mac,
+                        "state": state.state,
+                        "residual_ms": residual_ms,
+                        "current_filter_delay_ms": current_filter_delay_ms,
+                        "target_delay_ms": target_delay_ms,
+                        "target_delay_samples": target_delay_samples,
+                        "response": response,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            # Slider fire is an actuation event, not a "clean cycle".
+            # Don't advance the warmup counter here; the next cycle with
+            # small residual + non-clamped proposal will count.
+            return ActuationResult(mac, state.state, 0.0, None, target_delay_ms - current_filter_delay_ms)
+
+
         proposed_ppm = _proposal_float(
             proposal,
             "proposed_adjustment_ppm",
@@ -157,40 +205,6 @@ class SpeakerActuator:
 
         if state.state != ACTIVE:
             return self._result(mac, state.state, state.state)
-
-        residual_ms = _proposal_float(
-            proposal,
-            "residual_ms",
-            fallback_keys=("relative_residual_ms", "recent_relative_residual_ms"),
-            default=0.0,
-        )
-        current_filter_delay_ms = _proposal_float(
-            proposal,
-            "current_filter_delay_ms",
-            fallback_keys=("slider_target_delay_ms",),
-            default=0.0,
-        )
-        if abs(residual_ms) > self.slider_threshold_ms:
-            target_delay_ms = max(0.0, current_filter_delay_ms + residual_ms)
-            target_delay_samples = int(round(target_delay_ms * self.sample_rate / 1000.0))
-            response = self._write(mac, f"set_delay {target_delay_ms:.3f}")
-            self.logger.info(
-                json.dumps(
-                    {
-                        "event": "slice5_slider_adjustment",
-                        "timestamp_iso": _timestamp_iso(),
-                        "mac": mac,
-                        "residual_ms": residual_ms,
-                        "current_filter_delay_ms": current_filter_delay_ms,
-                        "target_delay_ms": target_delay_ms,
-                        "target_delay_samples": target_delay_samples,
-                        "response": response,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-            return ActuationResult(mac, state.state, 0.0, None, target_delay_ms - current_filter_delay_ms)
 
         applied_ppm = max(-self.max_rate_ppm, min(self.max_rate_ppm, proposed_ppm))
         response = self._write(mac, f"set_rate_ppm {applied_ppm:.3f}")

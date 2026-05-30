@@ -9,7 +9,7 @@ _BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from measurement.slice5_actuator import ACTIVE, SUSPENDED, SpeakerActuator  # noqa: E402
+from measurement.slice5_actuator import ACTIVE, SUSPENDED, WARMING_UP, SpeakerActuator  # noqa: E402
 
 
 def _writer(calls: list[tuple[str, str]]):
@@ -91,14 +91,58 @@ def test_clamped_proposal_skipped(caplog) -> None:
 
 
 def test_slider_applied_for_large_residual() -> None:
+    # Sign convention: positive residual = speaker LATE relative to group ->
+    # reduce delay. new_delay = current - residual = 100 - 6 = 94. The slider
+    # applied delta is therefore -6 ms (delay decreased).
     calls: list[tuple[str, str]] = []
     actuator = _active_actuator(calls)
 
     result = actuator.apply(_proposal(residual_ms=6.0, current_filter_delay_ms=100.0))
 
     assert result.actuation_applied_ppm == 0.0
+    assert result.slider_applied_ms == -6.0
+    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 94.000")]
+
+
+def test_slider_sign_for_early_speaker_increases_delay() -> None:
+    # Negative residual = speaker EARLY relative to group -> increase delay.
+    # new_delay = current - residual = 100 - (-6) = 106.
+    calls: list[tuple[str, str]] = []
+    actuator = _active_actuator(calls)
+
+    result = actuator.apply(_proposal(residual_ms=-6.0, current_filter_delay_ms=100.0))
+
+    assert result.actuation_applied_ppm == 0.0
     assert result.slider_applied_ms == 6.0
     assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 106.000")]
+
+
+def test_slider_fires_in_warming_up_with_clamped_ppm() -> None:
+    # Regression: previously the actuator returned SKIP_CLAMPED before ever
+    # consulting residual, and slider was gated to ACTIVE only. So a large
+    # initial offset (which produces a clamped ppm proposal) would keep the
+    # speaker permanently in WARMING_UP. The slider now fires in WARMING_UP
+    # too, independently of ppm clamping, because it responds to residual.
+    calls: list[tuple[str, str]] = []
+    actuator = SpeakerActuator(
+        {"AA:BB:CC:DD:EE:FF": Path("/tmp/a.sock")},
+        socket_writer=_writer(calls),
+    )
+
+    result = actuator.apply(_proposal(
+        residual_ms=15.0,                # well above 5 ms slider threshold
+        current_filter_delay_ms=120.0,
+        proposed_adjustment_ppm=50.0,    # clamped at max_ppm=50
+        max_ppm=50.0,
+    ))
+
+    assert result.state == WARMING_UP    # state unchanged by slider fire
+    assert result.actuation_applied_ppm == 0.0
+    assert result.slider_applied_ms == -15.0
+    assert calls == [("/tmp/a.sock", "set_delay 105.000")]
+    # Slider fire is an actuation, not a "clean cycle" -> warmup counter
+    # must NOT advance from this event.
+    assert actuator.state_for("AA:BB:CC:DD:EE:FF") == WARMING_UP
 
 
 def test_ppm_applied_for_small_residual() -> None:

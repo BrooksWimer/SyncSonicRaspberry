@@ -63,6 +63,12 @@ import numpy as np
 
 from measurement.service_env import slice4_observe_from_env
 from measurement.slice4_observer import DEFAULT_OBSERVATION_PATH, ObservationWriter
+from measurement.slice5_actuator import (
+    BURST_AMP_X1000,
+    ActuationResult,
+    SpeakerActuator,
+    register_ble_stop_callback,
+)
 
 try:
     import dbus
@@ -1288,7 +1294,7 @@ class RuntimeSyncService:
                 max_ppm=args.max_ppm,
                 smoothing_window=args.smoothing_window,
             )
-            if getattr(args, "enable_correction", False)
+            if getattr(args, "enable_correction", False) and getattr(args, "detector_mode", None) != "pattern"
             else None
         )
         self.relative_estimator: Optional[RelativeDriftEstimator] = (
@@ -1298,9 +1304,14 @@ class RuntimeSyncService:
                 gain_ppm_per_ms=args.relative_gain_ppm_per_ms,
                 peer_max_age_sec=args.relative_peer_max_age_sec,
             )
-            if getattr(args, "enable_relative_proposals", False) or getattr(args, "slice4_observe", False)
+            if (
+                getattr(args, "enable_relative_proposals", False)
+                or getattr(args, "slice4_observe", False)
+                or getattr(args, "enable_correction", False)
+            )
             else None
         )
+        self.slice5_actuator: Optional[SpeakerActuator] = None
         self._slice4_observe_enabled = bool(getattr(args, "slice4_observe", False))
         self.slice4_observer: Optional[ObservationWriter] = (
             ObservationWriter(Path(args.slice4_observation_path))
@@ -1326,6 +1337,10 @@ class RuntimeSyncService:
         self.loop_task = asyncio.create_task(self._measurement_loop())
         return {"ok": True, "state": "started"}
 
+    def emergency_stop(self) -> None:
+        if self.slice5_actuator is not None:
+            self.slice5_actuator.emergency_stop()
+
     async def _measurement_loop(self) -> None:
         await self.detector.warmup(self.args.warmup_sec)
         while self.state.measuring:
@@ -1342,6 +1357,7 @@ class RuntimeSyncService:
                     ].last_sample_clock_delta_samples
                     target.pattern_clock_reject_count = previous[target.mac].pattern_clock_reject_count
             self.state.targets = discovered
+            self._sync_slice5_actuator(discovered)
             if not self.state.targets:
                 _emit("measurement_idle", reason="no_active_speakers")
                 await asyncio.sleep(5.0)
@@ -1352,6 +1368,23 @@ class RuntimeSyncService:
                 await self._measure_once(target)
                 await asyncio.sleep(self.args.cadence_sec)
             self.state.cycles += 1
+
+    def _sync_slice5_actuator(self, targets: list[SpeakerTarget]) -> None:
+        if not getattr(self.args, "enable_correction", False):
+            return
+        sockets = {target.mac: target.socket_path for target in targets}
+        if self.slice5_actuator is None:
+            self.slice5_actuator = SpeakerActuator(
+                sockets,
+                max_rate_ppm=self.args.max_ppm,
+            )
+            register_ble_stop_callback(self.slice5_actuator.emergency_stop)
+            _emit("slice5_actuator_started", speaker_macs=sorted(sockets), burst_amp_x1000=BURST_AMP_X1000)
+            return
+        old_states = self.slice5_actuator.states
+        self.slice5_actuator.sockets = {mac.upper(): Path(path) for mac, path in sockets.items()}
+        for mac in set(old_states) | {mac.upper() for mac in sockets}:
+            self.slice5_actuator._state(mac)
 
     async def _measure_once(self, target: SpeakerTarget) -> None:
         if self.args.detector_mode == "pattern":
@@ -1522,6 +1555,7 @@ class RuntimeSyncService:
         )
         if len(emit_entries) < self.args.pattern_bursts:
             target.stable_count = 0
+            self._apply_slice5_missed_burst(target, current_filter_delay_ms=current_filter_delay_ms)
             self._record_slice4_missed_burst(
                 target,
                 current_filter_delay_ms=current_filter_delay_ms,
@@ -1573,6 +1607,7 @@ class RuntimeSyncService:
                 target.sample_clock_baseline_samples = None
                 target.last_sample_clock_delta_samples = None
                 target.pattern_clock_reject_count = 0
+            self._apply_slice5_missed_burst(target, current_filter_delay_ms=current_filter_delay_ms)
             self._record_slice4_missed_burst(
                 target,
                 current_filter_delay_ms=current_filter_delay_ms,
@@ -1662,6 +1697,11 @@ class RuntimeSyncService:
                 pattern_mean_abs_error_ms=detection.get("pattern_mean_abs_error_ms"),
                 pattern_clock_delta_spread_ms=detection.get("pattern_clock_delta_spread_ms"),
             )
+            actuation_result = self._apply_slice5_proposal(
+                target,
+                proposal_record=record,
+                current_filter_delay_ms=current_filter_delay_ms,
+            )
             self._record_slice4_observation(
                 target,
                 measured_latency_ms=latency_ms,
@@ -1680,6 +1720,7 @@ class RuntimeSyncService:
                     },
                     "relative_proposal": record,
                 },
+                actuation_result=actuation_result,
             )
             if getattr(self.args, "enable_relative_proposals", False):
                 _emit(**record)
@@ -1703,6 +1744,41 @@ class RuntimeSyncService:
             },
         )
 
+    def _apply_slice5_missed_burst(
+        self,
+        target: SpeakerTarget,
+        *,
+        current_filter_delay_ms: float,
+    ) -> Optional[ActuationResult]:
+        if self.slice5_actuator is None:
+            return None
+        return self.slice5_actuator.apply(
+            {
+                "mac": target.mac,
+                "missed_burst": True,
+                "proposed_adjustment_ppm": math.nan,
+                "current_filter_delay_ms": current_filter_delay_ms,
+            }
+        )
+
+    def _apply_slice5_proposal(
+        self,
+        target: SpeakerTarget,
+        *,
+        proposal_record: dict[str, Any],
+        current_filter_delay_ms: float,
+    ) -> Optional[ActuationResult]:
+        if self.slice5_actuator is None:
+            return None
+        proposal = {
+            **proposal_record,
+            "mac": target.mac,
+            "missed_burst": False,
+            "current_filter_delay_ms": current_filter_delay_ms,
+            "max_ppm": self.args.max_ppm,
+        }
+        return self.slice5_actuator.apply(proposal)
+
     def _record_slice4_observation(
         self,
         target: SpeakerTarget,
@@ -1712,6 +1788,7 @@ class RuntimeSyncService:
         snr_db: float,
         proposal_record: dict[str, Any],
         pattern_state_snapshot: dict[str, Any],
+        actuation_result: Optional[ActuationResult] = None,
     ) -> None:
         if self.slice4_observer is None:
             return
@@ -1726,6 +1803,9 @@ class RuntimeSyncService:
                 **pattern_state_snapshot,
             },
             proposed_adjustment_ppm=proposed_adjustment_ppm,
+            actuation_applied_ppm=(
+                actuation_result.actuation_applied_ppm if actuation_result is not None else 0.0
+            ),
             confidence=confidence,
             current_filter_delay_ms=current_filter_delay_ms,
             missed_burst=False,
@@ -1862,6 +1942,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 async def _amain(argv: Optional[Iterable[str]] = None) -> int:
     args = _build_parser().parse_args(list(argv) if argv is not None else None)
+    if args.enable_correction:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        args.detector_mode = "pattern"
+        args.amplitude = BURST_AMP_X1000 / 1000.0
     if args.slice4_observe:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         args.detector_mode = "pattern"
@@ -1872,6 +1956,8 @@ async def _amain(argv: Optional[Iterable[str]] = None) -> int:
     for signum in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(signum, service.stop_event.set)
+    with contextlib.suppress(NotImplementedError):
+        loop.add_signal_handler(signal.SIGUSR1, service.emergency_stop)
     _emit("service_starting", args=vars(args))
     try:
         await service.run()

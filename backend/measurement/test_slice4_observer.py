@@ -85,6 +85,38 @@ def test_csv_appends_without_duplicate_header(tmp_path: Path) -> None:
     assert len(lines) == 3
 
 
+def test_existing_slice4_csv_header_migrates_to_actuation_column(tmp_path: Path) -> None:
+    path = tmp_path / "slice4.csv"
+    old_columns = [column for column in CSV_COLUMNS if column != "actuation_applied_ppm"]
+    path.write_text(
+        ",".join(old_columns)
+        + "\n"
+        + "2026-05-30T00:00:00+00:00,A,100.0,-1.0,1.0,12.0,False,25.0,[],{}\n",
+        encoding="utf-8",
+    )
+    logger, _stream = _logger()
+
+    with ObservationWriter(path, logger=logger) as writer:
+        writer.write_observation(
+            timestamp_iso="2026-05-30T00:00:01+00:00",
+            speaker_id="A",
+            measured_latency_ms=101.0,
+            history_snapshot=[100.0],
+            pattern_state_snapshot={"event": "second"},
+            proposed_adjustment_ppm=-2.0,
+            confidence=1.0,
+            current_filter_delay_ms=12.0,
+            missed_burst=False,
+            snr_db=25.0,
+            actuation_applied_ppm=-2.0,
+        )
+
+    rows = _rows(path)
+    assert path.read_text(encoding="utf-8").splitlines()[0] == ",".join(CSV_COLUMNS)
+    assert float(rows[0]["actuation_applied_ppm"]) == 0.0
+    assert float(rows[1]["actuation_applied_ppm"]) == -2.0
+
+
 def test_unwritable_path_raises_on_startup(tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "slice4.csv"
     logger, _stream = _logger()

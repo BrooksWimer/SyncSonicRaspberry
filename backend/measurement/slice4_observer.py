@@ -18,6 +18,7 @@ CSV_COLUMNS = [
     "speaker_id",
     "measured_latency_ms",
     "proposed_adjustment_ppm",
+    "actuation_applied_ppm",
     "confidence",
     "current_filter_delay_ms",
     "missed_burst",
@@ -53,6 +54,8 @@ class ObservationWriter:
             return
         try:
             write_header = not self.path.exists()
+            if not write_header:
+                self._migrate_header_if_needed()
             self._file = self.path.open("a", encoding="utf-8", newline="")
             self._writer = csv.DictWriter(self._file, fieldnames=CSV_COLUMNS)
             if write_header:
@@ -62,6 +65,23 @@ class ObservationWriter:
             message = f"Slice 4 observation path is not writable: {self.path}"
             self.logger.error("%s (%r)", message, exc)
             raise RuntimeError(message) from exc
+
+    def _migrate_header_if_needed(self) -> None:
+        with self.path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames == CSV_COLUMNS:
+                return
+            if not reader.fieldnames:
+                return
+            rows = list(reader)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                migrated = {column: row.get(column, "") for column in CSV_COLUMNS}
+                migrated["actuation_applied_ppm"] = row.get("actuation_applied_ppm") or 0.0
+                writer.writerow(migrated)
 
     def close(self) -> None:
         if self._file is not None:
@@ -81,6 +101,7 @@ class ObservationWriter:
         current_filter_delay_ms: float,
         missed_burst: bool,
         snr_db: float,
+        actuation_applied_ppm: float = 0.0,
         timestamp_iso: Optional[str] = None,
     ) -> dict[str, Any]:
         if self._writer is None:
@@ -95,6 +116,7 @@ class ObservationWriter:
             "history_snapshot": _json_clean(history_snapshot),
             "pattern_state_snapshot": _json_clean(pattern_state_snapshot),
             "proposed_adjustment_ppm": _json_number(proposed_adjustment_ppm),
+            "actuation_applied_ppm": _json_number(actuation_applied_ppm),
             "confidence": _json_number(confidence),
             "current_filter_delay_ms": _json_number(current_filter_delay_ms),
             "missed_burst": bool(missed_burst),
@@ -105,6 +127,7 @@ class ObservationWriter:
             "speaker_id": speaker_id,
             "measured_latency_ms": _csv_number(measured_latency_ms),
             "proposed_adjustment_ppm": _csv_number(proposed_adjustment_ppm),
+            "actuation_applied_ppm": _csv_number(actuation_applied_ppm),
             "confidence": _csv_number(confidence),
             "current_filter_delay_ms": _csv_number(current_filter_delay_ms),
             "missed_burst": str(bool(missed_burst)),
@@ -138,6 +161,7 @@ class ObservationWriter:
             history_snapshot=history_snapshot,
             pattern_state_snapshot=pattern_state_snapshot,
             proposed_adjustment_ppm=math.nan,
+            actuation_applied_ppm=0.0,
             confidence=math.nan,
             current_filter_delay_ms=current_filter_delay_ms,
             missed_burst=True,

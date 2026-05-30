@@ -187,3 +187,4 @@ The `ultrasonic-runtime-sync` epic branch promotes to `main` only after slice 4+
 ## Progress log (auto)
 
 - 2026-05-30 — Slice 3 follow-up measurement cleanup (f16ede00-2681-4720-8da1-66c5f8cb86dc): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/f16ede00-2681-4720-8da1-66c5f8cb86dc.md
+- 2026-05-30 — Slice 4: live observation of proposed alignment adjustments (dfec41a7-7681-47af-a78a-79352c1dcb2a): Operator-confirmed verification (software-plus-pi) passed. → docs/maverick/workstreams/dfec41a7-7681-47af-a78a-79352c1dcb2a.md

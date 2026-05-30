@@ -51,6 +51,9 @@ _Current best plan, refreshed 2026-05-30. Detailed slice prose for the older sli
 
 - **Slice 5** — Closed-loop actuation. Turn validated proposals into bounded `set_rate_ppm` adjustments to the elastic engine. Confidence-gated, operator-disable-able. Live test on the two-speaker setup.
   - Verification scope: `software-pi-and-listening` — first slice that changes audible behavior
+  - **Discovery from slice 4 (operator, 2026-05-30):** the ±50 ppm cap saturated repeatedly and reversed sign — rate-only correction is the wrong primitive for *initial* alignment. Use the slider's instantaneous large-step mechanism (direct `target_delay_samples` writes to the filter socket — the same channel the operator drives manually) for catching up the gross offset, and reserve `set_rate_ppm` for the slow drift-tracking after the speakers are aligned. Two-stage control: slider for offset, ppm for drift.
+  - **Discovery from slice 4 (operator, 2026-05-30):** 45:7A:D9:00:81:19 had 47% miss rate at 14.1 dB mean SNR vs 28:FA:19:B6:0E:3B at 10% / 23.6 dB. Slice 5 must NOT actuate either speaker until per-speaker confidence is established; investigate the audio-path asymmetry before assuming this can be confidence-gated away.
+  - **Discovery from slice 4 (operator, 2026-05-30):** 3-burst pattern audible at 18.5 kHz / 100ms / 0.95 amplitude. Suspected codec intermodulation or burst-edge transients. Lower amplitude or extend raised-cosine fade before any actuator runs during normal listening. Separate isolation test (operator pauses music + manually triggers burst via filter socket) pending.
 - **Slice 6** — Hardening + soak. Multi-speaker beyond two, UX surface (coordinated with `ui-polish`), 24-hour soak under stress. Promotion gate.
 
 ### Strategy decisions on record

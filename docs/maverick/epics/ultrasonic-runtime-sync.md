@@ -39,22 +39,19 @@ _Current best plan, refreshed 2026-05-30. Detailed slice prose for the older sli
 - **Slice 2** — Open-loop latency measurement service. Per-burst arrival measurement against active speakers, journal-logged.
 - **Slice 3** — Pattern measurement + relative proposal generation. Computes what timing adjustments WOULD be applied, without actuating.
 - **Slice 3 follow-up** — Measurement cleanup + pattern/relative-proposal CLI flags. (workstream `f16ede00`, 2026-05-30, software-only verified)
+- **Slice 4** — Live observation of proposed alignment adjustments on Pi. (workstream `dfec41a7`, 2026-05-30, software-plus-pi verified)
+- **Slice 5** — Closed-loop actuation, **ppm-only** (slider stage stripped after live testing exposed architectural mismatch — slider changes filter delay, residual is sample-clock-derived and invariant to filter-delay changes, so slider could not drive residual to zero). System ships with: bounded ±50 ppm `set_rate_ppm` corrections, per-speaker confidence gating, SIGUSR1 + `MAVERICK_CORRECTION_STOP` env var operator escape (<1 s response), opt-in via `--enable-correction`. (workstream `cbb33bdc`, 2026-05-30, software-plus-pi verified)
 
 ### Next
 
-- **Slice 4** — Live observation of proposed adjustments. Observe-only on Pi across varied audio; record what the slice-3 proposals would actuate. Validate proposals match reality before committing actuators.
-  - Verification scope: `software-plus-pi`
-  - Listening not a verification gate (no audible behavior change)
-  - Risks: proposals may be unstable under SNR variation; capture conditions where confidence breaks down
+- **Slice 6** — Latency-baseline slider stage (see Later list — promoted to Next as of slice-5 finish, 2026-05-30).
 
 ### Later (subject to discovery)
 
-- **Slice 5** — Closed-loop actuation. Turn validated proposals into bounded `set_rate_ppm` adjustments to the elastic engine. Confidence-gated, operator-disable-able. Live test on the two-speaker setup.
-  - Verification scope: `software-pi-and-listening` — first slice that changes audible behavior
-  - **Discovery from slice 4 (operator, 2026-05-30):** the ±50 ppm cap saturated repeatedly and reversed sign — rate-only correction is the wrong primitive for *initial* alignment. Use the slider's instantaneous large-step mechanism (direct `target_delay_samples` writes to the filter socket — the same channel the operator drives manually) for catching up the gross offset, and reserve `set_rate_ppm` for the slow drift-tracking after the speakers are aligned. Two-stage control: slider for offset, ppm for drift.
-  - **Discovery from slice 4 (operator, 2026-05-30):** 45:7A:D9:00:81:19 had 47% miss rate at 14.1 dB mean SNR vs 28:FA:19:B6:0E:3B at 10% / 23.6 dB. Slice 5 must NOT actuate either speaker until per-speaker confidence is established; investigate the audio-path asymmetry before assuming this can be confidence-gated away.
-  - **Discovery from slice 4 (operator, 2026-05-30):** Audibility resolved empirically via isolation tests. Standalone bursts (music paused, single 3-burst pattern at 18.5 kHz / 100 ms / amp 0.95) were inaudible to the operator AND produced +68 dB mic SNR — confirming the audio path delivers cleanly but the burst itself is not audible. A subsequent amplitude sweep with music playing (amp 0.95 / 0.30 / 0.10 / 0.03) did not reliably reproduce the slice-4 audibility during the listening session — operator heard no codec artifacts at any amplitude in two consecutive runs. Conclusion: the slice-4 audibility was either music-content-specific or below the operator's reliable detection threshold under the test conditions. **Slice 5 ships with amp_x1000=300 (0.30 linear, ~-10 dB below slice-4 default).** Detection headroom at amp 300: +41 dB above the slice-3 detector's 9 dB rejection threshold (mic peak +9 dB vs baseline -41 dB in the sweep). If audibility issues recur during slice-5 testing, amp can drop another 10-20 dB without losing detection (+22 dB still in headroom at amp 30).
-- **Slice 6** — Hardening + soak. Multi-speaker beyond two, UX surface (coordinated with `ui-polish`), 24-hour soak under stress. Promotion gate.
+
+- **Slice 6** — Latency-baseline slider stage. Reintroduce the slider as a two-stage actuator pair to `set_rate_ppm`, but drive it from `measured_latency_ms` deviation against a per-speaker baseline (not relative residual). Slider handles fast recovery from large absolute offsets; ppm continues drift tracking. The control signal IS conjugate to the slider action this time.
+  - Verification scope: `software-pi-and-listening` — slider is audible by nature
+- **Slice 7** — Hardening + soak. Multi-speaker beyond two, UX surface (coordinated with `ui-polish`), 24-hour soak under stress. Promotion gate.
 
 ### Strategy decisions on record
 
@@ -62,13 +59,14 @@ _Current best plan, refreshed 2026-05-30. Detailed slice prose for the older sli
 - **Envelope FFT detection, NOT cross-correlation.** Decided slice 0; A2DP codecs destroy phase/shape, preserve energy.
 - **Filter-resident emission, NOT direct-to-BlueZ.** Decided slice 1 revision; direct `paplay` bypasses the delay filter and causes audible chop.
 - **Bounded rate adjustment.** Per `ROADMAP.md` section 4 — never jump filter delay during music; cap at the documented limit.
-- **Burst amplitude: amp_x1000=300 (0.30 linear).** Decided 2026-05-30 empirically via slice-4 amplitude sweep. Standalone bursts inaudible at amp 0.95; sweep showed no consistent audible codec interaction at 0.95/0.30/0.10/0.03. Chose 300 (one order of magnitude below original) as conservative slice-5 default with +41 dB detection headroom. Drop further if any audibility recurs in slice-5 live test.
+- **Burst amplitude: amp_x1000=300 (0.30 linear).** Decided 2026-05-30 empirically via slice-4 amplitude sweep. Standalone bursts inaudible at amp 0.95; sweep showed no consistent audible codec interaction at 0.95/0.30/0.10/0.03. Chose 300 (one order of magnitude below original) as conservative slice-5 default with +41 dB detection headroom. Drop further if any audibility recurs in live test.
+- **Slider stage is NOT conjugate to relative_residual_ms.** Decided 2026-05-30 empirically via slice-5 live testing. Moving filter delay shifts both the emit-frame and arrival-sample indices by the same amount, so `sample_clock_delta` (and therefore relative residual) is largely invariant to slider corrections. Slice 5 ships ppm-only as a result. Slice 6 reintroduces slider with a different control signal (absolute latency offset from per-speaker baseline) that IS conjugate.
 - **Two-speaker scope first.** Architecture must not bake in N=2, but tuning + validation done on the operator current setup; multi-speaker is slice 6.
 - **Single-direction first, closed-loop second.** Measurement (slices 2/3) shipped before actuation (slice 5) so we can validate proposals against reality without risking audio.
 
 ### Promotion gate
 
-`ultrasonic-runtime-sync` → `main` only after slice 6 soak validation passes. Until then, opt in via the slice-3 service start command.
+`ultrasonic-runtime-sync` → `main` only after slice 7 soak validation passes. Until then, opt in via the slice-3 service start command.
 
 ## Planning Guidance
 

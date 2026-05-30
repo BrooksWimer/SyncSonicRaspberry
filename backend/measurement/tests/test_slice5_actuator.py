@@ -77,72 +77,38 @@ def test_warmup_to_active_after_n_clean_cycles() -> None:
     assert calls == []
 
 
-def test_clamped_proposal_skipped(caplog) -> None:
+def test_clamped_proposal_applies_at_max_in_active() -> None:
+    # Slice-5 ppm-only redesign: clamped proposals are no longer skipped.
+    # The actuator bounds them to +/- max_rate_ppm and applies. Clamp flag is
+    # informational only (live data showed clamped at +/-50 ppm routinely
+    # under real BT clock drift; skipping them stalled the system).
     calls: list[tuple[str, str]] = []
     actuator = _active_actuator(calls)
 
-    with caplog.at_level(logging.INFO):
-        result = actuator.apply(_proposal(proposed_adjustment_ppm=50.0, max_ppm=50.0))
+    result = actuator.apply(_proposal(proposed_adjustment_ppm=70.0, max_ppm=50.0))
 
-    assert result.actuation_applied_ppm == 0.0
-    assert result.skip_reason == "SKIP_CLAMPED"
-    assert calls == []
-    assert "SKIP_CLAMPED" in caplog.text
+    assert result.actuation_applied_ppm == 50.0
+    assert result.skip_reason is None
+    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_rate_ppm 50.000")]
 
 
-def test_slider_applied_for_large_residual() -> None:
-    # Sign convention: positive residual = speaker LATE relative to group ->
-    # reduce delay. new_delay = current - residual = 100 - 6 = 94. The slider
-    # applied delta is therefore -6 ms (delay decreased).
-    calls: list[tuple[str, str]] = []
-    actuator = _active_actuator(calls)
-
-    result = actuator.apply(_proposal(residual_ms=6.0, current_filter_delay_ms=100.0))
-
-    assert result.actuation_applied_ppm == 0.0
-    assert result.slider_applied_ms == -6.0
-    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 94.000")]
-
-
-def test_slider_sign_for_early_speaker_increases_delay() -> None:
-    # Negative residual = speaker EARLY relative to group -> increase delay.
-    # new_delay = current - residual = 100 - (-6) = 106.
-    calls: list[tuple[str, str]] = []
-    actuator = _active_actuator(calls)
-
-    result = actuator.apply(_proposal(residual_ms=-6.0, current_filter_delay_ms=100.0))
-
-    assert result.actuation_applied_ppm == 0.0
-    assert result.slider_applied_ms == 6.0
-    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 106.000")]
-
-
-def test_slider_fires_in_warming_up_with_clamped_ppm() -> None:
-    # Regression: previously the actuator returned SKIP_CLAMPED before ever
-    # consulting residual, and slider was gated to ACTIVE only. So a large
-    # initial offset (which produces a clamped ppm proposal) would keep the
-    # speaker permanently in WARMING_UP. The slider now fires in WARMING_UP
-    # too, independently of ppm clamping, because it responds to residual.
+def test_clamped_proposal_counts_as_clean_in_warmup() -> None:
+    # Slice-5 ppm-only redesign: relaxed WARMING_UP gate allows clamped
+    # proposals to count as clean cycles. Live testing showed a large initial
+    # residual (~10-14 ms) produces clamped ppm proposals indefinitely, which
+    # would otherwise prevent the actuator from ever leaving WARMING_UP. The
+    # actuator bounds the ppm safely either way; clamped is no longer a stop
+    # signal for warmup progression.
     calls: list[tuple[str, str]] = []
     actuator = SpeakerActuator(
         {"AA:BB:CC:DD:EE:FF": Path("/tmp/a.sock")},
+        warmup_cycles_required=3,
         socket_writer=_writer(calls),
     )
+    for _idx in range(3):
+        actuator.apply(_proposal(proposed_adjustment_ppm=70.0, max_ppm=50.0))
 
-    result = actuator.apply(_proposal(
-        residual_ms=15.0,                # well above 5 ms slider threshold
-        current_filter_delay_ms=120.0,
-        proposed_adjustment_ppm=50.0,    # clamped at max_ppm=50
-        max_ppm=50.0,
-    ))
-
-    assert result.state == WARMING_UP    # state unchanged by slider fire
-    assert result.actuation_applied_ppm == 0.0
-    assert result.slider_applied_ms == -15.0
-    assert calls == [("/tmp/a.sock", "set_delay 105.000")]
-    # Slider fire is an actuation, not a "clean cycle" -> warmup counter
-    # must NOT advance from this event.
-    assert actuator.state_for("AA:BB:CC:DD:EE:FF") == WARMING_UP
+    assert actuator.state_for("AA:BB:CC:DD:EE:FF") == ACTIVE
 
 
 def test_ppm_applied_for_small_residual() -> None:

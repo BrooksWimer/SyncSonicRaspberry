@@ -129,64 +129,21 @@ class SpeakerActuator:
             self._suspend(mac, state, "CONFIDENCE_DROP")
             return self._result(mac, state.state, "CONFIDENCE_DROP")
 
-        # --- Slider stage: fires in WARMING_UP and ACTIVE ---
-        # The slider responds to RESIDUAL directly, not to ppm, so it can
-        # safely fire even when the ppm proposal is clamped at the cap and
-        # even before the actuator has reached ACTIVE. This solves the
-        # chicken-and-egg case where a large initial offset keeps ppm
-        # proposals clamped and prevents the warmup gate from ever clearing.
-        residual_ms = _proposal_float(
-            proposal,
-            "residual_ms",
-            fallback_keys=("relative_residual_ms", "recent_relative_residual_ms"),
-            default=0.0,
-        )
-        current_filter_delay_ms = _proposal_float(
-            proposal,
-            "current_filter_delay_ms",
-            fallback_keys=("slider_target_delay_ms",),
-            default=0.0,
-        )
-        if abs(residual_ms) > self.slider_threshold_ms and state.state in (WARMING_UP, ACTIVE):
-            # Sign: positive residual = speaker LATE relative to group ->
-            # reduce delay (audio leaves filter sooner -> plays sooner).
-            # new_delay = current_delay - residual.
-            target_delay_ms = max(0.0, current_filter_delay_ms - residual_ms)
-            target_delay_samples = int(round(target_delay_ms * self.sample_rate / 1000.0))
-            response = self._write(mac, f"set_delay {target_delay_ms:.3f}")
-            self.logger.info(
-                json.dumps(
-                    {
-                        "event": "slice5_slider_adjustment",
-                        "timestamp_iso": _timestamp_iso(),
-                        "mac": mac,
-                        "state": state.state,
-                        "residual_ms": residual_ms,
-                        "current_filter_delay_ms": current_filter_delay_ms,
-                        "target_delay_ms": target_delay_ms,
-                        "target_delay_samples": target_delay_samples,
-                        "response": response,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-            # Slider fire is an actuation event, not a "clean cycle".
-            # Don't advance the warmup counter here; the next cycle with
-            # small residual + non-clamped proposal will count.
-            return ActuationResult(mac, state.state, 0.0, None, target_delay_ms - current_filter_delay_ms)
 
-
+        # Slider stage was removed in the slice-5 ppm-only redesign — slider
+        # responds to a control signal (filter delay) that is not conjugate
+        # to the error signal (sample_clock-based residual), so slider firing
+        # cannot drive residual to zero. ppm IS conjugate and converges.
+        # See follow-on slice-6 workstream for the latency-based slider redesign.
         proposed_ppm = _proposal_float(
             proposal,
             "proposed_adjustment_ppm",
             fallback_keys=("proposed_rate_ppm", "applied_ppm"),
         )
         max_ppm = abs(_proposal_float(proposal, "max_ppm", default=self.max_rate_ppm))
+        # Clamped proposals no longer skip — the actuator bounds them to
+        # ±max_rate_ppm and applies. The clamp flag is informational only.
         clamped = _is_clamped(proposed_ppm, max_ppm)
-        if clamped:
-            self._log_skip(mac, "SKIP_CLAMPED", proposed_ppm=proposed_ppm, max_ppm=max_ppm)
-            return ActuationResult(mac, state.state, 0.0, "SKIP_CLAMPED", 0.0)
 
         proposal_warming = _proposal_get(proposal, "reason") == "warming_up" or _proposal_bool(
             proposal,
@@ -194,7 +151,10 @@ class SpeakerActuator:
             default=False,
         )
         if state.state == WARMING_UP:
-            if not missed and not proposal_warming and not clamped and math.isfinite(proposed_ppm):
+            # Relaxed gate (ppm-only): allow clamped proposals to count as
+            # clean. The actuator bounds them safely; requiring non-clamped
+            # chicken-and-eggs large initial offsets.
+            if not missed and not proposal_warming and math.isfinite(proposed_ppm):
                 state.clean_warmup_cycles += 1
                 if state.clean_warmup_cycles >= self.warmup_cycles_required:
                     self._log_transition(mac, state.state, ACTIVE, "warmup_clean_cycles")
@@ -216,6 +176,7 @@ class SpeakerActuator:
                     "mac": mac,
                     "actuation_applied_ppm": applied_ppm,
                     "proposed_adjustment_ppm": proposed_ppm,
+                    "clamped": clamped,
                     "response": response,
                 },
                 sort_keys=True,

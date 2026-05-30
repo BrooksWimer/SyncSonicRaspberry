@@ -41,6 +41,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import os
 import signal
@@ -59,6 +60,9 @@ from pathlib import Path
 from typing import Any, Deque, Iterable, Optional
 
 import numpy as np
+
+from measurement.service_env import slice4_observe_from_env
+from measurement.slice4_observer import DEFAULT_OBSERVATION_PATH, ObservationWriter
 
 try:
     import dbus
@@ -98,6 +102,7 @@ ENVELOPE_EDGE_PRE_MS = 4.0
 ENVELOPE_EDGE_POST_MS = 8.0
 RELATIVE_CORRECTION_GAIN_PPM_PER_MS = 5.0
 RELATIVE_PEER_MAX_AGE_SEC = 90.0
+SLICE4_HISTORY_LIMIT = 5
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
 
@@ -365,6 +370,7 @@ class SpeakerTarget:
     socket_path: Path
     stable_count: int = 0
     last_latency_ms: Optional[float] = None
+    latency_history_ms: list[float] = field(default_factory=list)
     sample_clock_baseline_samples: Optional[float] = None
     last_sample_clock_delta_samples: Optional[float] = None
     pattern_clock_reject_count: int = 0
@@ -1292,19 +1298,26 @@ class RuntimeSyncService:
                 gain_ppm_per_ms=args.relative_gain_ppm_per_ms,
                 peer_max_age_sec=args.relative_peer_max_age_sec,
             )
-            if getattr(args, "enable_relative_proposals", False)
+            if getattr(args, "enable_relative_proposals", False) or getattr(args, "slice4_observe", False)
+            else None
+        )
+        self._slice4_observe_enabled = bool(getattr(args, "slice4_observe", False))
+        self.slice4_observer: Optional[ObservationWriter] = (
+            ObservationWriter(Path(args.slice4_observation_path))
+            if self._slice4_observe_enabled
             else None
         )
 
     async def run(self) -> None:
-        await self.capture.start()
-        await self.start_measurement()
-        await self.stop_event.wait()
-        if self.loop_task:
-            self.loop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.loop_task
-        await self.capture.stop()
+        with self.slice4_observer if self.slice4_observer is not None else contextlib.nullcontext():
+            await self.capture.start()
+            await self.start_measurement()
+            await self.stop_event.wait()
+            if self.loop_task:
+                self.loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.loop_task
+            await self.capture.stop()
 
     async def start_measurement(self) -> dict[str, Any]:
         if self.loop_task and not self.loop_task.done():
@@ -1322,6 +1335,7 @@ class RuntimeSyncService:
                 if target.mac in previous:
                     target.stable_count = previous[target.mac].stable_count
                     target.last_latency_ms = previous[target.mac].last_latency_ms
+                    target.latency_history_ms = list(previous[target.mac].latency_history_ms)
                     target.sample_clock_baseline_samples = previous[target.mac].sample_clock_baseline_samples
                     target.last_sample_clock_delta_samples = previous[
                         target.mac
@@ -1443,6 +1457,7 @@ class RuntimeSyncService:
         query = _send_filter_command(target.socket_path, "query") or {}
         target_delay_samples = int(query.get("target_delay_samples") or 0)
         target_delay_ms = (target_delay_samples / SAMPLE_RATE) * 1000.0
+        current_filter_delay_ms = _current_filter_delay_ms(query, target_delay_ms)
         _send_filter_command(target.socket_path, "query_emit_timestamps")
 
         emit_records: list[dict[str, Any]] = []
@@ -1507,6 +1522,18 @@ class RuntimeSyncService:
         )
         if len(emit_entries) < self.args.pattern_bursts:
             target.stable_count = 0
+            self._record_slice4_missed_burst(
+                target,
+                current_filter_delay_ms=current_filter_delay_ms,
+                pattern_state_snapshot={
+                    "reason": "missing_emit_timestamps",
+                    "expected_emit_count": self.args.pattern_bursts,
+                    "emit_entry_count": len(emit_entries),
+                    "detect_start_monotonic": detect_start,
+                    "detect_end_monotonic": detect_end,
+                    "stable_count": target.stable_count,
+                },
+            )
             _emit(
                 "burst_pattern_missed",
                 mac=target.mac,
@@ -1546,6 +1573,20 @@ class RuntimeSyncService:
                 target.sample_clock_baseline_samples = None
                 target.last_sample_clock_delta_samples = None
                 target.pattern_clock_reject_count = 0
+            self._record_slice4_missed_burst(
+                target,
+                current_filter_delay_ms=current_filter_delay_ms,
+                pattern_state_snapshot={
+                    "reason": reject_reason,
+                    "emit_frame_indices": emit_frame_indices,
+                    "detect_start_monotonic": detect_start,
+                    "detect_end_monotonic": detect_end,
+                    "pattern_clock_reject_count": pattern_clock_reject_count,
+                    "reset_clock_prior": reset_clock_prior,
+                    "stable_count": target.stable_count,
+                    "analysis": analysis,
+                },
+            )
             _emit(
                 "burst_pattern_missed",
                 mac=target.mac,
@@ -1564,6 +1605,9 @@ class RuntimeSyncService:
         target.stable_count += 1
         target.pattern_clock_reject_count = 0
         target.last_latency_ms = latency_ms
+        target.latency_history_ms.append(latency_ms)
+        if len(target.latency_history_ms) > SLICE4_HISTORY_LIMIT:
+            target.latency_history_ms = target.latency_history_ms[-SLICE4_HISTORY_LIMIT:]
         sample_clock = _sample_clock_fields(target, detection, [emit_entries[0]])
         _emit(
             "burst_pattern_arrival",
@@ -1618,7 +1662,100 @@ class RuntimeSyncService:
                 pattern_mean_abs_error_ms=detection.get("pattern_mean_abs_error_ms"),
                 pattern_clock_delta_spread_ms=detection.get("pattern_clock_delta_spread_ms"),
             )
-            _emit(**record)
+            self._record_slice4_observation(
+                target,
+                measured_latency_ms=latency_ms,
+                current_filter_delay_ms=current_filter_delay_ms,
+                snr_db=float(detection["snr_db"]),
+                proposal_record=record,
+                pattern_state_snapshot={
+                    "stable_count": target.stable_count,
+                    "sample_clock": sample_clock,
+                    "detection": {
+                        "pattern_mean_abs_error_ms": detection.get("pattern_mean_abs_error_ms"),
+                        "pattern_clock_delta_spread_ms": detection.get("pattern_clock_delta_spread_ms"),
+                        "pattern_selection_reason": detection.get("pattern_selection_reason"),
+                        "pattern_match_count": detection.get("pattern_match_count"),
+                        "pattern_rejected_by_clock_count": detection.get("pattern_rejected_by_clock_count"),
+                    },
+                    "relative_proposal": record,
+                },
+            )
+            if getattr(self.args, "enable_relative_proposals", False):
+                _emit(**record)
+
+    def _record_slice4_missed_burst(
+        self,
+        target: SpeakerTarget,
+        *,
+        current_filter_delay_ms: float,
+        pattern_state_snapshot: dict[str, Any],
+    ) -> None:
+        if self.slice4_observer is None:
+            return
+        self.slice4_observer.write_missed_burst(
+            speaker_id=target.mac,
+            current_filter_delay_ms=current_filter_delay_ms,
+            history_snapshot=list(target.latency_history_ms[-SLICE4_HISTORY_LIMIT:]),
+            pattern_state_snapshot={
+                **self._pattern_state_base(target),
+                **pattern_state_snapshot,
+            },
+        )
+
+    def _record_slice4_observation(
+        self,
+        target: SpeakerTarget,
+        *,
+        measured_latency_ms: float,
+        current_filter_delay_ms: float,
+        snr_db: float,
+        proposal_record: dict[str, Any],
+        pattern_state_snapshot: dict[str, Any],
+    ) -> None:
+        if self.slice4_observer is None:
+            return
+        proposed_adjustment_ppm = float(proposal_record.get("proposed_rate_ppm", math.nan))
+        confidence = 1.0 if proposal_record.get("event") == "relative_correction_proposed" else 0.0
+        self.slice4_observer.write_observation(
+            speaker_id=target.mac,
+            measured_latency_ms=measured_latency_ms,
+            history_snapshot=list(target.latency_history_ms[-SLICE4_HISTORY_LIMIT:]),
+            pattern_state_snapshot={
+                **self._pattern_state_base(target),
+                **pattern_state_snapshot,
+            },
+            proposed_adjustment_ppm=proposed_adjustment_ppm,
+            confidence=confidence,
+            current_filter_delay_ms=current_filter_delay_ms,
+            missed_burst=False,
+            snr_db=snr_db,
+        )
+
+    def _pattern_state_base(self, target: SpeakerTarget) -> dict[str, Any]:
+        return {
+            "stable_count": target.stable_count,
+            "sample_clock_baseline_samples": target.sample_clock_baseline_samples,
+            "last_sample_clock_delta_samples": target.last_sample_clock_delta_samples,
+            "pattern_clock_reject_count": target.pattern_clock_reject_count,
+        }
+
+
+def _current_filter_delay_ms(query: dict[str, Any], fallback_delay_ms: float) -> float:
+    current_x100 = query.get("current_delay_samples_x100")
+    if current_x100 is not None:
+        try:
+            return (float(current_x100) / 100.0 / SAMPLE_RATE) * 1000.0
+        except (TypeError, ValueError):
+            pass
+    current_samples = query.get("current_delay_samples")
+    if current_samples is not None:
+        try:
+            return (float(current_samples) / SAMPLE_RATE) * 1000.0
+        except (TypeError, ValueError):
+            pass
+    return fallback_delay_ms
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1698,6 +1835,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Log group-relative correction proposals from pattern sample-clock measurements without actuating",
     )
     parser.add_argument(
+        "--slice4-observe",
+        action="store_true",
+        default=slice4_observe_from_env(),
+        help="Append observe-only Slice 4 proposal rows without actuating",
+    )
+    parser.add_argument(
+        "--slice4-observation-path",
+        default=str(DEFAULT_OBSERVATION_PATH),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--relative-gain-ppm-per-ms",
         type=float,
         default=RELATIVE_CORRECTION_GAIN_PPM_PER_MS,
@@ -1714,6 +1862,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 async def _amain(argv: Optional[Iterable[str]] = None) -> int:
     args = _build_parser().parse_args(list(argv) if argv is not None else None)
+    if args.slice4_observe:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        args.detector_mode = "pattern"
     if args.detector_mode == "pattern" and args.pattern_bursts < 2:
         raise SystemExit("--pattern-bursts must be >= 2 when --detector-mode=pattern")
     service = RuntimeSyncService(args)

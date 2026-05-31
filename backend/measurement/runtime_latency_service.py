@@ -2,7 +2,7 @@
 
 Slice 2 deliberately measures only: filter-resident ultrasonic burst
 emission, USB mic capture, envelope detection, and JSON-lines journal
-records. It does not feed measurements back into ``set_rate_ppm``.
+records. Pattern mode feeds valid measurements into the Slice 5 delay-step actuator.
 
 Invocation (manual CLI; runs as the syncsonic user so it can access
 the filter sockets and the service's PipeWire/Pulse runtime):
@@ -106,11 +106,10 @@ ENVELOPE_SMOOTH_MS = 2.0
 ENVELOPE_REFRACTORY_MS = 25.0
 ENVELOPE_EDGE_PRE_MS = 4.0
 ENVELOPE_EDGE_POST_MS = 8.0
-RELATIVE_CORRECTION_GAIN_PPM_PER_MS = 5.0
-RELATIVE_PEER_MAX_AGE_SEC = 90.0
 SLICE4_HISTORY_LIMIT = 5
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
+CLOCK_PRIOR_RESET_CYCLES = 3
 
 
 def _emit(event: str, **fields: Any) -> None:
@@ -380,6 +379,7 @@ class SpeakerTarget:
     sample_clock_baseline_samples: Optional[float] = None
     last_sample_clock_delta_samples: Optional[float] = None
     pattern_clock_reject_count: int = 0
+    clock_prior_reset_remaining: int = 0
 
 
 @dataclass
@@ -921,328 +921,6 @@ class EnvelopeDetector:
         return 10.0 * math.log10(max(power, 1e-20))
 
 
-# Slice 3: closed-loop drift correction.
-# Conservative starting gain (0.1) — tune after Pi validation.
-# Spec: docs/maverick/proposals/09-slice-3-implementation-spec.md
-CORRECTION_PPM_GAIN = 0.1
-CORRECTION_SNR_FLOOR_DB = 10.0
-CORRECTION_STABLE_FLOOR = 5
-CORRECTION_PAUSE_AFTER_SKIPS = 3
-
-
-class DriftController:
-    """Per-speaker drift correction state + decision logic.
-
-    Maintains a rolling baseline of (latency_ms - slider_ms) per speaker
-    = intrinsic codec latency. Detects drift as the deviation of the
-    recent rolling mean from the long-term baseline. Applied correction
-    is bounded at +/-max_ppm per ROADMAP section 4.
-
-    Confidence gating: requires stable_count >= smoothing_window AND
-    snr_db >= 10.0 dB before applying any correction for that speaker.
-
-    Auto-pause: if a speaker accumulates 3+ consecutive correction_skipped
-    events AND its SNR is below 10 dB, the controller stops issuing
-    corrections for THAT speaker. Other speakers continue normally.
-    """
-
-    def __init__(
-        self,
-        max_ppm: float = 50.0,
-        smoothing_window: int = 5,
-        gain: float = CORRECTION_PPM_GAIN,
-    ):
-        self.max_ppm = max_ppm
-        self.smoothing_window = smoothing_window
-        self.gain = gain
-        self.baselines: dict[str, float] = {}
-        self.recent_samples: dict[str, list[float]] = {}
-        self.consecutive_skips: dict[str, int] = {}
-        self.paused: set[str] = set()
-
-    def observe(
-        self,
-        mac: str,
-        latency_ms: float,
-        slider_ms: float,
-        snr_db: float,
-        stable_count: int,
-    ) -> Optional[dict[str, Any]]:
-        """Record a measurement; return a JSON-line-ready record dict or None."""
-        codec_ms = latency_ms - slider_ms
-
-        # Update rolling samples
-        recent = self.recent_samples.setdefault(mac, [])
-        recent.append(codec_ms)
-        if len(recent) > self.smoothing_window:
-            recent.pop(0)
-
-        # Establish baseline once we have enough stable measurements
-        if mac not in self.baselines and stable_count >= self.smoothing_window:
-            self.baselines[mac] = sum(recent) / len(recent)
-            return {
-                "event": "correction_proposed",
-                "mac": mac,
-                "reason": "baseline_established",
-                "baseline_codec_ms": self.baselines[mac],
-            }
-
-        # Already paused: no-op
-        if mac in self.paused:
-            return None
-
-        # Confidence gating
-        if stable_count < self.smoothing_window or snr_db < CORRECTION_SNR_FLOOR_DB:
-            self.consecutive_skips[mac] = self.consecutive_skips.get(mac, 0) + 1
-            if (
-                self.consecutive_skips[mac] >= CORRECTION_PAUSE_AFTER_SKIPS
-                and snr_db < CORRECTION_SNR_FLOOR_DB
-            ):
-                self.paused.add(mac)
-                return {
-                    "event": "controller_paused",
-                    "mac": mac,
-                    "reason": f"3+ low-confidence skips, snr={snr_db:.1f}dB",
-                }
-            return {
-                "event": "correction_skipped",
-                "mac": mac,
-                "reason": "low_confidence",
-                "snr_db": snr_db,
-                "stable_count": stable_count,
-            }
-
-        # Compute correction
-        self.consecutive_skips[mac] = 0
-        if mac not in self.baselines:
-            return None
-        recent_mean = sum(recent) / len(recent)
-        drift_ms = recent_mean - self.baselines[mac]
-        applied_ppm = max(
-            -self.max_ppm,
-            min(self.max_ppm, drift_ms * self.gain),
-        )
-        return {
-            "event": "correction_applied",
-            "mac": mac,
-            "baseline_codec_ms": self.baselines[mac],
-            "current_codec_ms": recent_mean,
-            "drift_ppm_estimated": drift_ms * self.gain,
-            "applied_ppm": applied_ppm,
-        }
-
-
-@dataclass
-class RelativeClockObservation:
-    mac: str
-    monotonic: float
-    delta_samples: float
-    drift_samples: float
-    snr_db: float
-    stable_count: int
-
-
-class RelativeDriftEstimator:
-    """Group-relative sample-clock drift estimator.
-
-    Pattern mode produces ``arrival_sample_index - emit_frame_index``. That
-    delta is useful, but it contains both speaker latency and any shared slope
-    between the mic capture clock and the PipeWire/filter frame clock. This
-    estimator removes the common-mode part before proposing any per-speaker
-    correction, so speakers that move together produce near-zero proposals.
-
-    Positive residual means this speaker is late relative to the group. In the
-    C filter, positive ``set_rate_ppm`` increases effective delay over time, so
-    a positive residual maps to a negative proposed rate.
-    """
-
-    def __init__(
-        self,
-        max_ppm: float = 50.0,
-        smoothing_window: int = 5,
-        gain_ppm_per_ms: float = RELATIVE_CORRECTION_GAIN_PPM_PER_MS,
-        peer_max_age_sec: float = RELATIVE_PEER_MAX_AGE_SEC,
-    ) -> None:
-        self.max_ppm = max_ppm
-        self.smoothing_window = max(1, int(smoothing_window))
-        self.gain_ppm_per_ms = float(gain_ppm_per_ms)
-        self.peer_max_age_sec = max(0.0, float(peer_max_age_sec))
-        self.baselines: dict[str, float] = {}
-        self.latest: dict[str, RelativeClockObservation] = {}
-        self.recent_residuals_ms: dict[str, list[float]] = {}
-        self.common_history: list[tuple[float, float]] = []
-
-    def observe(
-        self,
-        *,
-        mac: str,
-        monotonic: float,
-        delta_samples: float,
-        snr_db: float,
-        stable_count: int,
-        pattern_mean_abs_error_ms: Optional[float] = None,
-        pattern_clock_delta_spread_ms: Optional[float] = None,
-    ) -> dict[str, Any]:
-        mac = mac.upper()
-        if mac not in self.baselines:
-            self.baselines[mac] = float(delta_samples)
-        drift_samples = float(delta_samples) - self.baselines[mac]
-        obs = RelativeClockObservation(
-            mac=mac,
-            monotonic=float(monotonic),
-            delta_samples=float(delta_samples),
-            drift_samples=drift_samples,
-            snr_db=float(snr_db),
-            stable_count=int(stable_count),
-        )
-        self.latest[mac] = obs
-
-        active = self._active_observations(float(monotonic))
-        if len(active) < 2:
-            return self._skip_record(
-                obs,
-                reason="insufficient_recent_peers",
-                active=active,
-                pattern_mean_abs_error_ms=pattern_mean_abs_error_ms,
-                pattern_clock_delta_spread_ms=pattern_clock_delta_spread_ms,
-            )
-
-        common_drift_samples = self._median([item.drift_samples for item in active])
-        common_drift_ms = common_drift_samples * 1000.0 / SAMPLE_RATE
-        self._remember_common(float(monotonic), common_drift_samples)
-        residual_samples = drift_samples - common_drift_samples
-        residual_ms = residual_samples * 1000.0 / SAMPLE_RATE
-
-        recent = self.recent_residuals_ms.setdefault(mac, [])
-        recent.append(residual_ms)
-        if len(recent) > self.smoothing_window:
-            recent.pop(0)
-        recent_residual_ms = sum(recent) / len(recent)
-
-        fields = self._base_record(
-            obs,
-            active=active,
-            common_drift_ms=common_drift_ms,
-            residual_ms=residual_ms,
-            recent_residual_ms=recent_residual_ms,
-            pattern_mean_abs_error_ms=pattern_mean_abs_error_ms,
-            pattern_clock_delta_spread_ms=pattern_clock_delta_spread_ms,
-        )
-
-        if stable_count < self.smoothing_window:
-            return {
-                "event": "relative_correction_skipped",
-                "reason": "warming_up",
-                **fields,
-            }
-        if snr_db < CORRECTION_SNR_FLOOR_DB:
-            return {
-                "event": "relative_correction_skipped",
-                "reason": "low_snr",
-                **fields,
-            }
-
-        proposed_uncapped = -recent_residual_ms * self.gain_ppm_per_ms
-        proposed_ppm = self._clamp_ppm(proposed_uncapped)
-        return {
-            "event": "relative_correction_proposed",
-            "reason": "group_residual",
-            "proposed_rate_ppm_uncapped": proposed_uncapped,
-            "proposed_rate_ppm": proposed_ppm,
-            "gain_ppm_per_ms": self.gain_ppm_per_ms,
-            "set_rate_ppm_sign": "negative_reduces_delay_positive_increases_delay",
-            **fields,
-        }
-
-    def _active_observations(self, now: float) -> list[RelativeClockObservation]:
-        return [
-            obs
-            for obs in self.latest.values()
-            if now - obs.monotonic <= self.peer_max_age_sec
-        ]
-
-    def _remember_common(self, monotonic: float, common_drift_samples: float) -> None:
-        self.common_history.append((monotonic, common_drift_samples))
-        max_len = max(4, self.smoothing_window * 4)
-        if len(self.common_history) > max_len:
-            self.common_history = self.common_history[-max_len:]
-
-    def _base_record(
-        self,
-        obs: RelativeClockObservation,
-        *,
-        active: list[RelativeClockObservation],
-        common_drift_ms: Optional[float],
-        residual_ms: Optional[float],
-        recent_residual_ms: Optional[float],
-        pattern_mean_abs_error_ms: Optional[float],
-        pattern_clock_delta_spread_ms: Optional[float],
-    ) -> dict[str, Any]:
-        return {
-            "mac": obs.mac,
-            "sample_clock_delta_ms": obs.delta_samples * 1000.0 / SAMPLE_RATE,
-            "speaker_sample_clock_drift_ms": obs.drift_samples * 1000.0 / SAMPLE_RATE,
-            "group_common_drift_ms": common_drift_ms,
-            "relative_residual_ms": residual_ms,
-            "recent_relative_residual_ms": recent_residual_ms,
-            "common_clock_slope_ppm": self._common_slope_ppm(),
-            "active_peer_count": len(active),
-            "active_peer_macs": sorted(item.mac for item in active),
-            "peer_max_age_sec": self.peer_max_age_sec,
-            "stable_count": obs.stable_count,
-            "snr_db": obs.snr_db,
-            "pattern_mean_abs_error_ms": pattern_mean_abs_error_ms,
-            "pattern_clock_delta_spread_ms": pattern_clock_delta_spread_ms,
-        }
-
-    def _skip_record(
-        self,
-        obs: RelativeClockObservation,
-        *,
-        reason: str,
-        active: list[RelativeClockObservation],
-        pattern_mean_abs_error_ms: Optional[float],
-        pattern_clock_delta_spread_ms: Optional[float],
-    ) -> dict[str, Any]:
-        return {
-            "event": "relative_correction_skipped",
-            "reason": reason,
-            **self._base_record(
-                obs,
-                active=active,
-                common_drift_ms=None,
-                residual_ms=None,
-                recent_residual_ms=None,
-                pattern_mean_abs_error_ms=pattern_mean_abs_error_ms,
-                pattern_clock_delta_spread_ms=pattern_clock_delta_spread_ms,
-            ),
-        }
-
-    def _common_slope_ppm(self) -> Optional[float]:
-        if len(self.common_history) < 2:
-            return None
-        t0 = self.common_history[0][0]
-        xs = [item[0] - t0 for item in self.common_history]
-        ys = [item[1] for item in self.common_history]
-        mean_x = sum(xs) / len(xs)
-        mean_y = sum(ys) / len(ys)
-        denom = sum((x - mean_x) ** 2 for x in xs)
-        if denom <= 0.0:
-            return None
-        slope_samples_per_sec = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
-        return slope_samples_per_sec / SAMPLE_RATE * 1_000_000.0
-
-    def _clamp_ppm(self, value: float) -> float:
-        return max(-self.max_ppm, min(self.max_ppm, float(value)))
-
-    @staticmethod
-    def _median(values: list[float]) -> float:
-        ordered = sorted(values)
-        mid = len(ordered) // 2
-        if len(ordered) % 2:
-            return ordered[mid]
-        return (ordered[mid - 1] + ordered[mid]) / 2.0
-
 
 def _current_emit_entry(entries: list[Any]) -> Optional[dict[str, Any]]:
     parsed = [entry for entry in entries if isinstance(entry, dict) and "frame_index" in entry]
@@ -1286,31 +964,6 @@ class RuntimeSyncService:
         self.state = RuntimeSyncState()
         self.stop_event = asyncio.Event()
         self.loop_task: Optional[asyncio.Task[None]] = None
-        # Slice 3: closed-loop drift correction. Opt-in via --enable-correction;
-        # default is measure-only (slice 2 behavior). Spec:
-        # docs/maverick/proposals/09-slice-3-implementation-spec.md
-        self.controller: Optional[DriftController] = (
-            DriftController(
-                max_ppm=args.max_ppm,
-                smoothing_window=args.smoothing_window,
-            )
-            if getattr(args, "enable_correction", False) and getattr(args, "detector_mode", None) != "pattern"
-            else None
-        )
-        self.relative_estimator: Optional[RelativeDriftEstimator] = (
-            RelativeDriftEstimator(
-                max_ppm=args.max_ppm,
-                smoothing_window=args.smoothing_window,
-                gain_ppm_per_ms=args.relative_gain_ppm_per_ms,
-                peer_max_age_sec=args.relative_peer_max_age_sec,
-            )
-            if (
-                getattr(args, "enable_relative_proposals", False)
-                or getattr(args, "slice4_observe", False)
-                or getattr(args, "enable_correction", False)
-            )
-            else None
-        )
         self.slice5_actuator: Optional[SpeakerActuator] = None
         self._slice4_observe_enabled = bool(getattr(args, "slice4_observe", False))
         self.slice4_observer: Optional[ObservationWriter] = (
@@ -1356,6 +1009,7 @@ class RuntimeSyncService:
                         target.mac
                     ].last_sample_clock_delta_samples
                     target.pattern_clock_reject_count = previous[target.mac].pattern_clock_reject_count
+                    target.clock_prior_reset_remaining = previous[target.mac].clock_prior_reset_remaining
             self.state.targets = discovered
             self._sync_slice5_actuator(discovered)
             if not self.state.targets:
@@ -1370,21 +1024,15 @@ class RuntimeSyncService:
             self.state.cycles += 1
 
     def _sync_slice5_actuator(self, targets: list[SpeakerTarget]) -> None:
-        if not getattr(self.args, "enable_correction", False):
+        if getattr(self.args, "detector_mode", None) != "pattern":
             return
         sockets = {target.mac: target.socket_path for target in targets}
         if self.slice5_actuator is None:
-            self.slice5_actuator = SpeakerActuator(
-                sockets,
-                max_rate_ppm=self.args.max_ppm,
-            )
+            self.slice5_actuator = SpeakerActuator(sockets)
             register_ble_stop_callback(self.slice5_actuator.emergency_stop)
             _emit("slice5_actuator_started", speaker_macs=sorted(sockets), burst_amp_x1000=BURST_AMP_X1000)
             return
-        old_states = self.slice5_actuator.states
         self.slice5_actuator.sync_sockets(sockets)
-        for mac in set(old_states) | {mac.upper() for mac in sockets}:
-            self.slice5_actuator._state(mac)
 
     async def _measure_once(self, target: SpeakerTarget) -> None:
         if self.args.detector_mode == "pattern":
@@ -1461,30 +1109,6 @@ class RuntimeSyncService:
             **sample_clock,
         )
 
-        # Slice 3: closed-loop drift correction (opt-in via --enable-correction).
-        # Observe the new measurement; if the controller decides to apply, push
-        # the bounded set_rate_ppm command to this speaker's filter socket.
-        if self.controller is not None:
-            record = self.controller.observe(
-                mac=target.mac,
-                latency_ms=latency_ms,
-                slider_ms=target_delay_ms,
-                snr_db=detection["snr_db"],
-                stable_count=target.stable_count,
-            )
-            if record is not None:
-                _emit(**record)
-                if record["event"] == "correction_applied":
-                    response = _send_filter_command(
-                        target.socket_path,
-                        f"set_rate_ppm {record['applied_ppm']:.3f}",
-                    )
-                    _emit(
-                        "correction_applied_response",
-                        mac=target.mac,
-                        response=response,
-                        applied_ppm=record["applied_ppm"],
-                    )
 
     async def _measure_pattern(self, target: SpeakerTarget) -> None:
         query = _send_filter_command(target.socket_path, "query") or {}
@@ -1581,7 +1205,11 @@ class RuntimeSyncService:
             return
 
         emit_frame_indices = [int(entry["frame_index"]) for entry in emit_entries[: self.args.pattern_bursts]]
-        clock_prior_delta_samples = target.last_sample_clock_delta_samples
+        clock_prior_delta_samples = (
+            None if target.clock_prior_reset_remaining > 0 else target.last_sample_clock_delta_samples
+        )
+        if target.clock_prior_reset_remaining > 0:
+            target.clock_prior_reset_remaining -= 1
         analysis = await self.detector.analyze_pattern(
             detect_start,
             detect_end,
@@ -1632,6 +1260,7 @@ class RuntimeSyncService:
                 detect_end_monotonic=detect_end,
                 pattern_clock_reject_count=pattern_clock_reject_count,
                 reset_clock_prior=reset_clock_prior,
+                clock_prior_reset_remaining=target.clock_prior_reset_remaining,
                 **analysis,
             )
             return
@@ -1672,6 +1301,7 @@ class RuntimeSyncService:
             pattern_clock_prior_delta_samples=detection.get("pattern_clock_prior_delta_samples"),
             pattern_clock_prior_error_ms=detection.get("pattern_clock_prior_error_ms"),
             pattern_clock_prior_tolerance_ms=detection.get("pattern_clock_prior_tolerance_ms"),
+            clock_prior_reset_remaining=target.clock_prior_reset_remaining,
             envelope_noise_floor_db=detection.get("envelope_noise_floor_db"),
             envelope_threshold_db=detection.get("envelope_threshold_db"),
             envelope_peak_db=detection.get("envelope_peak_db"),
@@ -1683,48 +1313,42 @@ class RuntimeSyncService:
             stable_count=target.stable_count,
             **sample_clock,
         )
-        if self.relative_estimator is not None and "sample_clock_delta_samples" in sample_clock:
-            record = self.relative_estimator.observe(
-                mac=target.mac,
-                monotonic=float(
-                    detection.get("sample_clock_anchor_monotonic")
-                    or detection.get("arrival_monotonic")
-                    or emit_records[0]["emit_monotonic"]
-                ),
-                delta_samples=float(sample_clock["sample_clock_delta_samples"]),
-                snr_db=float(detection["snr_db"]),
-                stable_count=target.stable_count,
-                pattern_mean_abs_error_ms=detection.get("pattern_mean_abs_error_ms"),
-                pattern_clock_delta_spread_ms=detection.get("pattern_clock_delta_spread_ms"),
-            )
-            actuation_result = self._apply_slice5_proposal(
-                target,
-                proposal_record=record,
-                current_filter_delay_ms=current_filter_delay_ms,
-                measured_latency_ms=latency_ms,
-            )
-            self._record_slice4_observation(
-                target,
-                measured_latency_ms=latency_ms,
-                current_filter_delay_ms=current_filter_delay_ms,
-                snr_db=float(detection["snr_db"]),
-                proposal_record=record,
-                pattern_state_snapshot={
-                    "stable_count": target.stable_count,
-                    "sample_clock": sample_clock,
-                    "detection": {
-                        "pattern_mean_abs_error_ms": detection.get("pattern_mean_abs_error_ms"),
-                        "pattern_clock_delta_spread_ms": detection.get("pattern_clock_delta_spread_ms"),
-                        "pattern_selection_reason": detection.get("pattern_selection_reason"),
-                        "pattern_match_count": detection.get("pattern_match_count"),
-                        "pattern_rejected_by_clock_count": detection.get("pattern_rejected_by_clock_count"),
-                    },
-                    "relative_proposal": record,
+        actuation_result = self._apply_slice5_proposal(
+            target,
+            current_filter_delay_ms=current_filter_delay_ms,
+            measured_latency_ms=latency_ms,
+            target_total_ms=current_filter_delay_ms + float(self.args.bt_codec_latency_ms),
+        )
+        if actuation_result is not None and actuation_result.clock_prior_reset:
+            target.last_sample_clock_delta_samples = None
+            target.clock_prior_reset_remaining = CLOCK_PRIOR_RESET_CYCLES
+        self._record_slice4_observation(
+            target,
+            measured_latency_ms=latency_ms,
+            current_filter_delay_ms=current_filter_delay_ms,
+            snr_db=float(detection["snr_db"]),
+            pattern_state_snapshot={
+                "stable_count": target.stable_count,
+                "sample_clock": sample_clock,
+                "detection": {
+                    "pattern_mean_abs_error_ms": detection.get("pattern_mean_abs_error_ms"),
+                    "pattern_clock_delta_spread_ms": detection.get("pattern_clock_delta_spread_ms"),
+                    "pattern_selection_reason": detection.get("pattern_selection_reason"),
+                    "pattern_match_count": detection.get("pattern_match_count"),
+                    "pattern_rejected_by_clock_count": detection.get("pattern_rejected_by_clock_count"),
                 },
-                actuation_result=actuation_result,
-            )
-            if getattr(self.args, "enable_relative_proposals", False):
-                _emit(**record)
+                "actuation": (
+                    None
+                    if actuation_result is None
+                    else {
+                        "action": actuation_result.action,
+                        "delta_ms": actuation_result.delta_ms,
+                        "clock_prior_reset": actuation_result.clock_prior_reset,
+                    }
+                ),
+            },
+            actuation_result=actuation_result,
+        )
 
     def _record_slice4_missed_burst(
         self,
@@ -1754,33 +1378,29 @@ class RuntimeSyncService:
         if self.slice5_actuator is None:
             return None
         return self.slice5_actuator.apply(
-            {
-                "mac": target.mac,
-                "missed_burst": True,
-                "proposed_adjustment_ppm": math.nan,
-                "current_filter_delay_ms": current_filter_delay_ms,
-            }
+            target.mac,
+            None,
+            None,
+            current_filter_delay_ms,
+            missed_burst=True,
         )
 
     def _apply_slice5_proposal(
         self,
         target: SpeakerTarget,
         *,
-        proposal_record: dict[str, Any],
         current_filter_delay_ms: float,
         measured_latency_ms: float,
+        target_total_ms: float,
     ) -> Optional[ActuationResult]:
         if self.slice5_actuator is None:
             return None
-        proposal = {
-            **proposal_record,
-            "mac": target.mac,
-            "missed_burst": False,
-            "measured_latency_ms": measured_latency_ms,
-            "current_filter_delay_ms": current_filter_delay_ms,
-            "max_ppm": self.args.max_ppm,
-        }
-        return self.slice5_actuator.apply(proposal)
+        return self.slice5_actuator.apply(
+            target.mac,
+            measured_latency_ms,
+            target_total_ms,
+            current_filter_delay_ms,
+        )
 
     def _record_slice4_observation(
         self,
@@ -1789,14 +1409,13 @@ class RuntimeSyncService:
         measured_latency_ms: float,
         current_filter_delay_ms: float,
         snr_db: float,
-        proposal_record: dict[str, Any],
         pattern_state_snapshot: dict[str, Any],
         actuation_result: Optional[ActuationResult] = None,
     ) -> None:
         if self.slice4_observer is None:
             return
-        proposed_adjustment_ppm = float(proposal_record.get("proposed_rate_ppm", math.nan))
-        confidence = 1.0 if proposal_record.get("event") == "relative_correction_proposed" else 0.0
+        proposed_adjustment_ppm = math.nan
+        confidence = 1.0 if actuation_result is not None and actuation_result.action != "missed" else 0.0
         self.slice4_observer.write_observation(
             speaker_id=target.mac,
             measured_latency_ms=measured_latency_ms,
@@ -1807,7 +1426,7 @@ class RuntimeSyncService:
             },
             proposed_adjustment_ppm=proposed_adjustment_ppm,
             actuation_applied_ppm=(
-                actuation_result.actuation_applied_ppm if actuation_result is not None else 0.0
+                actuation_result.delta_ms if actuation_result is not None else 0.0
             ),
             confidence=confidence,
             current_filter_delay_ms=current_filter_delay_ms,
@@ -1817,17 +1436,15 @@ class RuntimeSyncService:
 
     def _pattern_state_base(self, target: SpeakerTarget) -> dict[str, Any]:
         baseline_latency_ms = None
-        slider_cooldown_cycles = None
         if self.slice5_actuator is not None:
             baseline_latency_ms = self.slice5_actuator.baseline_for(target.mac)
-            slider_cooldown_cycles = self.slice5_actuator.slider_cooldowns.get(target.mac.upper())
         return {
             "stable_count": target.stable_count,
             "sample_clock_baseline_samples": target.sample_clock_baseline_samples,
             "last_sample_clock_delta_samples": target.last_sample_clock_delta_samples,
             "pattern_clock_reject_count": target.pattern_clock_reject_count,
             "baseline_latency_ms": baseline_latency_ms,
-            "slider_cooldown_cycles": slider_cooldown_cycles,
+            "clock_prior_reset_remaining": target.clock_prior_reset_remaining,
         }
 
 
@@ -1900,30 +1517,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=PATTERN_LANDMARK,
         help="Mic-side timing landmark for pattern mode",
     )
-    # Slice 3: closed-loop drift correction flags.
-    # Spec: docs/maverick/proposals/09-slice-3-implementation-spec.md
-    parser.add_argument(
-        "--enable-correction",
-        action="store_true",
-        help="Enable closed-loop drift correction (default: measure-only)",
-    )
-    parser.add_argument(
-        "--max-ppm",
-        type=float,
-        default=50.0,
-        help="Maximum |ppm| correction bound per ROADMAP section 4",
-    )
-    parser.add_argument(
-        "--smoothing-window",
-        type=int,
-        default=5,
-        help="Rolling-mean window for drift estimation",
-    )
-    parser.add_argument(
-        "--enable-relative-proposals",
-        action="store_true",
-        help="Log group-relative correction proposals from pattern sample-clock measurements without actuating",
-    )
     parser.add_argument(
         "--slice4-observe",
         action="store_true",
@@ -1935,27 +1528,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_OBSERVATION_PATH),
         help=argparse.SUPPRESS,
     )
-    parser.add_argument(
-        "--relative-gain-ppm-per-ms",
-        type=float,
-        default=RELATIVE_CORRECTION_GAIN_PPM_PER_MS,
-        help="Observe-only proportional gain for relative residual ms -> proposed ppm",
-    )
-    parser.add_argument(
-        "--relative-peer-max-age-sec",
-        type=float,
-        default=RELATIVE_PEER_MAX_AGE_SEC,
-        help="Maximum age of another speaker's last pattern measurement for common-mode subtraction",
-    )
     return parser
 
 
 async def _amain(argv: Optional[Iterable[str]] = None) -> int:
     args = _build_parser().parse_args(list(argv) if argv is not None else None)
-    if args.enable_correction:
-        logging.basicConfig(level=logging.INFO, format="%(message)s")
-        args.detector_mode = "pattern"
-        args.amplitude = BURST_AMP_X1000 / 1000.0
     if args.slice4_observe:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         args.detector_mode = "pattern"

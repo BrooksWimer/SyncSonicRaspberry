@@ -396,6 +396,13 @@ def handle_calibrate_speaker(char, data):
         )
 
     def _push(_phase: str, payload: Dict[str, Any]) -> None:
+        if calibration_mode == "startup_tune" and _phase == "applied":
+            try:
+                from measurement.calibration_targets import record_startup_tune_target
+
+                record_startup_tune_target(float(payload.get("target_total_ms", target_total_ms)), mac=mac)
+            except Exception as exc:  # noqa: BLE001 - notification should still be sent if persistence fails.
+                logger.warning("Failed to persist startup-tune target_total_ms for %s: %s", mac, exc)
         # The Characteristic's send_notification is already known to
         # be safe from worker threads (existing ConnectionService and
         # DeviceManager use the same pattern). Failures inside the
@@ -452,6 +459,13 @@ def handle_calibrate_all_speakers(char, data):
     )
 
     def _push(_phase: str, payload: Dict[str, Any]) -> None:
+        if calibration_mode == "startup_tune" and _phase == "sequence_started":
+            try:
+                from measurement.calibration_targets import record_startup_tune_target
+
+                record_startup_tune_target(float(payload.get("target_total_ms", target_total_ms)))
+            except Exception as exc:  # noqa: BLE001 - notification should still be sent if persistence fails.
+                logger.warning("Failed to persist shared startup-tune target_total_ms: %s", exc)
         char.send_notification(Msg.CALIBRATION_RESULT, payload)
 
     wifi_device_ids: list[str] = []

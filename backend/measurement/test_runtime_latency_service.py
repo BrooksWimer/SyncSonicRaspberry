@@ -18,6 +18,10 @@ from measurement.runtime_latency_service import (  # noqa: E402
     RingBuffer,
     SAMPLE_RATE,
 )
+from measurement.calibration_targets import (  # noqa: E402
+    read_startup_tune_target,
+    record_startup_tune_target,
+)
 
 
 def _tone(start: int, duration: int, total: int, freq_hz: float = 18_500.0) -> np.ndarray:
@@ -25,6 +29,46 @@ def _tone(start: int, duration: int, total: int, freq_hz: float = 18_500.0) -> n
     t = np.arange(duration, dtype=np.float64) / SAMPLE_RATE
     samples[start : start + duration] = (0.8 * np.sin(2.0 * np.pi * freq_hz * t)).astype(np.float32)
     return samples
+
+
+def test_startup_tune_target_missing_file_falls_back_to_cli_default(tmp_path: Path) -> None:
+    path = tmp_path / "startup_tune_targets.json"
+
+    resolved = read_startup_tune_target("AA:BB:CC:DD:EE:FF", 500.0, path=path)
+
+    assert resolved.target_total_ms == 500.0
+    assert resolved.source == "cli_default_missing_file"
+
+
+def test_startup_tune_target_reads_shared_persistent_value_before_cli_default(tmp_path: Path) -> None:
+    path = tmp_path / "startup_tune_targets.json"
+    record_startup_tune_target(612.5, path=path)
+
+    resolved = read_startup_tune_target("AA:BB:CC:DD:EE:FF", 500.0, path=path)
+
+    assert resolved.target_total_ms == 612.5
+    assert resolved.source == "shared"
+
+
+def test_startup_tune_target_uses_per_speaker_before_shared(tmp_path: Path) -> None:
+    path = tmp_path / "startup_tune_targets.json"
+    record_startup_tune_target(612.5, path=path)
+    record_startup_tune_target(455.25, mac="aa:bb:cc:dd:ee:ff", path=path)
+
+    resolved = read_startup_tune_target("AA:BB:CC:DD:EE:FF", 500.0, path=path)
+
+    assert resolved.target_total_ms == 455.25
+    assert resolved.source == "per_speaker"
+
+
+def test_startup_tune_target_persists_shared_and_per_speaker_values(tmp_path: Path) -> None:
+    path = tmp_path / "startup_tune_targets.json"
+
+    record_startup_tune_target(700.0, path=path)
+    record_startup_tune_target(480.0, mac="11:22:33:44:55:66", path=path)
+
+    assert read_startup_tune_target("AA:BB:CC:DD:EE:FF", 500.0, path=path).target_total_ms == 700.0
+    assert read_startup_tune_target("11:22:33:44:55:66", 500.0, path=path).target_total_ms == 480.0
 
 
 def test_ring_buffer_tracks_absolute_mic_sample_indices() -> None:

@@ -63,6 +63,7 @@ import numpy as np
 
 from measurement.service_env import slice4_observe_from_env
 from measurement.slice4_observer import DEFAULT_OBSERVATION_PATH, ObservationWriter
+from measurement.calibration_targets import read_startup_tune_target
 from measurement.slice5_actuator import (
     BURST_AMP_X1000,
     BURST_AMP_LADDER_X1000,
@@ -1332,7 +1333,6 @@ class RuntimeSyncService:
             target,
             current_filter_delay_ms=current_filter_delay_ms,
             measured_latency_ms=latency_ms,
-            target_total_ms=float(self.args.target_total_ms),
         )
         if actuation_result is not None and actuation_result.clock_prior_reset:
             target.last_sample_clock_delta_samples = None
@@ -1412,14 +1412,21 @@ class RuntimeSyncService:
         *,
         current_filter_delay_ms: float,
         measured_latency_ms: float,
-        target_total_ms: float,
     ) -> Optional[ActuationResult]:
         if self.slice5_actuator is None:
             return None
+        target_total = read_startup_tune_target(target.mac, float(self.args.target_total_ms))
+        _emit(
+            "runtime_target_total_resolved",
+            mac=target.mac,
+            target_total_ms=target_total.target_total_ms,
+            target_total_source=target_total.source,
+            target_total_path=str(target_total.path),
+        )
         return self.slice5_actuator.apply(
             target.mac,
             measured_latency_ms,
-            target_total_ms,
+            target_total.target_total_ms,
             current_filter_delay_ms,
         )
 

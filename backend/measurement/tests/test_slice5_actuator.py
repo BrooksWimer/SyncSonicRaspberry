@@ -68,6 +68,19 @@ def test_subsequent_burst_above_threshold_applies_set_delay_with_correct_sign() 
     assert result.action == "corrected"
     assert result.delta_ms == 7.0
     assert result.clock_prior_reset is True
+    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 13.000")]
+
+
+def test_apply_with_negative_offset_increases_delay() -> None:
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    result = actuator.apply(MAC, 363.0, 370.0, 20.0)
+
+    assert result.action == "corrected"
+    assert result.delta_ms == -7.0
+    assert result.clock_prior_reset is True
     assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 27.000")]
 
 
@@ -138,4 +151,4 @@ def test_slider_aware_clock_prior_reset_cycles_still_emitted() -> None:
     assert result.action == "corrected"
     assert result.delta_ms == -5.0
     assert result.clock_prior_reset is True
-    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 15.000")]
+    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 25.000")]

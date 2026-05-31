@@ -133,7 +133,7 @@ class SpeakerActuator:
             )
             return ActuationResult(action="freak_skip", clock_prior_reset=False)
 
-        new_delay = float(current_filter_delay) + offset
+        new_delay = max(0.0, float(current_filter_delay) - offset)
         self.set_delay(mac, new_delay)
         self._log_action(mac, "corrected", delta_ms=offset, new_delay_ms=new_delay)
         return ActuationResult(action="corrected", delta_ms=offset, clock_prior_reset=True)

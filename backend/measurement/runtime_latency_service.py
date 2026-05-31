@@ -4,20 +4,13 @@ Slice 2 deliberately measures only: filter-resident ultrasonic burst
 emission, USB mic capture, envelope detection, and JSON-lines journal
 records. Pattern mode feeds valid measurements into the Slice 5 delay-step actuator.
 
-Invocation (manual CLI; runs as the syncsonic user so it can access
-the filter sockets and the service's PipeWire/Pulse runtime):
+Permanent systemd unit:
 
-    sudo systemd-run --unit=runtime-latency \\
-        --uid=syncsonic --gid=syncsonic \\
-        --working-directory=/home/syncsonic/SyncSonicPi \\
-        --setenv=PULSE_SERVER=unix:/run/syncsonic/pulse/native \\
-        --setenv=RESERVED_HCI=hci3 \\
-        --setenv=RESERVED_ADAPTER_MAC=2C:CF:67:CE:57:91 \\
-        --setenv=PYTHONUNBUFFERED=1 \\
-        python3 /home/syncsonic/SyncSonicPi/backend/measurement/runtime_latency_service.py \\
-        --max-speakers 2
+    sudo cp deploy/runtime-latency.service /etc/systemd/system/runtime-latency.service
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now runtime-latency.service
 
-The four ``--setenv`` lines are mandatory:
+The unit's environment lines are mandatory:
 - ``PULSE_SERVER`` points at the syncsonic-owned PulseAudio runtime
   so ``parecord`` can read the USB mic source. Without it the service
   fails to start capture because the default PulseAudio path is empty.
@@ -93,6 +86,8 @@ DEFAULT_FREQ_HZ = 18_500.0
 DEFAULT_DURATION_MS = 100
 DEFAULT_AMPLITUDE = 0.95
 DEFAULT_BT_CODEC_LATENCY_MS = 370.0
+STARTUP_GATE_INTERVAL_SEC = 5.0
+STARTUP_GATE_ATTEMPTS = 60
 INITIAL_WINDOW_MARGIN_MS = 250.0
 STABLE_WINDOW_MARGIN_MS = 100.0
 STABLE_MEASUREMENT_COUNT = 5
@@ -977,6 +972,10 @@ class RuntimeSyncService:
 
     async def run(self) -> None:
         with self.slice4_observer if self.slice4_observer is not None else contextlib.nullcontext():
+            startup_targets = await self._wait_for_startup_speaker()
+            if not startup_targets:
+                return
+            self.state.targets = startup_targets
             await self.capture.start()
             await self.start_measurement()
             await self.stop_event.wait()
@@ -996,6 +995,37 @@ class RuntimeSyncService:
     def emergency_stop(self) -> None:
         if self.slice5_actuator is not None:
             self.slice5_actuator.emergency_stop()
+
+    async def _wait_for_startup_speaker(self) -> list[SpeakerTarget]:
+        attempts = int(getattr(self.args, "startup_gate_attempts", STARTUP_GATE_ATTEMPTS))
+        interval_sec = float(getattr(self.args, "startup_gate_interval_sec", STARTUP_GATE_INTERVAL_SEC))
+        for attempt in range(1, attempts + 1):
+            targets = discover_active_speakers(limit=self.args.max_speakers)
+            if targets:
+                _emit(
+                    "startup_gate_ready",
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    active_macs=[target.mac for target in targets],
+                )
+                return targets
+            _emit(
+                "startup_gate_waiting",
+                attempt=attempt,
+                max_attempts=attempts,
+                interval_sec=interval_sec,
+                reason="no_connected_speaker_macs",
+            )
+            if attempt < attempts:
+                await asyncio.sleep(interval_sec)
+        _emit(
+            "startup_gate_timeout",
+            attempts=attempts,
+            interval_sec=interval_sec,
+            max_wait_sec=attempts * interval_sec,
+            reason="no_connected_speaker_macs",
+        )
+        return []
 
     async def _measurement_loop(self) -> None:
         await self.detector.warmup(self.args.warmup_sec)
@@ -1556,6 +1586,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--slice4-observation-path",
         default=str(DEFAULT_OBSERVATION_PATH),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--startup-gate-attempts",
+        type=int,
+        default=STARTUP_GATE_ATTEMPTS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--startup-gate-interval-sec",
+        type=float,
+        default=STARTUP_GATE_INTERVAL_SEC,
         help=argparse.SUPPRESS,
     )
     return parser

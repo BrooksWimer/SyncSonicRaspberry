@@ -16,7 +16,9 @@ sys.modules.setdefault("dbus", types.SimpleNamespace(SystemBus=lambda: None))
 from measurement.runtime_latency_service import (  # noqa: E402
     EnvelopeDetector,
     RingBuffer,
+    RuntimeSyncService,
     SAMPLE_RATE,
+    _build_parser,
 )
 from measurement.calibration_targets import (  # noqa: E402
     read_startup_tune_target,
@@ -69,6 +71,38 @@ def test_startup_tune_target_persists_shared_and_per_speaker_values(tmp_path: Pa
 
     assert read_startup_tune_target("AA:BB:CC:DD:EE:FF", 500.0, path=path).target_total_ms == 700.0
     assert read_startup_tune_target("11:22:33:44:55:66", 500.0, path=path).target_total_ms == 480.0
+
+
+def test_runtime_service_exits_cleanly_when_no_speakers_connected_after_timeout(monkeypatch) -> None:
+    async def run() -> None:
+        args = _build_parser().parse_args(
+            [
+                "--startup-gate-attempts",
+                "2",
+                "--startup-gate-interval-sec",
+                "0",
+            ]
+        )
+        service = RuntimeSyncService(args)
+        started_capture = False
+
+        async def fake_capture_start() -> None:
+            nonlocal started_capture
+            started_capture = True
+
+        monkeypatch.setattr(
+            "measurement.runtime_latency_service.discover_active_speakers",
+            lambda limit: [],
+        )
+        monkeypatch.setattr(service.capture, "start", fake_capture_start)
+
+        await service.run()
+
+        assert started_capture is False
+        assert service.loop_task is None
+        assert service.state.targets == []
+
+    asyncio.run(run())
 
 
 def test_ring_buffer_tracks_absolute_mic_sample_indices() -> None:

@@ -169,6 +169,31 @@ Tail logs:
 journalctl -u syncsonic.service -f
 ```
 
+### Runtime latency service
+
+Runtime ultrasonic correction is installed as a separate unit that starts after
+the main SyncSonic service has prepared the audio runtime and speaker filter
+sockets:
+
+```bash
+sudo cp deploy/runtime-latency.service /etc/systemd/system/runtime-latency.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now runtime-latency.service
+```
+
+The unit runs as `syncsonic`, requires `syncsonic.service`, and bakes the
+pattern-mode runtime latency arguments directly into `ExecStart`. On boot it
+polls for an active connected speaker every 5 seconds for up to 60 attempts
+(5 minutes). If no speaker becomes available, it exits cleanly; systemd will not
+restart that clean timeout because the unit uses `Restart=on-failure`.
+
+Inspect or stop it with:
+
+```bash
+journalctl -u runtime-latency.service -f
+sudo systemctl stop runtime-latency.service
+```
+
 ---
 
 ## Environment variables
@@ -200,4 +225,3 @@ Wi‑Fi discovery uses separate message types: `WIFI_SCAN_START` (0x44), `WIFI_S
 Logs are emitted via `logging_conf.get_logger()` and by default go to
 `stdout` (systemd captures them in the journal).  Adjust the configuration as
 needed for file rotation or remote aggregation.
-

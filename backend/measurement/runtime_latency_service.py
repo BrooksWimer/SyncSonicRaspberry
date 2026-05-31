@@ -1382,7 +1382,7 @@ class RuntimeSyncService:
             _emit("slice5_actuator_started", speaker_macs=sorted(sockets), burst_amp_x1000=BURST_AMP_X1000)
             return
         old_states = self.slice5_actuator.states
-        self.slice5_actuator.sockets = {mac.upper(): Path(path) for mac, path in sockets.items()}
+        self.slice5_actuator.sync_sockets(sockets)
         for mac in set(old_states) | {mac.upper() for mac in sockets}:
             self.slice5_actuator._state(mac)
 
@@ -1701,6 +1701,7 @@ class RuntimeSyncService:
                 target,
                 proposal_record=record,
                 current_filter_delay_ms=current_filter_delay_ms,
+                measured_latency_ms=latency_ms,
             )
             self._record_slice4_observation(
                 target,
@@ -1767,6 +1768,7 @@ class RuntimeSyncService:
         *,
         proposal_record: dict[str, Any],
         current_filter_delay_ms: float,
+        measured_latency_ms: float,
     ) -> Optional[ActuationResult]:
         if self.slice5_actuator is None:
             return None
@@ -1774,6 +1776,7 @@ class RuntimeSyncService:
             **proposal_record,
             "mac": target.mac,
             "missed_burst": False,
+            "measured_latency_ms": measured_latency_ms,
             "current_filter_delay_ms": current_filter_delay_ms,
             "max_ppm": self.args.max_ppm,
         }
@@ -1813,11 +1816,18 @@ class RuntimeSyncService:
         )
 
     def _pattern_state_base(self, target: SpeakerTarget) -> dict[str, Any]:
+        baseline_latency_ms = None
+        slider_cooldown_cycles = None
+        if self.slice5_actuator is not None:
+            baseline_latency_ms = self.slice5_actuator.baseline_for(target.mac)
+            slider_cooldown_cycles = self.slice5_actuator.slider_cooldowns.get(target.mac.upper())
         return {
             "stable_count": target.stable_count,
             "sample_clock_baseline_samples": target.sample_clock_baseline_samples,
             "last_sample_clock_delta_samples": target.last_sample_clock_delta_samples,
             "pattern_clock_reject_count": target.pattern_clock_reject_count,
+            "baseline_latency_ms": baseline_latency_ms,
+            "slider_cooldown_cycles": slider_cooldown_cycles,
         }
 
 

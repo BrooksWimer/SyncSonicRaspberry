@@ -20,6 +20,7 @@ BURST_AMP_LADDER_X1000 = (300, 600, 950)
 BURST_MISS_ESCALATION_THRESHOLD = 3
 BURST_AMP_X1000 = BURST_AMP_LADDER_X1000[0]
 SOCKET_TIMEOUT_SEC = 0.25
+RUNTIME_CORRECTIONS_PATH = Path("/run/syncsonic/runtime_corrections.jsonl")
 
 BleStopCallback = Callable[[], None]
 SocketWriter = Callable[[Path, str], Optional[dict[str, Any]]]
@@ -49,12 +50,16 @@ class SpeakerActuator:
         apply_threshold_ms: float = APPLY_THRESHOLD_MS,
         freak_threshold_ms: float = FREAK_THRESHOLD_MS,
         socket_writer: Optional[SocketWriter] = None,
+        runtime_corrections_path: Path | str | None = RUNTIME_CORRECTIONS_PATH,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.sockets = {mac.upper(): Path(path) for mac, path in sockets.items()}
         self.apply_threshold_ms = abs(float(apply_threshold_ms))
         self.freak_threshold_ms = abs(float(freak_threshold_ms))
         self.socket_writer = socket_writer or _send_filter_command
+        self.runtime_corrections_path = (
+            Path(runtime_corrections_path) if runtime_corrections_path is not None else None
+        )
         self.logger = logger or logging.getLogger("measurement.slice5_actuator")
         self.baseline_established: dict[str, bool] = {mac: False for mac in self.sockets}
         self.consecutive_missed_bursts: dict[str, int] = {mac: 0 for mac in self.sockets}
@@ -151,7 +156,24 @@ class SpeakerActuator:
 
         new_delay = max(0.0, float(current_filter_delay) - offset)
         self.set_delay(mac, new_delay)
-        self._log_action(mac, "corrected", delta_ms=offset, new_delay_ms=new_delay)
+        self._log_action(
+            mac,
+            "corrected",
+            measured_latency_ms=measured_latency_ms,
+            target_total_ms=target_total_ms,
+            current_filter_delay_ms=current_filter_delay,
+            delta_ms=offset,
+            new_filter_delay_ms=new_delay,
+            new_delay_ms=new_delay,
+        )
+        self._write_runtime_correction(
+            mac,
+            measured_latency_ms=float(measured_latency_ms),
+            target_total_ms=float(target_total_ms),
+            current_filter_delay_ms=float(current_filter_delay),
+            delta_ms=offset,
+            new_filter_delay_ms=new_delay,
+        )
         return ActuationResult(action="corrected", delta_ms=offset, clock_prior_reset=True)
 
     def set_delay(self, speaker_id: str, delay_ms: float) -> Optional[dict[str, Any]]:
@@ -232,6 +254,27 @@ class SpeakerActuator:
                 separators=(",", ":"),
             )
         )
+
+    def _write_runtime_correction(self, mac: str, **fields: Any) -> None:
+        if self.runtime_corrections_path is None:
+            return
+        payload = {
+            "event": "runtime_correction",
+            "timestamp_iso": _timestamp_iso(),
+            "mac": mac,
+            "action": "corrected",
+            **fields,
+        }
+        try:
+            self.runtime_corrections_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.runtime_corrections_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+        except OSError as exc:
+            self.logger.warning(
+                "failed to write runtime correction event to %s: %s",
+                self.runtime_corrections_path,
+                exc,
+            )
 
 
 def trigger_ble_stop_callbacks() -> None:

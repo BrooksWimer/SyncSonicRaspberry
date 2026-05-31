@@ -1,6 +1,6 @@
 import { useSearchParams } from 'expo-router/build/hooks';
 import { Clock3, Pencil, Play, RefreshCw, Volume1, Volume2, VolumeX } from '@tamagui/lucide-icons'
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { StyleSheet, Alert, TouchableOpacity, ScrollView, View, Dimensions, Platform, TextInput } from 'react-native';
 import Slider from '@react-native-community/slider';
 import { useRouter, useNavigation } from 'expo-router';
@@ -122,6 +122,47 @@ export default function SpeakerConfigScreen() {
   // slider scales to (anchor_lag * 1.2 or 4000ms, whichever is larger)
   // so relative slider positions stay meaningful across BT and Wi-Fi.
   const [latestAnchorLagMs, setLatestAnchorLagMs] = useState<number | null>(null);
+  const [runtimeCorrectionCounts, setRuntimeCorrectionCounts] = useState<Record<string, number>>({});
+  const [runtimeCorrectionFlash, setRuntimeCorrectionFlash] = useState<Record<string, boolean>>({});
+  const runtimeCorrectionFlashTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const runtimeCorrectionAnimationTimersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
+
+  const animateLatencyTo = useCallback((mac: string, targetLatencyMs: number) => {
+    if (!Number.isFinite(targetLatencyMs)) return;
+    const startLatencyMs = settings[mac]?.latency ?? targetLatencyMs;
+    const steps = 8;
+    let step = 0;
+    if (runtimeCorrectionAnimationTimersRef.current[mac]) {
+      clearInterval(runtimeCorrectionAnimationTimersRef.current[mac]);
+    }
+    runtimeCorrectionAnimationTimersRef.current[mac] = setInterval(() => {
+      step += 1;
+      const progress = Math.min(1, step / steps);
+      const latency = Math.round(startLatencyMs + ((targetLatencyMs - startLatencyMs) * progress));
+      setSettings(prev => {
+        if (!prev[mac]) return prev;
+        return {
+          ...prev,
+          [mac]: { ...prev[mac], latency },
+        };
+      });
+      if (progress >= 1) {
+        clearInterval(runtimeCorrectionAnimationTimersRef.current[mac]);
+        delete runtimeCorrectionAnimationTimersRef.current[mac];
+      }
+    }, 24);
+  }, [settings]);
+
+  useEffect(() => {
+    return () => {
+      Object.keys(runtimeCorrectionFlashTimersRef.current).forEach(mac => {
+        clearTimeout(runtimeCorrectionFlashTimersRef.current[mac]);
+      });
+      Object.keys(runtimeCorrectionAnimationTimersRef.current).forEach(mac => {
+        clearInterval(runtimeCorrectionAnimationTimersRef.current[mac]);
+      });
+    };
+  }, []);
 
   useEffect(() => {
     const events = calibrationEvents;
@@ -145,6 +186,41 @@ export default function SpeakerConfigScreen() {
       const ev = events[calNotificationCursorRef.current] as Record<string, unknown>;
       calNotificationCursorRef.current += 1;
       const phase = String(ev.phase ?? '');
+
+      if (phase === 'runtime_correction') {
+        const mac = typeof ev.mac === 'string' ? ev.mac : '';
+        const newDelay = Number(ev.new_filter_delay_ms);
+        if (mac && Number.isFinite(newDelay)) {
+          animateLatencyTo(mac, newDelay);
+          setRuntimeCorrectionCounts(prev => ({
+            ...prev,
+            [mac]: (prev[mac] ?? 0) + 1,
+          }));
+          setRuntimeCorrectionFlash(prev => ({
+            ...prev,
+            [mac]: true,
+          }));
+          if (runtimeCorrectionFlashTimersRef.current[mac]) {
+            clearTimeout(runtimeCorrectionFlashTimersRef.current[mac]);
+          }
+          runtimeCorrectionFlashTimersRef.current[mac] = setTimeout(() => {
+            setRuntimeCorrectionFlash(prev => ({
+              ...prev,
+              [mac]: false,
+            }));
+            delete runtimeCorrectionFlashTimersRef.current[mac];
+          }, 900);
+          if (configIDParam) {
+            try {
+              updateSpeakerSettings(
+                Number(configIDParam), mac,
+                settings[mac]?.volume ?? 50, Math.round(newDelay),
+              );
+            } catch (err) { console.warn('persist runtime correction latency failed', err); }
+          }
+        }
+        continue;
+      }
 
       // Reset accumulators at the start of each new sequence. We also
       // treat the first per-speaker `started` event with index 1 as a
@@ -278,7 +354,7 @@ export default function SpeakerConfigScreen() {
       // failed events: surface inline next to the speaker card; do not
       // fire a separate Alert for each.
     }
-  }, [calibrationEvents, connectedSpeakers, configIDParam]);
+  }, [animateLatencyTo, calibrationEvents, connectedSpeakers, configIDParam, settings]);
 
   // Unified slider scale across all cards (BT + Wi-Fi). When any Wi-Fi
   // output is connected we scale every slider to the anchor envelope so
@@ -1241,6 +1317,26 @@ export default function SpeakerConfigScreen() {
                   <Body center={false} bold={true} style={{fontSize: 18, letterSpacing: 1}}>
                     Latency: {settings[mac]?.latency ?? 100} ms
                   </Body>
+                  {(runtimeCorrectionCounts[mac] ?? 0) > 0 && (
+                    <View
+                      style={[
+                        styles.runtimeCorrectionBadge,
+                        {
+                          backgroundColor: runtimeCorrectionFlash[mac] ? green : (themeName === 'dark' ? '#3D2A55' : '#E8DCFA'),
+                          borderColor: runtimeCorrectionFlash[mac] ? green : pc,
+                        },
+                      ]}
+                    >
+                      <Text style={{
+                        fontFamily: 'Finlandica',
+                        fontSize: 12,
+                        fontWeight: 'bold',
+                        color: runtimeCorrectionFlash[mac] ? '#26004E' : tc,
+                      }}>
+                        Runtime corrections: {runtimeCorrectionCounts[mac]}
+                      </Text>
+                    </View>
+                  )}
                   <Slider
                     style={styles.slider}
                     minimumValue={0}
@@ -1556,6 +1652,14 @@ export default function SpeakerConfigScreen() {
       speakerName: { fontSize: 18, marginBottom: 10 },
       label: { fontSize: 15, marginTop: 10, fontWeight: "bold"},
       slider: { width: '100%', height: 40, marginBottom: -5},
+      runtimeCorrectionBadge: {
+        alignSelf: 'center',
+        borderRadius: 8,
+        borderWidth: 1,
+        marginTop: 6,
+        paddingHorizontal: 10,
+        paddingVertical: 4,
+      },
       instructions: { fontSize: 14, marginTop: 10, textAlign: 'center' },
       buttonContainer: { alignItems: "center", flexDirection: 'row', justifyContent: 'space-around', marginTop: 75 },
       saveButton: { backgroundColor: '#3E0094', padding: 15, borderRadius: 8 },

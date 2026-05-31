@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -22,10 +23,16 @@ def _writer(calls: list[tuple[str, str]]):
     return write
 
 
-def _actuator(calls: list[tuple[str, str]], *, mac: str = MAC) -> SpeakerActuator:
+def _actuator(
+    calls: list[tuple[str, str]],
+    *,
+    mac: str = MAC,
+    runtime_corrections_path: Path | str | None = None,
+) -> SpeakerActuator:
     return SpeakerActuator(
         {mac: Path(f"/tmp/{mac.replace(':', '_')}.sock")},
         socket_writer=_writer(calls),
+        runtime_corrections_path=runtime_corrections_path,
     )
 
 
@@ -223,3 +230,23 @@ def test_startup_tune_convergence_with_fixed_target() -> None:
     assert result2.action == "corrected"
     assert result2.delta_ms == -10.0
     assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 110.000")]
+
+
+def test_corrected_action_appends_runtime_correction_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "runtime_corrections.jsonl"
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls, runtime_corrections_path=path)
+    _establish_baseline(actuator)
+
+    result = actuator.apply(MAC, 377.0, 370.0, 20.0)
+
+    assert result.action == "corrected"
+    event = json.loads(path.read_text(encoding="utf-8").strip())
+    assert event["action"] == "corrected"
+    assert event["event"] == "runtime_correction"
+    assert event["mac"] == MAC
+    assert event["measured_latency_ms"] == 377.0
+    assert event["target_total_ms"] == 370.0
+    assert event["current_filter_delay_ms"] == 20.0
+    assert event["delta_ms"] == 7.0
+    assert event["new_filter_delay_ms"] == 13.0

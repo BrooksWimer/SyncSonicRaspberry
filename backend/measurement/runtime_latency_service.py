@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import math
@@ -54,6 +55,11 @@ from typing import Any, Deque, Iterable, Optional
 
 import numpy as np
 
+from measurement.correlation import (
+    build_envelope_template,
+    cross_correlate_envelope,
+    quadratic_peak_interpolation,
+)
 from measurement.service_env import slice4_observe_from_env
 from measurement.slice4_observer import DEFAULT_OBSERVATION_PATH, ObservationWriter
 from measurement.calibration_targets import read_startup_tune_target
@@ -108,6 +114,18 @@ SLICE4_HISTORY_LIMIT = 5
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
 CLOCK_PRIOR_RESET_CYCLES = 3
+
+
+@functools.lru_cache(maxsize=8)
+def _burst_envelope_template(duration_ms: int, carrier_hz_x10: int, sample_rate: int) -> np.ndarray:
+    """Cache burst envelope templates keyed by duration, carrier, and sample rate."""
+    return build_envelope_template(
+        float(duration_ms),
+        float(carrier_hz_x10) / 10.0,
+        sample_rate,
+        mix_low_pass_ms=ENVELOPE_MIX_LOW_PASS_MS,
+        smooth_ms=ENVELOPE_SMOOTH_MS,
+    )
 
 
 def _emit(event: str, **fields: Any) -> None:
@@ -630,6 +648,8 @@ class EnvelopeDetector:
                         "power_db": nearest["power_db"],
                         "snr_db": nearest["snr_db"],
                         "landmark_offset_ms": nearest.get("landmark_offset_ms"),
+                        "precision_us": nearest.get("precision_us"),
+                        "fractional_offset": nearest.get("fractional_offset"),
                     }
                 )
                 total_abs_error += abs(error_samples)
@@ -683,6 +703,11 @@ class EnvelopeDetector:
         offset = first["sample_index"] - base_sample_index
         snrs = [match["snr_db"] for match in best["matched"]]
         powers = [match["power_db"] for match in best["matched"]]
+        precision_values = [
+            match.get("precision_us", 1000.0)
+            for match in best["matched"]
+            if match.get("precision_us") is not None
+        ]
         clock_delta_samples = best["clock_delta_samples"]
         clock_anchor_sample_index = emit_frame_indices[0] + clock_delta_samples
         selected = {
@@ -712,6 +737,8 @@ class EnvelopeDetector:
             "pattern_match_count": len(matches),
             "pattern_rejected_by_clock_count": analysis["pattern_rejected_by_clock_count"],
         }
+        if precision_values:
+            selected["measurement_precision_us"] = float(np.mean(precision_values))
         for key in (
             "envelope_noise_floor_db",
             "envelope_threshold_db",
@@ -851,38 +878,62 @@ class EnvelopeDetector:
             return [], scan
 
         refractory_samples = max(1, int(round(ENVELOPE_REFRACTORY_MS * SAMPLE_RATE / 1000.0)))
-        pre_samples = max(1, int(round(ENVELOPE_EDGE_PRE_MS * SAMPLE_RATE / 1000.0)))
-        post_samples = max(1, int(round(ENVELOPE_EDGE_POST_MS * SAMPLE_RATE / 1000.0)))
         candidates: list[dict[str, Any]] = []
         above = envelope_db >= threshold_db
+
+        template = _burst_envelope_template(
+            int(round(DEFAULT_DURATION_MS)),
+            int(round(carrier_hz * 10)),
+            SAMPLE_RATE,
+        )
+        xcorr, _peak_norm = cross_correlate_envelope(envelope, template)
+        xcorr_zero_lag = len(template) - 1
+
         previous_above = False
         last_sample_index = -refractory_samples
         for idx, is_above in enumerate(above):
             if bool(is_above) and not previous_above:
                 sample_index = base_sample_index + idx
                 if sample_index - last_sample_index >= refractory_samples:
-                    edge_start = max(0, idx - pre_samples)
-                    edge_end = min(len(envelope), idx + post_samples + 1)
-                    edge = envelope[edge_start:edge_end]
-                    if len(edge) >= 2:
-                        slope = np.diff(edge)
-                        slope_idx = int(np.argmax(slope))
-                        landmark_offset = edge_start + slope_idx + 1
-                    else:
-                        landmark_offset = idx
-                    peak_end = min(len(envelope), idx + refractory_samples)
-                    local_peak_db = float(np.max(envelope_db[idx:peak_end])) if peak_end > idx else float(envelope_db[idx])
-                    landmark_sample_index = base_sample_index + landmark_offset
-                    candidates.append(
-                        {
-                            "sample_index": landmark_sample_index,
-                            "threshold_sample_index": sample_index,
-                            "power_db": local_peak_db,
-                            "snr_db": local_peak_db - noise_floor_db,
-                            "landmark_offset_ms": (landmark_offset - idx) * 1000.0 / SAMPLE_RATE,
-                        }
-                    )
-                    last_sample_index = landmark_sample_index
+                    search_half = len(template) // 2 + refractory_samples
+                    xcorr_lo = max(0, xcorr_zero_lag + idx - search_half)
+                    xcorr_hi = min(len(xcorr) - 1, xcorr_zero_lag + idx + search_half)
+                    if xcorr_lo < xcorr_hi:
+                        region = xcorr[xcorr_lo : xcorr_hi + 1]
+                        local_peak_idx_in_region = int(np.argmax(np.abs(region)))
+                        local_peak_idx_in_xcorr = xcorr_lo + local_peak_idx_in_region
+                        frac_peak = quadratic_peak_interpolation(xcorr, local_peak_idx_in_xcorr)
+                        frac_lag = frac_peak - xcorr_zero_lag
+                        frac_sample_index = base_sample_index + frac_lag
+                        landmark_sample_index = int(round(frac_sample_index))
+                        fractional_offset = frac_sample_index - landmark_sample_index
+
+                        peak_val = float(np.abs(xcorr[local_peak_idx_in_xcorr]))
+                        half_val = peak_val * 0.5
+                        left_w = local_peak_idx_in_xcorr
+                        right_w = local_peak_idx_in_xcorr
+                        while left_w > 0 and abs(xcorr[left_w]) >= half_val:
+                            left_w -= 1
+                        while right_w < len(xcorr) - 1 and abs(xcorr[right_w]) >= half_val:
+                            right_w += 1
+                        fwhm_samples = max(1, right_w - left_w)
+                        precision_us = (float(fwhm_samples) * 1e6 / SAMPLE_RATE) / 8.0
+                        precision_us = max(0.5, min(5000.0, precision_us))
+
+                        peak_end = min(len(envelope), idx + refractory_samples)
+                        local_peak_db = float(np.max(envelope_db[idx:peak_end])) if peak_end > idx else float(envelope_db[idx])
+                        candidates.append(
+                            {
+                                "sample_index": landmark_sample_index,
+                                "threshold_sample_index": sample_index,
+                                "power_db": local_peak_db,
+                                "snr_db": local_peak_db - noise_floor_db,
+                                "landmark_offset_ms": (landmark_sample_index - sample_index) * 1000.0 / SAMPLE_RATE,
+                                "precision_us": precision_us,
+                                "fractional_offset": fractional_offset,
+                            }
+                        )
+                        last_sample_index = landmark_sample_index
             previous_above = bool(is_above)
         return candidates, scan
 
@@ -1346,6 +1397,7 @@ class RuntimeSyncService:
             pattern_clock_prior_delta_samples=detection.get("pattern_clock_prior_delta_samples"),
             pattern_clock_prior_error_ms=detection.get("pattern_clock_prior_error_ms"),
             pattern_clock_prior_tolerance_ms=detection.get("pattern_clock_prior_tolerance_ms"),
+            measurement_precision_us=detection.get("measurement_precision_us"),
             clock_prior_reset_remaining=target.clock_prior_reset_remaining,
             envelope_noise_floor_db=detection.get("envelope_noise_floor_db"),
             envelope_threshold_db=detection.get("envelope_threshold_db"),

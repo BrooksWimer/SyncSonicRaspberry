@@ -1317,7 +1317,7 @@ class RuntimeSyncService:
             target,
             current_filter_delay_ms=current_filter_delay_ms,
             measured_latency_ms=latency_ms,
-            target_total_ms=current_filter_delay_ms + float(self.args.bt_codec_latency_ms),
+            target_total_ms=float(self.args.target_total_ms),
         )
         if actuation_result is not None and actuation_result.clock_prior_reset:
             target.last_sample_clock_delta_samples = None
@@ -1475,6 +1475,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration-ms", type=int, default=DEFAULT_DURATION_MS)
     parser.add_argument("--amplitude", type=float, default=DEFAULT_AMPLITUDE)
     parser.add_argument("--bt-codec-latency-ms", type=float, default=DEFAULT_BT_CODEC_LATENCY_MS)
+    parser.add_argument("--target-total-ms", type=float, default=500.0,
+                        help="Fixed wall-clock target latency in ms for every speaker (matches the startup-tune target_total_ms). Default 500.0.")
     parser.add_argument(
         "--detector-mode",
         choices=("peak", "onset", "pattern"),

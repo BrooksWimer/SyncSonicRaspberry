@@ -152,3 +152,28 @@ def test_slider_aware_clock_prior_reset_cycles_still_emitted() -> None:
     assert result.delta_ms == -5.0
     assert result.clock_prior_reset is True
     assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 25.000")]
+
+
+def test_startup_tune_convergence_with_fixed_target() -> None:
+    # Matches the startup-tune semantic verified empirically: target_total_ms is a fixed
+    # reference value; new_filter_delay = current_filter_delay + (target - measured).
+    # A speaker measuring 510ms against a 500ms target with current_filter_delay 100ms
+    # should be told to subtract 10ms of filter delay so its NEXT cycle measures closer
+    # to 500ms.
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    result = actuator.apply(MAC, 510.0, 500.0, 100.0)
+    assert result.action == corrected
+    assert result.delta_ms == 10.0
+    assert calls == [(/tmp/AA_BB_CC_DD_EE_FF.sock, set_delay 90.000)]
+
+    # And the converse: a fast speaker at 490ms vs target 500ms gets MORE filter delay.
+    calls.clear()
+    actuator2 = _actuator(calls)
+    _establish_baseline(actuator2)
+    result2 = actuator2.apply(MAC, 490.0, 500.0, 100.0)
+    assert result2.action == corrected
+    assert result2.delta_ms == -10.0
+    assert calls == [(/tmp/AA_BB_CC_DD_EE_FF.sock, set_delay 110.000)]

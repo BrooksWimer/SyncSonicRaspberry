@@ -65,6 +65,8 @@ from measurement.service_env import slice4_observe_from_env
 from measurement.slice4_observer import DEFAULT_OBSERVATION_PATH, ObservationWriter
 from measurement.slice5_actuator import (
     BURST_AMP_X1000,
+    BURST_AMP_LADDER_X1000,
+    BURST_MISS_ESCALATION_THRESHOLD,
     ActuationResult,
     SpeakerActuator,
     register_ble_stop_callback,
@@ -1030,7 +1032,13 @@ class RuntimeSyncService:
         if self.slice5_actuator is None:
             self.slice5_actuator = SpeakerActuator(sockets)
             register_ble_stop_callback(self.slice5_actuator.emergency_stop)
-            _emit("slice5_actuator_started", speaker_macs=sorted(sockets), burst_amp_x1000=BURST_AMP_X1000)
+            _emit(
+                "slice5_actuator_started",
+                speaker_macs=sorted(sockets),
+                burst_amp_x1000=BURST_AMP_X1000,
+                burst_amp_ladder_x1000=list(BURST_AMP_LADDER_X1000),
+                burst_miss_escalation_threshold=BURST_MISS_ESCALATION_THRESHOLD,
+            )
             return
         self.slice5_actuator.sync_sockets(sockets)
 
@@ -1118,9 +1126,10 @@ class RuntimeSyncService:
         _send_filter_command(target.socket_path, "query_emit_timestamps")
 
         emit_records: list[dict[str, Any]] = []
+        burst_amp_x1000 = self._burst_amp_x1000_for(target)
         emit_payload = (
             f"emit_burst {int(round(self.args.freq_hz * 10))} "
-            f"{int(self.args.duration_ms)} {int(round(self.args.amplitude * 1000))}"
+            f"{int(self.args.duration_ms)} {burst_amp_x1000}"
         )
         pattern_gap_sec = max(
             self.args.pattern_gap_ms / 1000.0,
@@ -1149,6 +1158,7 @@ class RuntimeSyncService:
                 slider_target_delay_samples=target_delay_samples,
                 slider_target_delay_ms=target_delay_ms,
                 pattern_gap_sec=pattern_gap_sec,
+                burst_amp_x1000=burst_amp_x1000,
                 ack=ack,
             )
             if not ack or not ack.get("ok"):
@@ -1189,6 +1199,7 @@ class RuntimeSyncService:
                     "emit_entry_count": len(emit_entries),
                     "detect_start_monotonic": detect_start,
                     "detect_end_monotonic": detect_end,
+                    "burst_amp_x1000": burst_amp_x1000,
                     "stable_count": target.stable_count,
                 },
             )
@@ -1201,6 +1212,7 @@ class RuntimeSyncService:
                 frame_entries=entries,
                 detect_start_monotonic=detect_start,
                 detect_end_monotonic=detect_end,
+                burst_amp_x1000=burst_amp_x1000,
             )
             return
 
@@ -1247,6 +1259,7 @@ class RuntimeSyncService:
                     "pattern_clock_reject_count": pattern_clock_reject_count,
                     "reset_clock_prior": reset_clock_prior,
                     "stable_count": target.stable_count,
+                    "burst_amp_x1000": burst_amp_x1000,
                     "analysis": analysis,
                 },
             )
@@ -1261,6 +1274,7 @@ class RuntimeSyncService:
                 pattern_clock_reject_count=pattern_clock_reject_count,
                 reset_clock_prior=reset_clock_prior,
                 clock_prior_reset_remaining=target.clock_prior_reset_remaining,
+                burst_amp_x1000=burst_amp_x1000,
                 **analysis,
             )
             return
@@ -1311,6 +1325,7 @@ class RuntimeSyncService:
             emit_frame_indices=emit_frame_indices,
             frame_entries=entries,
             stable_count=target.stable_count,
+            burst_amp_x1000=burst_amp_x1000,
             **sample_clock,
         )
         actuation_result = self._apply_slice5_proposal(
@@ -1336,6 +1351,7 @@ class RuntimeSyncService:
                     "pattern_selection_reason": detection.get("pattern_selection_reason"),
                     "pattern_match_count": detection.get("pattern_match_count"),
                     "pattern_rejected_by_clock_count": detection.get("pattern_rejected_by_clock_count"),
+                    "burst_amp_x1000": burst_amp_x1000,
                 },
                 "actuation": (
                     None
@@ -1384,6 +1400,11 @@ class RuntimeSyncService:
             current_filter_delay_ms,
             missed_burst=True,
         )
+
+    def _burst_amp_x1000_for(self, target: SpeakerTarget) -> int:
+        if self.slice5_actuator is None:
+            return int(round(self.args.amplitude * 1000))
+        return self.slice5_actuator.burst_amp_x1000_for(target.mac)
 
     def _apply_slice5_proposal(
         self,

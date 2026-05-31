@@ -16,7 +16,9 @@ from typing import Any, Callable, Mapping, Optional
 
 APPLY_THRESHOLD_MS = 1.0
 FREAK_THRESHOLD_MS = 500.0  # raised from 100 — initial-alignment corrections after manual slider moves can legitimately be 200-400ms; the freak case we want to catch (BT buffer flush) is ~600ms+
-BURST_AMP_X1000 = 300
+BURST_AMP_LADDER_X1000 = (300, 600, 950)
+BURST_MISS_ESCALATION_THRESHOLD = 3
+BURST_AMP_X1000 = BURST_AMP_LADDER_X1000[0]
 SOCKET_TIMEOUT_SEC = 0.25
 
 BleStopCallback = Callable[[], None]
@@ -55,6 +57,8 @@ class SpeakerActuator:
         self.socket_writer = socket_writer or _send_filter_command
         self.logger = logger or logging.getLogger("measurement.slice5_actuator")
         self.baseline_established: dict[str, bool] = {mac: False for mac in self.sockets}
+        self.consecutive_missed_bursts: dict[str, int] = {mac: 0 for mac in self.sockets}
+        self.burst_amp_indices: dict[str, int] = {mac: 0 for mac in self.sockets}
 
     @property
     def states(self) -> dict[str, str]:
@@ -69,6 +73,12 @@ class SpeakerActuator:
     def baseline_for(self, mac: str) -> Optional[float]:
         return 0.0 if self.baseline_established.get(mac.upper(), False) else None
 
+    def burst_amp_x1000_for(self, mac: str) -> int:
+        normalized = mac.upper()
+        self.burst_amp_indices.setdefault(normalized, 0)
+        index = self.burst_amp_indices[normalized]
+        return BURST_AMP_LADDER_X1000[index]
+
     def register_signal_handler(self, signum: int = signal.SIGUSR1) -> None:
         signal.signal(signum, lambda _signum, _frame: self.emergency_stop())
 
@@ -81,6 +91,8 @@ class SpeakerActuator:
             self._log_baseline_reset(mac, "speaker_disconnected")
         for mac in sorted(current):
             self.baseline_established.setdefault(mac, False)
+            self.consecutive_missed_bursts.setdefault(mac, 0)
+            self.burst_amp_indices.setdefault(mac, 0)
         self.sockets = new_sockets
 
     def re_enable(self, mac: Optional[str] = None) -> None:
@@ -100,13 +112,17 @@ class SpeakerActuator:
     ) -> ActuationResult:
         mac = speaker_id.upper()
         self.baseline_established.setdefault(mac, False)
+        self.consecutive_missed_bursts.setdefault(mac, 0)
+        self.burst_amp_indices.setdefault(mac, 0)
         if os.environ.get("MAVERICK_CORRECTION_STOP") == "1":
             self.emergency_stop()
             return ActuationResult(action="emergency_stop", clock_prior_reset=True)
         if missed_burst:
+            self._record_missed_burst(mac)
             return ActuationResult(action="missed", clock_prior_reset=False)
         if not _finite(measured_latency_ms) or not _finite(target_total_ms) or not _finite(current_filter_delay):
             return ActuationResult(action="invalid", clock_prior_reset=False)
+        self.consecutive_missed_bursts[mac] = 0
         if not self.baseline_established[mac]:
             self.baseline_established[mac] = True
             self._log_action(mac, "baseline", measured_latency_ms=measured_latency_ms)
@@ -140,6 +156,26 @@ class SpeakerActuator:
 
     def set_delay(self, speaker_id: str, delay_ms: float) -> Optional[dict[str, Any]]:
         return self._write(speaker_id, f"set_delay {delay_ms:.3f}")
+
+    def _record_missed_burst(self, mac: str) -> None:
+        self.consecutive_missed_bursts[mac] += 1
+        previous_index = self.burst_amp_indices[mac]
+        escalated = False
+        if (
+            self.consecutive_missed_bursts[mac] >= BURST_MISS_ESCALATION_THRESHOLD
+            and previous_index < len(BURST_AMP_LADDER_X1000) - 1
+        ):
+            self.burst_amp_indices[mac] = previous_index + 1
+            self.consecutive_missed_bursts[mac] = 0
+            escalated = True
+        self._log_action(
+            mac,
+            "missed",
+            consecutive_missed_bursts=self.consecutive_missed_bursts[mac],
+            burst_amp_x1000=self.burst_amp_x1000_for(mac),
+            burst_amp_ladder_x1000=list(BURST_AMP_LADDER_X1000),
+            burst_amp_escalated=escalated,
+        )
 
     def emergency_stop(self) -> None:
         started = time.monotonic()

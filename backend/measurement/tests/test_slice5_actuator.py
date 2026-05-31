@@ -8,7 +8,7 @@ _BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from measurement.slice5_actuator import SpeakerActuator  # noqa: E402
+from measurement.slice5_actuator import BURST_AMP_LADDER_X1000, SpeakerActuator  # noqa: E402
 
 
 MAC = "AA:BB:CC:DD:EE:FF"
@@ -89,7 +89,7 @@ def test_freak_outlier_skips_without_corrupting_baseline() -> None:
     actuator = _actuator(calls)
     _establish_baseline(actuator)
 
-    result = actuator.apply(MAC, 500.0, 370.0, 20.0)
+    result = actuator.apply(MAC, 900.0, 370.0, 20.0)
 
     assert result.action == "freak_skip"
     assert result.clock_prior_reset is False
@@ -106,6 +106,53 @@ def test_missed_burst_does_nothing() -> None:
     assert result.action == "missed"
     assert result.clock_prior_reset is False
     assert actuator.baseline_established[MAC] is False
+    assert calls == []
+
+
+def test_burst_amp_escalates_after_three_consecutive_misses_and_sticks() -> None:
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+
+    assert BURST_AMP_LADDER_X1000 == (300, 600, 950)
+    assert actuator.burst_amp_x1000_for(MAC) == 300
+
+    for _idx in range(2):
+        result = actuator.apply(MAC, None, None, 20.0, missed_burst=True)
+        assert result.action == "missed"
+        assert actuator.burst_amp_x1000_for(MAC) == 300
+
+    actuator.apply(MAC, None, None, 20.0, missed_burst=True)
+    assert actuator.burst_amp_x1000_for(MAC) == 600
+
+    actuator.apply(MAC, 370.0, 370.0, 20.0)
+    assert actuator.consecutive_missed_bursts[MAC] == 0
+    assert actuator.burst_amp_x1000_for(MAC) == 600
+
+    for _idx in range(3):
+        actuator.apply(MAC, None, None, 20.0, missed_burst=True)
+    assert actuator.burst_amp_x1000_for(MAC) == 950
+
+    actuator.apply(MAC, 370.0, 370.0, 20.0)
+    assert actuator.burst_amp_x1000_for(MAC) == 950
+    assert calls == []
+
+
+def test_burst_amp_ladder_is_per_speaker() -> None:
+    other = "11:22:33:44:55:66"
+    calls: list[tuple[str, str]] = []
+    actuator = SpeakerActuator(
+        {
+            MAC: Path("/tmp/a.sock"),
+            other: Path("/tmp/b.sock"),
+        },
+        socket_writer=_writer(calls),
+    )
+
+    for _idx in range(3):
+        actuator.apply(MAC, None, None, 20.0, missed_burst=True)
+
+    assert actuator.burst_amp_x1000_for(MAC) == 600
+    assert actuator.burst_amp_x1000_for(other) == 300
     assert calls == []
 
 

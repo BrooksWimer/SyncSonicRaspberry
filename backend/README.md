@@ -173,13 +173,30 @@ journalctl -u syncsonic.service -f
 
 Runtime ultrasonic correction is installed as a separate unit that starts after
 the main SyncSonic service has prepared the audio runtime and speaker filter
-sockets:
+sockets.
+
+**Sparse-checkout note:** the default Pi clone of /home/syncsonic/SyncSonicPi
+uses sparse-checkout and excludes deploy/. If ls deploy/ returns
+"No such file or directory" after git pull, add the directory to the
+sparse pattern first:
+
+```bash
+echo "/deploy/" >> .git/info/sparse-checkout
+git read-tree -mu HEAD
+```
+
+Then install and enable the unit:
 
 ```bash
 sudo cp deploy/runtime-latency.service /etc/systemd/system/runtime-latency.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now runtime-latency.service
 ```
+
+**Venv python:** the unit ExecStart uses
+/home/syncsonic/SyncSonicPi/backend/.venv/bin/python3. Do NOT change this
+to system /usr/bin/python3 — the measurement code requires numpy and
+scipy which only exist in the project venv.
 
 The unit runs as `syncsonic`, requires `syncsonic.service`, and bakes the
 pattern-mode runtime latency arguments directly into `ExecStart`. On boot it

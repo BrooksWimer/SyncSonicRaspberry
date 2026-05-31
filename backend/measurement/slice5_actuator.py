@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 
-APPLY_THRESHOLD_MS = 1.0
+APPLY_THRESHOLD_MS = 15.0  # 2026-05-31: raised from 1.0; measurement noise floor is ~6-8ms 1-sigma; threshold below 15 causes hyper-correction
 FREAK_THRESHOLD_MS = 500.0  # raised from 100 — initial-alignment corrections after manual slider moves can legitimately be 200-400ms; the freak case we want to catch (BT buffer flush) is ~600ms+
 BURST_AMP_LADDER_X1000 = (300, 600, 950)
 BURST_MISS_ESCALATION_THRESHOLD = 3

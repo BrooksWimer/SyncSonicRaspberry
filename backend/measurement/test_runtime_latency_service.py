@@ -18,6 +18,8 @@ from measurement.runtime_latency_service import (  # noqa: E402
     RelativeDriftEstimator,
     RingBuffer,
     SAMPLE_RATE,
+    SpeakerTarget,
+    _consume_clock_prior_reset_window,
 )
 
 
@@ -169,6 +171,62 @@ def test_pattern_detector_rejects_groups_that_jump_outside_clock_prior() -> None
     assert analysis["pattern_rejected_by_clock_count"] == 1
     assert analysis["best_unprioritized_pattern_mean_abs_error_ms"] < 2.0
     assert analysis["best_unprioritized_pattern_clock_prior_error_ms"] > 35.0
+    assert "selected" not in analysis
+
+
+def test_runtime_clock_prior_reset_window_accepts_then_rejects_mismatch() -> None:
+    first = 12_000
+    offsets = [0, 14_336, 28_672]
+    late_jump = 2_400
+    duration = int(0.006 * SAMPLE_RATE)
+    total = first + offsets[-1] + late_jump + duration + 8_000
+    samples = np.zeros(total, dtype=np.float32)
+    for offset in offsets:
+        samples += _tone(first + late_jump + offset, duration, total)
+
+    base_sample = 500_000
+    emit_frames = [1_000_000 + offset for offset in offsets]
+    expected_delta = base_sample + first - emit_frames[0]
+    target = SpeakerTarget(
+        mac="AA:BB:CC:DD:EE:FF",
+        socket_path=Path("/tmp/a.sock"),
+        clock_prior_reset_remaining=3,
+    )
+
+    for remaining in (2, 1, 0):
+        enforce_clock_prior = _consume_clock_prior_reset_window(target, expected_delta)
+        analysis = EnvelopeDetector.analyze_pattern_in_samples(
+            samples,
+            base_time=0.0,
+            base_sample_index=base_sample,
+            noise_floor_db=-90.0,
+            emit_frame_indices=emit_frames,
+            tolerance_ms=5.0,
+            expected_delta_samples=expected_delta,
+            clock_tolerance_ms=20.0,
+            enforce_clock_prior=enforce_clock_prior,
+        )
+
+        assert enforce_clock_prior is False
+        assert target.clock_prior_reset_remaining == remaining
+        assert analysis["selected"]["pattern_selection_reason"] == "clock_prior_reset"
+
+    enforce_clock_prior = _consume_clock_prior_reset_window(target, expected_delta)
+    analysis = EnvelopeDetector.analyze_pattern_in_samples(
+        samples,
+        base_time=0.0,
+        base_sample_index=base_sample,
+        noise_floor_db=-90.0,
+        emit_frame_indices=emit_frames,
+        tolerance_ms=5.0,
+        expected_delta_samples=expected_delta,
+        clock_tolerance_ms=20.0,
+        enforce_clock_prior=enforce_clock_prior,
+    )
+
+    assert enforce_clock_prior is True
+    assert target.clock_prior_reset_remaining == 0
+    assert analysis["reject_reason"] == "clock_prior_mismatch"
     assert "selected" not in analysis
 
 

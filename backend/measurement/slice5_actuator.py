@@ -44,6 +44,7 @@ class ActuationResult:
     actuation_applied_ppm: float
     skip_reason: Optional[str]
     slider_applied_ms: float
+    clock_prior_reset_cycles: int = 0
 
 
 @dataclass
@@ -179,6 +180,11 @@ class SpeakerActuator:
         )
         self._observe_baseline_sample(mac, state, proposal, proposal_warming=proposal_warming)
         slider_applied_ms = self._apply_slider_stage(mac, state, proposal)
+        clock_prior_reset_cycles = (
+            _env_int("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES", 3)
+            if slider_applied_ms != 0.0
+            else 0
+        )
 
         proposed_ppm = _proposal_float(
             proposal,
@@ -207,7 +213,14 @@ class SpeakerActuator:
                     state.state = ACTIVE
             else:
                 state.clean_warmup_cycles = 0
-            return ActuationResult(mac, state.state, 0.0, "WARMING_UP", slider_applied_ms)
+            return ActuationResult(
+                mac,
+                state.state,
+                0.0,
+                "WARMING_UP",
+                slider_applied_ms,
+                clock_prior_reset_cycles,
+            )
 
         if state.state != ACTIVE:
             return self._result(mac, state.state, state.state)
@@ -229,7 +242,14 @@ class SpeakerActuator:
                 separators=(",", ":"),
             )
         )
-        return ActuationResult(mac, state.state, applied_ppm, None, slider_applied_ms)
+        return ActuationResult(
+            mac,
+            state.state,
+            applied_ppm,
+            None,
+            slider_applied_ms,
+            clock_prior_reset_cycles,
+        )
 
     def emergency_stop(self) -> None:
         started = time.monotonic()
@@ -383,8 +403,14 @@ class SpeakerActuator:
 
     def _suspend(self, mac: str, state: _SpeakerState, reason: str) -> None:
         old = state.state
+        if old == ACTIVE:
+            self._write(mac, "set_rate_ppm 0")
+            if state.slider_reference_delay_ms is not None:
+                self._write(mac, f"set_delay {state.slider_reference_delay_ms:.3f}")
         state.state = SUSPENDED
         state.clean_warmup_cycles = 0
+        state.slider_cooldown_cycles = 0
+        state.slider_reference_delay_ms = None
         self._log_transition(mac, old, SUSPENDED, reason)
 
     def _write(self, mac: str, command: str) -> Optional[dict[str, Any]]:

@@ -380,6 +380,7 @@ class SpeakerTarget:
     sample_clock_baseline_samples: Optional[float] = None
     last_sample_clock_delta_samples: Optional[float] = None
     pattern_clock_reject_count: int = 0
+    clock_prior_reset_remaining: int = 0
 
 
 @dataclass
@@ -433,6 +434,7 @@ class EnvelopeDetector:
         min_snr_db: float = PATTERN_MIN_SNR_DB,
         landmark: str = PATTERN_LANDMARK,
         carrier_hz: float = DEFAULT_FREQ_HZ,
+        enforce_clock_prior: bool = True,
     ) -> Optional[dict[str, Any]]:
         analysis = await self.analyze_pattern(
             start_time,
@@ -444,6 +446,7 @@ class EnvelopeDetector:
             min_snr_db=min_snr_db,
             landmark=landmark,
             carrier_hz=carrier_hz,
+            enforce_clock_prior=enforce_clock_prior,
         )
         return analysis.get("selected")
 
@@ -458,6 +461,7 @@ class EnvelopeDetector:
         min_snr_db: float = PATTERN_MIN_SNR_DB,
         landmark: str = PATTERN_LANDMARK,
         carrier_hz: float = DEFAULT_FREQ_HZ,
+        enforce_clock_prior: bool = True,
     ) -> dict[str, Any]:
         window = await self.ring.read_window_with_index(start_time, end_time)
         return self.analyze_pattern_in_samples(
@@ -472,6 +476,7 @@ class EnvelopeDetector:
             min_snr_db=min_snr_db,
             landmark=landmark,
             carrier_hz=carrier_hz,
+            enforce_clock_prior=enforce_clock_prior,
         )
 
     @classmethod
@@ -545,6 +550,7 @@ class EnvelopeDetector:
         min_snr_db: float = PATTERN_MIN_SNR_DB,
         landmark: str = PATTERN_LANDMARK,
         carrier_hz: float = DEFAULT_FREQ_HZ,
+        enforce_clock_prior: bool = True,
     ) -> Optional[dict[str, Any]]:
         analysis = cls.analyze_pattern_in_samples(
             samples,
@@ -558,6 +564,7 @@ class EnvelopeDetector:
             min_snr_db=min_snr_db,
             landmark=landmark,
             carrier_hz=carrier_hz,
+            enforce_clock_prior=enforce_clock_prior,
         )
         return analysis.get("selected")
 
@@ -575,6 +582,7 @@ class EnvelopeDetector:
         min_snr_db: float = PATTERN_MIN_SNR_DB,
         landmark: str = PATTERN_LANDMARK,
         carrier_hz: float = DEFAULT_FREQ_HZ,
+        enforce_clock_prior: bool = True,
     ) -> dict[str, Any]:
         analysis: dict[str, Any] = {
             "candidate_count": 0,
@@ -659,7 +667,7 @@ class EnvelopeDetector:
             return analysis
         best_unprioritized = min(matches, key=lambda match: match["mean_abs_error_samples"])
         analysis.update(cls._pattern_match_debug(best_unprioritized, prefix="best_unprioritized"))
-        if expected_delta_samples is not None:
+        if expected_delta_samples is not None and enforce_clock_prior:
             clock_tolerance_samples = clock_tolerance_ms * SAMPLE_RATE / 1000.0
             viable = [
                 match
@@ -680,7 +688,7 @@ class EnvelopeDetector:
             selection_reason = "clock_prior"
         else:
             best = best_unprioritized
-            selection_reason = "best_spacing"
+            selection_reason = "clock_prior_reset" if expected_delta_samples is not None else "best_spacing"
         first = best["first"]
         offset = first["sample_index"] - base_sample_index
         snrs = [match["snr_db"] for match in best["matched"]]
@@ -1277,6 +1285,16 @@ def _sample_clock_fields(
     }
 
 
+def _consume_clock_prior_reset_window(
+    target: SpeakerTarget,
+    expected_delta_samples: Optional[float],
+) -> bool:
+    if expected_delta_samples is None or target.clock_prior_reset_remaining <= 0:
+        return True
+    target.clock_prior_reset_remaining -= 1
+    return False
+
+
 class RuntimeSyncService:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -1356,6 +1374,9 @@ class RuntimeSyncService:
                         target.mac
                     ].last_sample_clock_delta_samples
                     target.pattern_clock_reject_count = previous[target.mac].pattern_clock_reject_count
+                    target.clock_prior_reset_remaining = previous[
+                        target.mac
+                    ].clock_prior_reset_remaining
             self.state.targets = discovered
             self._sync_slice5_actuator(discovered)
             if not self.state.targets:
@@ -1582,6 +1603,10 @@ class RuntimeSyncService:
 
         emit_frame_indices = [int(entry["frame_index"]) for entry in emit_entries[: self.args.pattern_bursts]]
         clock_prior_delta_samples = target.last_sample_clock_delta_samples
+        enforce_clock_prior = _consume_clock_prior_reset_window(
+            target,
+            clock_prior_delta_samples,
+        )
         analysis = await self.detector.analyze_pattern(
             detect_start,
             detect_end,
@@ -1592,7 +1617,10 @@ class RuntimeSyncService:
             min_snr_db=self.args.pattern_min_snr_db,
             landmark=self.args.pattern_landmark,
             carrier_hz=self.args.freq_hz,
+            enforce_clock_prior=enforce_clock_prior,
         )
+        if not enforce_clock_prior:
+            analysis["clock_prior_reset_remaining"] = target.clock_prior_reset_remaining
         detection = analysis.get("selected")
         if not detection:
             target.stable_count = 0
@@ -1780,7 +1808,10 @@ class RuntimeSyncService:
             "current_filter_delay_ms": current_filter_delay_ms,
             "max_ppm": self.args.max_ppm,
         }
-        return self.slice5_actuator.apply(proposal)
+        result = self.slice5_actuator.apply(proposal)
+        if result.clock_prior_reset_cycles > 0:
+            target.clock_prior_reset_remaining = result.clock_prior_reset_cycles
+        return result
 
     def _record_slice4_observation(
         self,
@@ -1826,6 +1857,7 @@ class RuntimeSyncService:
             "sample_clock_baseline_samples": target.sample_clock_baseline_samples,
             "last_sample_clock_delta_samples": target.last_sample_clock_delta_samples,
             "pattern_clock_reject_count": target.pattern_clock_reject_count,
+            "clock_prior_reset_remaining": target.clock_prior_reset_remaining,
             "baseline_latency_ms": baseline_latency_ms,
             "slider_cooldown_cycles": slider_cooldown_cycles,
         }

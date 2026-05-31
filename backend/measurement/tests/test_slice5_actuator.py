@@ -46,6 +46,29 @@ def _active_actuator(calls: list[tuple[str, str]], *, mac: str = "AA:BB:CC:DD:EE
     return actuator
 
 
+def _active_actuator_with_baseline(
+    calls: list[tuple[str, str]],
+    *,
+    mac: str = "AA:BB:CC:DD:EE:FF",
+) -> SpeakerActuator:
+    actuator = SpeakerActuator(
+        {mac: Path(f"/tmp/{mac.replace(':', '_')}.sock")},
+        baseline_warmup_n=1,
+        warmup_cycles_required=1,
+        socket_writer=_writer(calls),
+    )
+    actuator.apply(
+        _proposal(
+            mac,
+            measured_latency_ms=100.0,
+            current_filter_delay_ms=120.0,
+        )
+    )
+    assert actuator.state_for(mac) == ACTIVE
+    calls.clear()
+    return actuator
+
+
 def test_warming_up_blocks_actuation() -> None:
     calls: list[tuple[str, str]] = []
     actuator = SpeakerActuator(
@@ -130,6 +153,66 @@ def test_auto_suspend_on_high_miss_rate() -> None:
         actuator.apply(_proposal(missed_burst=idx < 4))
 
     assert actuator.state_for("AA:BB:CC:DD:EE:FF") == SUSPENDED
+
+
+def test_auto_suspend_zeros_ppm_and_restores_slider_reference_delay() -> None:
+    calls: list[tuple[str, str]] = []
+    mac = "AA:BB:CC:DD:EE:FF"
+    actuator = _active_actuator_with_baseline(calls, mac=mac)
+
+    actuator.apply(
+        _proposal(
+            mac,
+            measured_latency_ms=140.0,
+            current_filter_delay_ms=120.0,
+            proposed_adjustment_ppm=25.0,
+        )
+    )
+    assert calls == [
+        ("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 80.000"),
+        ("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_rate_ppm 25.000"),
+    ]
+    calls.clear()
+
+    for _idx in range(10):
+        actuator.apply(_proposal(mac, missed_burst=True))
+
+    assert actuator.state_for(mac) == SUSPENDED
+    assert calls == [
+        ("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_rate_ppm 0"),
+        ("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 120.000"),
+    ]
+
+
+def test_slider_fire_reports_default_clock_prior_reset_cycles(monkeypatch) -> None:
+    monkeypatch.delenv("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES", raising=False)
+    calls: list[tuple[str, str]] = []
+    actuator = _active_actuator_with_baseline(calls)
+
+    result = actuator.apply(
+        _proposal(
+            measured_latency_ms=140.0,
+            current_filter_delay_ms=120.0,
+        )
+    )
+
+    assert result.slider_applied_ms == -40.0
+    assert result.clock_prior_reset_cycles == 3
+
+
+def test_slider_fire_reports_configured_clock_prior_reset_cycles(monkeypatch) -> None:
+    monkeypatch.setenv("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES", "5")
+    calls: list[tuple[str, str]] = []
+    actuator = _active_actuator_with_baseline(calls)
+
+    result = actuator.apply(
+        _proposal(
+            measured_latency_ms=140.0,
+            current_filter_delay_ms=120.0,
+        )
+    )
+
+    assert result.clock_prior_reset_cycles == 5
 
 
 def test_emergency_stop_zeros_all_ppm() -> None:

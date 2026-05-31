@@ -1528,7 +1528,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mic-source-prefix", default=DEFAULT_MIC_SOURCE_PREFIX)
     parser.add_argument("--cadence-sec", type=float, default=DEFAULT_CADENCE_SEC)
     parser.add_argument("--warmup-sec", type=float, default=DEFAULT_WARMUP_SEC)
-    parser.add_argument("--max-speakers", type=int, default=2)
+    parser.add_argument("--max-speakers", type=int, default=4)
     parser.add_argument("--freq-hz", type=float, default=DEFAULT_FREQ_HZ)
     parser.add_argument("--duration-ms", type=int, default=DEFAULT_DURATION_MS)
     parser.add_argument("--amplitude", type=float, default=DEFAULT_AMPLITUDE)

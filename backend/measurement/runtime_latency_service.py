@@ -1854,8 +1854,8 @@ async def _amain(argv: Optional[Iterable[str]] = None) -> int:
     if args.slice4_observe:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         args.detector_mode = "pattern"
-    if args.detector_mode == "pattern" and args.pattern_bursts < 2:
-        raise SystemExit("--pattern-bursts must be >= 2 when --detector-mode=pattern")
+    if args.detector_mode == "pattern" and args.pattern_bursts < 1:
+        raise SystemExit("--pattern-bursts must be >= 1")
     service = RuntimeSyncService(args)
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):

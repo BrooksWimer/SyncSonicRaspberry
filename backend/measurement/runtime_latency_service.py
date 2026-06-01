@@ -1395,6 +1395,7 @@ class RuntimeSyncService:
             target.latency_history_ms = target.latency_history_ms[-SLICE4_HISTORY_LIMIT:]
         sample_clock = _sample_clock_fields(target, detection, [emit_entries[0]])
         if _CAPTURE_SESSION is not None:
+            print(f"[slice17-hook] arrival hook fired mac={target.mac}", file=sys.stderr, flush=True)
             asyncio.create_task(_capture_arrival_to_disk(
                 ring=ring,
                 mac=target.mac,
@@ -1758,6 +1759,7 @@ async def _capture_arrival_to_disk(
     sess = _CAPTURE_SESSION
     if sess is None:
         return
+    print(f"[slice17-helper] enter mac={mac} outcome={outcome}", file=sys.stderr, flush=True)
     try:
         # Time bounds. For arrivals we know arrival_monotonic; for misses we use
         # detect_end_monotonic which is the scan window upper bound.
@@ -1785,6 +1787,7 @@ async def _capture_arrival_to_disk(
             wf.setsampwidth(2)
             wf.setframerate(sess.sample_rate)
             wf.writeframes(pcm_i16.tobytes())
+        print(f"[slice17-helper] wrote wav mac={mac}", file=sys.stderr, flush=True)
 
         meta = {
             "schema": 1,

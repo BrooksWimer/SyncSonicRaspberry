@@ -1358,7 +1358,7 @@ class RuntimeSyncService:
                     for e in emit_records
                 ]
                 _enqueue_arrival_capture(
-                    ring=ring,
+                    ring=self.ring,
                     mac=target.mac,
                     detection=_miss_detection,
                     emit_records=_miss_emit_records,
@@ -1396,7 +1396,7 @@ class RuntimeSyncService:
         sample_clock = _sample_clock_fields(target, detection, [emit_entries[0]])
         if _CAPTURE_SESSION is not None:
             _enqueue_arrival_capture(
-                ring=ring,
+                ring=self.ring,
                 mac=target.mac,
                 detection=detection,
                 emit_records=emit_records,

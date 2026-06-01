@@ -1357,7 +1357,7 @@ class RuntimeSyncService:
                     {"emit_monotonic": e.get("emit_monotonic"), "emit_frame_index": e.get("emit_frame_index")}
                     for e in emit_records
                 ]
-                await _capture_arrival_to_disk(
+                asyncio.create_task(_capture_arrival_to_disk(
                     ring=ring,
                     mac=target.mac,
                     detection=_miss_detection,
@@ -1369,7 +1369,7 @@ class RuntimeSyncService:
                     burst_freq_hz=self.args.freq_hz,
                     burst_duration_ms=self.args.duration_ms,
                     reject_reason=reject_reason,
-                )
+                ))
             _emit(
                 "burst_pattern_missed",
                 mac=target.mac,
@@ -1395,7 +1395,7 @@ class RuntimeSyncService:
             target.latency_history_ms = target.latency_history_ms[-SLICE4_HISTORY_LIMIT:]
         sample_clock = _sample_clock_fields(target, detection, [emit_entries[0]])
         if _CAPTURE_SESSION is not None:
-            await _capture_arrival_to_disk(
+            asyncio.create_task(_capture_arrival_to_disk(
                 ring=ring,
                 mac=target.mac,
                 detection=detection,
@@ -1406,7 +1406,7 @@ class RuntimeSyncService:
                 pattern_gap_ms=self.args.pattern_gap_ms,
                 burst_freq_hz=self.args.freq_hz,
                 burst_duration_ms=self.args.duration_ms,
-            )
+            ))
         _emit(
             "burst_pattern_arrival",
             mac=target.mac,

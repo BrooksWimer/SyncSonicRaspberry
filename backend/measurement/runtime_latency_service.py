@@ -1357,7 +1357,7 @@ class RuntimeSyncService:
                     {"emit_monotonic": e.get("emit_monotonic"), "emit_frame_index": e.get("emit_frame_index")}
                     for e in emit_records
                 ]
-                asyncio.create_task(_capture_arrival_to_disk(
+                _enqueue_arrival_capture(
                     ring=ring,
                     mac=target.mac,
                     detection=_miss_detection,
@@ -1369,7 +1369,7 @@ class RuntimeSyncService:
                     burst_freq_hz=self.args.freq_hz,
                     burst_duration_ms=self.args.duration_ms,
                     reject_reason=reject_reason,
-                ))
+                )
             _emit(
                 "burst_pattern_missed",
                 mac=target.mac,
@@ -1395,8 +1395,7 @@ class RuntimeSyncService:
             target.latency_history_ms = target.latency_history_ms[-SLICE4_HISTORY_LIMIT:]
         sample_clock = _sample_clock_fields(target, detection, [emit_entries[0]])
         if _CAPTURE_SESSION is not None:
-            print(f"[slice17-hook] arrival hook fired mac={target.mac}", file=sys.stderr, flush=True)
-            asyncio.create_task(_capture_arrival_to_disk(
+            _enqueue_arrival_capture(
                 ring=ring,
                 mac=target.mac,
                 detection=detection,
@@ -1407,7 +1406,7 @@ class RuntimeSyncService:
                 pattern_gap_ms=self.args.pattern_gap_ms,
                 burst_freq_hz=self.args.freq_hz,
                 burst_duration_ms=self.args.duration_ms,
-            ))
+            )
         _emit(
             "burst_pattern_arrival",
             mac=target.mac,
@@ -1708,15 +1707,21 @@ def _build_parser() -> argparse.ArgumentParser:
 # === Slice 17: raw-mic archive (capture-raw mode) =================================
 import wave as _wave_for_capture
 import datetime as _dt_for_capture
+import threading as _threading_for_capture
+import queue as _queue_for_capture
+
+_CAPTURE_QUEUE: "_queue_for_capture.Queue" = _queue_for_capture.Queue(maxsize=512)
+_CAPTURE_THREAD: Optional["_threading_for_capture.Thread"] = None
+_CAPTURE_DROPPED = 0
+
 
 class _CaptureSession:
-    """Per-run state for slice-17 raw-mic archive. Created in _amain when --capture-raw is set."""
+    """Per-run state for slice-17 raw-mic archive."""
     def __init__(self, parent_dir: str, args_dict: dict):
         self.session_id = _dt_for_capture.datetime.now().strftime("%Y%m%dT%H%M%S")
         self.dir = Path(parent_dir) / self.session_id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.sample_rate = SAMPLE_RATE
-        self.count_written = 0
         manifest = {
             "schema": 1,
             "session_id": self.session_id,
@@ -1730,17 +1735,46 @@ class _CaptureSession:
     def stem_for(self, mac: str, arrival_monotonic: float) -> str:
         return f"{mac.replace(':', '_')}_{int(arrival_monotonic * 1e6)}"
 
-# Module-level singleton (set in _amain when capture is enabled, None otherwise)
+
 _CAPTURE_SESSION: Optional[_CaptureSession] = None
 
 
-async def _capture_arrival_to_disk(
-    ring: RingBuffer,
+def _capture_writer_loop():
+    """Daemon thread: drain _CAPTURE_QUEUE, write WAV+JSON to disk. Never touches asyncio."""
+    while True:
+        try:
+            item = _CAPTURE_QUEUE.get()
+            if item is None:
+                return
+            pcm_i16, meta_dict, sess_dir, stem, sample_rate = item
+            wav_path = sess_dir / f"{stem}.wav"
+            json_path = sess_dir / f"{stem}.json"
+            try:
+                with _wave_for_capture.open(str(wav_path), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(pcm_i16.tobytes())
+                json_path.write_text(json.dumps(meta_dict, indent=2, default=str))
+            except Exception as exc:
+                print(f"[slice17-writer] WAV/JSON write failed stem={stem}: {exc!r}", file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"[slice17-writer] loop exc: {exc!r}", file=sys.stderr, flush=True)
+
+
+def _ensure_capture_thread() -> None:
+    global _CAPTURE_THREAD
+    if _CAPTURE_THREAD is None or not _CAPTURE_THREAD.is_alive():
+        _CAPTURE_THREAD = _threading_for_capture.Thread(target=_capture_writer_loop, name="slice17-writer", daemon=True)
+        _CAPTURE_THREAD.start()
+
+
+def _enqueue_arrival_capture(
+    ring,
     mac: str,
     detection: dict,
     emit_records: list,
-    *,
-    outcome: str,  # "arrival" or "missed"
+    outcome: str,
     burst_amp_x1000: int,
     pattern_bursts: int,
     pattern_gap_ms: float,
@@ -1750,19 +1784,12 @@ async def _capture_arrival_to_disk(
     pre_pad_sec: float = 0.20,
     post_pad_sec: float = 0.30,
 ) -> None:
-    """Slice 17: dump the mic window around a pattern arrival/miss as WAV + JSON sidecar.
-
-    Window spans [first_emit - pre_pad, last_arrival_or_expected + post_pad] so the
-    same archive captures both detected arrivals AND missed-burst windows (for which
-    future detectors might be able to recover a signal we missed today).
-    """
+    """SYNC entry. Snapshots ring chunks (no lock), enqueues to writer thread."""
+    global _CAPTURE_DROPPED
     sess = _CAPTURE_SESSION
     if sess is None:
         return
-    print(f"[slice17-helper] enter mac={mac} outcome={outcome}", file=sys.stderr, flush=True)
     try:
-        # Time bounds. For arrivals we know arrival_monotonic; for misses we use
-        # detect_end_monotonic which is the scan window upper bound.
         emit_t = emit_records[0]["emit_monotonic"]
         if outcome == "arrival":
             end_t = detection["arrival_monotonic"] + post_pad_sec
@@ -1770,25 +1797,26 @@ async def _capture_arrival_to_disk(
             end_t = detection.get("detect_end_monotonic", emit_t + 2.0) + post_pad_sec
         start_t = emit_t - pre_pad_sec
 
-        window = await ring.read_window_with_index(start_t, end_t)
-        if window.samples.size == 0:
+        pieces = []
+        for chunk in list(ring._chunks):
+            if chunk.end_time <= start_t:
+                continue
+            if chunk.start_time >= end_t:
+                break
+            si = max(0, int(math.floor((start_t - chunk.start_time) * ring.sample_rate)))
+            ei = min(len(chunk.samples), int(math.ceil((end_t - chunk.start_time) * ring.sample_rate)))
+            if ei <= si:
+                continue
+            pieces.append(chunk.samples[si:ei])
+        if not pieces:
             return
-
-        # Convert float32 [-1,1] -> int16 PCM for WAV
-        pcm = np.clip(window.samples, -1.0, 1.0)
+        samples = np.concatenate(pieces)
+        if samples.size == 0:
+            return
+        pcm = np.clip(samples, -1.0, 1.0)
         pcm_i16 = (pcm * 32767.0).astype(np.int16)
 
         stem = sess.stem_for(mac, detection.get("arrival_monotonic", emit_t))
-        wav_path = sess.dir / f"{stem}.wav"
-        json_path = sess.dir / f"{stem}.json"
-
-        with _wave_for_capture.open(str(wav_path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sess.sample_rate)
-            wf.writeframes(pcm_i16.tobytes())
-        print(f"[slice17-helper] wrote wav mac={mac}", file=sys.stderr, flush=True)
-
         meta = {
             "schema": 1,
             "mac": mac,
@@ -1797,19 +1825,9 @@ async def _capture_arrival_to_disk(
             "sample_rate": sess.sample_rate,
             "window_start_monotonic": start_t,
             "window_end_monotonic": end_t,
-            "window_start_sample_index": int(getattr(window, "start_index", 0)),
             "window_sample_count": int(pcm_i16.size),
-            "emit_records": [
-                {
-                    "emit_monotonic": r.get("emit_monotonic"),
-                    "emit_frame_index": r.get("emit_frame_index"),
-                }
-                for r in emit_records
-            ],
+            "emit_records": [{"emit_monotonic": r.get("emit_monotonic"), "emit_frame_index": r.get("emit_frame_index")} for r in emit_records],
             "arrival_monotonic": detection.get("arrival_monotonic"),
-            "arrival_sample_index": detection.get("arrival_sample_index"),
-            "matched_arrival_sample_indices": detection.get("matched_arrival_sample_indices"),
-            "matched_error_ms": detection.get("matched_error_ms"),
             "snr_db": detection.get("snr_db"),
             "envelope_noise_floor_db": detection.get("envelope_noise_floor_db"),
             "envelope_peak_db": detection.get("envelope_peak_db"),
@@ -1821,13 +1839,16 @@ async def _capture_arrival_to_disk(
             "pattern_bursts": pattern_bursts,
             "pattern_gap_ms": pattern_gap_ms,
         }
-        json_path.write_text(json.dumps(meta, indent=2, default=str))
-        sess.count_written += 1
-    except Exception as exc:  # noqa: BLE001
-        # Capture is best-effort - never let it crash the measurement loop.
+        try:
+            _CAPTURE_QUEUE.put_nowait((pcm_i16, meta, sess.dir, stem, sess.sample_rate))
+        except _queue_for_capture.Full:
+            _CAPTURE_DROPPED += 1
+    except Exception as exc:
         _emit("capture_raw_error", mac=mac, error=repr(exc))
 
-# === End slice 17 helpers =========================================================
+
+# === End slice 17 helpers ========================================================
+=
 
 async def _amain(argv: Optional[Iterable[str]] = None) -> int:
     args = _build_parser().parse_args(list(argv) if argv is not None else None)
@@ -1846,6 +1867,7 @@ async def _amain(argv: Optional[Iterable[str]] = None) -> int:
     global _CAPTURE_SESSION
     if args.capture_raw:
         _CAPTURE_SESSION = _CaptureSession(args.capture_raw_dir, vars(args))
+        _ensure_capture_thread()
         _emit("slice17_capture_session_started", session_id=_CAPTURE_SESSION.session_id, dir=str(_CAPTURE_SESSION.dir))
     _emit("service_starting", args=vars(args))
     try:

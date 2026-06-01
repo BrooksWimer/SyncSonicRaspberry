@@ -1345,6 +1345,31 @@ class RuntimeSyncService:
                     "analysis": analysis,
                 },
             )
+            if _CAPTURE_SESSION is not None:
+                _miss_detection = {
+                    "detect_end_monotonic": detect_end,
+                    "detect_start_monotonic": detect_start,
+                    "snr_db": analysis.get("envelope_peak_snr_db") if isinstance(analysis, dict) else None,
+                    "envelope_noise_floor_db": analysis.get("envelope_noise_floor_db") if isinstance(analysis, dict) else None,
+                    "envelope_peak_db": analysis.get("envelope_peak_db") if isinstance(analysis, dict) else None,
+                }
+                _miss_emit_records = [
+                    {"emit_monotonic": e.get("emit_monotonic"), "emit_frame_index": e.get("emit_frame_index")}
+                    for e in emit_records
+                ]
+                await _capture_arrival_to_disk(
+                    ring=ring,
+                    mac=target.mac,
+                    detection=_miss_detection,
+                    emit_records=_miss_emit_records,
+                    outcome="missed",
+                    burst_amp_x1000=burst_amp_x1000,
+                    pattern_bursts=self.args.pattern_bursts,
+                    pattern_gap_ms=self.args.pattern_gap_ms,
+                    burst_freq_hz=self.args.freq_hz,
+                    burst_duration_ms=self.args.duration_ms,
+                    reject_reason=reject_reason,
+                )
             _emit(
                 "burst_pattern_missed",
                 mac=target.mac,
@@ -1369,6 +1394,19 @@ class RuntimeSyncService:
         if len(target.latency_history_ms) > SLICE4_HISTORY_LIMIT:
             target.latency_history_ms = target.latency_history_ms[-SLICE4_HISTORY_LIMIT:]
         sample_clock = _sample_clock_fields(target, detection, [emit_entries[0]])
+        if _CAPTURE_SESSION is not None:
+            await _capture_arrival_to_disk(
+                ring=ring,
+                mac=target.mac,
+                detection=detection,
+                emit_records=emit_records,
+                outcome="arrival",
+                burst_amp_x1000=burst_amp_x1000,
+                pattern_bursts=self.args.pattern_bursts,
+                pattern_gap_ms=self.args.pattern_gap_ms,
+                burst_freq_hz=self.args.freq_hz,
+                burst_duration_ms=self.args.duration_ms,
+            )
         _emit(
             "burst_pattern_arrival",
             mac=target.mac,
@@ -1592,6 +1630,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Fixed wall-clock target latency in ms for every speaker (matches the startup-tune target_total_ms). Default 500.0.")
     parser.add_argument("--observe-only", action="store_true",
                         help="Slice-16 drift characterization: emit bursts, log measured_latency_ms, but skip actuator.apply(). CSV still written. Use for natural-drift soak experiments.")
+    parser.add_argument("--capture-raw", action="store_true",
+                        help="Slice-17 raw-mic archive: per burst arrival (or miss), write a WAV slice of the mic window + JSON sidecar with all detector metadata. Re-analyzable by any future detector.")
+    parser.add_argument("--capture-raw-dir", type=str, default="/var/lib/syncsonic/observe-raw",
+                        help="Parent directory for slice-17 raw-mic capture sessions. Each run gets its own timestamped subdirectory.")
     parser.add_argument(
         "--detector-mode",
         choices=("peak", "onset", "pattern"),
@@ -1660,6 +1702,130 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+
+# === Slice 17: raw-mic archive (capture-raw mode) =================================
+import wave as _wave_for_capture
+import datetime as _dt_for_capture
+
+class _CaptureSession:
+    """Per-run state for slice-17 raw-mic archive. Created in _amain when --capture-raw is set."""
+    def __init__(self, parent_dir: str, args_dict: dict):
+        self.session_id = _dt_for_capture.datetime.now().strftime("%Y%m%dT%H%M%S")
+        self.dir = Path(parent_dir) / self.session_id
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.sample_rate = SAMPLE_RATE
+        self.count_written = 0
+        manifest = {
+            "schema": 1,
+            "session_id": self.session_id,
+            "started_unix": time.time(),
+            "started_iso": _dt_for_capture.datetime.now().isoformat(),
+            "sample_rate": SAMPLE_RATE,
+            "args": args_dict,
+        }
+        (self.dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    def stem_for(self, mac: str, arrival_monotonic: float) -> str:
+        return f"{mac.replace(':', '_')}_{int(arrival_monotonic * 1e6)}"
+
+# Module-level singleton (set in _amain when capture is enabled, None otherwise)
+_CAPTURE_SESSION: Optional[_CaptureSession] = None
+
+
+async def _capture_arrival_to_disk(
+    ring: RingBuffer,
+    mac: str,
+    detection: dict,
+    emit_records: list,
+    *,
+    outcome: str,  # "arrival" or "missed"
+    burst_amp_x1000: int,
+    pattern_bursts: int,
+    pattern_gap_ms: float,
+    burst_freq_hz: float,
+    burst_duration_ms: int,
+    reject_reason: Optional[str] = None,
+    pre_pad_sec: float = 0.20,
+    post_pad_sec: float = 0.30,
+) -> None:
+    """Slice 17: dump the mic window around a pattern arrival/miss as WAV + JSON sidecar.
+
+    Window spans [first_emit - pre_pad, last_arrival_or_expected + post_pad] so the
+    same archive captures both detected arrivals AND missed-burst windows (for which
+    future detectors might be able to recover a signal we missed today).
+    """
+    sess = _CAPTURE_SESSION
+    if sess is None:
+        return
+    try:
+        # Time bounds. For arrivals we know arrival_monotonic; for misses we use
+        # detect_end_monotonic which is the scan window upper bound.
+        emit_t = emit_records[0]["emit_monotonic"]
+        if outcome == "arrival":
+            end_t = detection["arrival_monotonic"] + post_pad_sec
+        else:
+            end_t = detection.get("detect_end_monotonic", emit_t + 2.0) + post_pad_sec
+        start_t = emit_t - pre_pad_sec
+
+        window = await ring.read_window_with_index(start_t, end_t)
+        if window.samples.size == 0:
+            return
+
+        # Convert float32 [-1,1] -> int16 PCM for WAV
+        pcm = np.clip(window.samples, -1.0, 1.0)
+        pcm_i16 = (pcm * 32767.0).astype(np.int16)
+
+        stem = sess.stem_for(mac, detection.get("arrival_monotonic", emit_t))
+        wav_path = sess.dir / f"{stem}.wav"
+        json_path = sess.dir / f"{stem}.json"
+
+        with _wave_for_capture.open(str(wav_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sess.sample_rate)
+            wf.writeframes(pcm_i16.tobytes())
+
+        meta = {
+            "schema": 1,
+            "mac": mac,
+            "outcome": outcome,
+            "reject_reason": reject_reason,
+            "sample_rate": sess.sample_rate,
+            "window_start_monotonic": start_t,
+            "window_end_monotonic": end_t,
+            "window_start_sample_index": int(getattr(window, "start_index", 0)),
+            "window_sample_count": int(pcm_i16.size),
+            "emit_records": [
+                {
+                    "emit_monotonic": r.get("emit_monotonic"),
+                    "emit_frame_index": r.get("emit_frame_index"),
+                }
+                for r in emit_records
+            ],
+            "arrival_monotonic": detection.get("arrival_monotonic"),
+            "arrival_sample_index": detection.get("arrival_sample_index"),
+            "matched_arrival_sample_indices": detection.get("matched_arrival_sample_indices"),
+            "matched_error_ms": detection.get("matched_error_ms"),
+            "snr_db": detection.get("snr_db"),
+            "envelope_noise_floor_db": detection.get("envelope_noise_floor_db"),
+            "envelope_peak_db": detection.get("envelope_peak_db"),
+            "pattern_clock_delta_spread_ms": detection.get("pattern_clock_delta_spread_ms"),
+            "pattern_mean_abs_error_ms": detection.get("pattern_mean_abs_error_ms"),
+            "burst_amp_x1000": burst_amp_x1000,
+            "burst_freq_hz": burst_freq_hz,
+            "burst_duration_ms": burst_duration_ms,
+            "pattern_bursts": pattern_bursts,
+            "pattern_gap_ms": pattern_gap_ms,
+        }
+        json_path.write_text(json.dumps(meta, indent=2, default=str))
+        sess.count_written += 1
+    except Exception as exc:  # noqa: BLE001
+        # Capture is best-effort - never let it crash the measurement loop.
+        _emit("capture_raw_error", mac=mac, error=repr(exc))
+
+# === End slice 17 helpers =========================================================
+
 async def _amain(argv: Optional[Iterable[str]] = None) -> int:
     args = _build_parser().parse_args(list(argv) if argv is not None else None)
     if args.slice4_observe:
@@ -1674,6 +1840,10 @@ async def _amain(argv: Optional[Iterable[str]] = None) -> int:
             loop.add_signal_handler(signum, service.stop_event.set)
     with contextlib.suppress(NotImplementedError):
         loop.add_signal_handler(signal.SIGUSR1, service.emergency_stop)
+    global _CAPTURE_SESSION
+    if args.capture_raw:
+        _CAPTURE_SESSION = _CaptureSession(args.capture_raw_dir, vars(args))
+        _emit("slice17_capture_session_started", session_id=_CAPTURE_SESSION.session_id, dir=str(_CAPTURE_SESSION.dir))
     _emit("service_starting", args=vars(args))
     try:
         await service.run()

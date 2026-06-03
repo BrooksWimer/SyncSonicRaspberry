@@ -17,7 +17,7 @@ from typing import Any, Callable, Mapping, Optional
 APPLY_THRESHOLD_MS = 30.0  # 2026-05-31 iter 2: raised 15->30 based on empirical 57-min run showing ~50% cycles still correcting at 15ms; 30 is final value for current measurement-precision regime, future work upgrades the measurement protocol
 FREAK_THRESHOLD_MS = 500.0  # raised from 100 — initial-alignment corrections after manual slider moves can legitimately be 200-400ms; the freak case we want to catch (BT buffer flush) is ~600ms+
 BURST_AMP_LADDER_X1000 = (300, 600, 950)
-BURST_MISS_ESCALATION_THRESHOLD = 3
+BURST_MISS_ESCALATION_THRESHOLD = 1  # slice 18: smart adjustment - escalate on every miss, drop on every success
 BURST_AMP_X1000 = BURST_AMP_LADDER_X1000[0]
 SOCKET_TIMEOUT_SEC = 0.25
 RUNTIME_CORRECTIONS_PATH = Path("/run/syncsonic/runtime_corrections.jsonl")
@@ -127,7 +127,24 @@ class SpeakerActuator:
             return ActuationResult(action="missed", clock_prior_reset=False)
         if not _finite(measured_latency_ms) or not _finite(target_total_ms) or not _finite(current_filter_delay):
             return ActuationResult(action="invalid", clock_prior_reset=False)
+        # Slice 18 smart-adjustment: on successful detection, drop one rung down the
+        # amplitude ladder (no lower than baseline). Symmetric to escalation in
+        # _record_missed_burst, so steady-state at the lowest amp that keeps the
+        # speaker detectable. Audibility regression fix.
+        previous_amp_index = self.burst_amp_indices.get(mac, 0)
+        de_escalated = False
+        if previous_amp_index > 0:
+            self.burst_amp_indices[mac] = previous_amp_index - 1
+            de_escalated = True
         self.consecutive_missed_bursts[mac] = 0
+        if de_escalated:
+            self._log_action(
+                mac,
+                "amp_de_escalated",
+                previous_amp_x1000=BURST_AMP_LADDER_X1000[previous_amp_index],
+                burst_amp_x1000=self.burst_amp_x1000_for(mac),
+                burst_amp_ladder_x1000=list(BURST_AMP_LADDER_X1000),
+            )
         if not self.baseline_established[mac]:
             self.baseline_established[mac] = True
             self._log_action(mac, "baseline", measured_latency_ms=measured_latency_ms)

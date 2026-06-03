@@ -548,3 +548,28 @@ Process correction: exploratory work was staged on
 `codex/ultrasonic-sample-clock-pattern`. Canonical review/merge must happen from
 a Maverick workstream branch targeting `ultrasonic-runtime-sync`; do not merge
 the `codex/*` branch directly.
+
+## 2026-06-03 — M5 ultrasonic-runtime-sync reached production-effective state
+
+After an iterative design conversation spanning slices 15-18 (cross-correlation detector, observe-only drift characterization, raw-mic archive, single-burst sparse cadence, symmetric amp ladder, confidence-gated actuation), the closed-loop ultrasonic alignment system is functioning as a fully-integrated production tool on the operator's 2-BT-speaker setup. Operator framing: "we have a very strong fully fleshed out tool."
+
+**Architectural journey:**
+
+- **Slice 15 (cross-correlation upgrade)** brought single-measurement precision to sub-millisecond via template-matched xcorr + quadratic sub-sample interpolation. Verified live: 0.4 ms median precision_us at SNR floor.
+- **Slice 16 (observe-only mode)** enabled drift characterization without controller interference. Subsequent 62-hour soak showed essentially zero slow drift (≤0.2 ms/min) on both speakers.
+- **Slice 17 (raw-mic capture archive)** persists every burst arrival as WAV + JSON sidecar so any future detector can re-analyze the same physical signal. 650 MB / 7,277 captures already accumulated.
+- **Slice 18 (single-burst sparse-cadence)** replaced 3-burst-at-300ms-spacing with a single isolated burst per 30-second cycle. Eliminated the ~100 ms artifacts that the close-spaced pattern matcher was producing (mis-locks to wrong burst, room-echo confusion). Cycle-to-cycle std dropped 42 ms -> 15 ms on 2C:FD (3x).
+- **Slice 18 smart amp adjustment** made the slice-9 amplitude ladder symmetric: one rung up on every miss, one rung down on every success. Eliminated the sticky-at-950 audibility regression that had caused bursts to become audible after the ladder escalated and never came back down.
+- **Slice 18.2 confidence-gated actuation** sources corrections from median of a sliding 5-measurement window per speaker, gated by both an absolute 30 ms apply threshold AND a 2-sigma noise-floor gate (correction only fires if signal exceeds 2x window std). Live verified: zero corrections during a 15-minute window when measurement noise was high; system audibly transparent.
+
+**Empirical findings worth remembering:**
+
+- **Apparent 100-200 ms "jumps" in earlier 3-burst data were detector artifacts**, not real physical events. Operator audibility check exposed this: a real 100+ ms latency jump on one of two paired speakers would be catastrophically audible (slap-back, clicks), and operator did not hear them.
+- **Cross-speaker analysis confirmed jumps are independent per-speaker** (0% coincidence vs 11% random baseline) — BT codec internal buffer re-anchoring, not common-mode pipeline issues. F4:6A and 2C:FD had their own independent jumpy windows that did not align.
+- **Long-window drift is essentially zero** at this timescale. BT speakers hold their position over hours; continuous tight-cadence correction was over-engineered for the actual drift pattern.
+
+**What this means architecturally:** the bottleneck was always measurement precision and detector ambiguity, not the speakers themselves. Once measurement quality (slice 15) and discriminator design (slice 18) were correct, the closed-loop became silent and stable.
+
+**Future exploration documented in `epics/ultrasonic-runtime-sync.md`** — six areas of potential improvement (xcorr precision, frequency adaptation, raw-mic analysis tooling, 24-hour soak, WiFi PipeWire integration, adaptive cadence). Operator decision 2026-06-03: not filed as committed workstreams. Only the WiFi integration is flagged as potentially warranting real workstream status eventually, and even there the architectural shape is undecided.
+
+**Epic promotion gate:** ultrasonic-runtime-sync epic remains unmerged to main as of 2026-06-03. Promotion is a separate operator-triggered step; not on this entry's critical path.

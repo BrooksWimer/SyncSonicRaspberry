@@ -6,6 +6,50 @@ _The strategic context — why runtime correction matters, why ultrasonic vs in-
 
 Close the loop between speakers continuously while music plays. Today's calibration is a discrete event triggered by a button press; this epic adds inaudible runtime correction that absorbs the 20–80 ppm BT clock drift before it becomes audible — without the operator pressing anything.
 
+## Status — Production-effective as of 2026-06-03
+
+The runtime closed-loop ultrasonic alignment system is in **production-effective steady state**. After ~3 days of continuous operation (62 hours, 6,786 captured measurements on Pi 10.0.0.89) and live operator listening tests, the system holds 2-speaker BT alignment within ~15 ms one-sigma without operator intervention, generates zero audible artifacts in steady state, and self-recovers from amplitude-detection failures.
+
+### What's shipping (architecture summary)
+
+**Measurement primitive (slices 15, 18)** — single-burst ultrasonic emission at 18.5 kHz with sparse 30-second cadence per speaker. Time-of-arrival measured via cross-correlation against an analytically-synthesized envelope template, with quadratic sub-sample peak interpolation. Empirical precision: sub-millisecond at SNR >= 9 dB (slice 15 design target), measured median 0.4 ms across capture archive.
+
+**Adaptive amplitude (slice 9 + slice 18 smart adjustment)** — per-speaker amplitude ladder `(300, 600, 950)` with **symmetric step-on-miss / step-on-success**. A miss escalates one rung, a success drops one rung. Steady-state operation settles at the lowest rung that maintains detection — amp 300 (the slice-4-validated inaudibility floor) on cooperative speakers, with brief escalation only when bursts genuinely miss.
+
+**Confidence-gated actuation (slice 18.2)** — corrections are derived from the median of a sliding 5-measurement window per speaker, not from individual readings. Two thresholds must both be exceeded for a correction to fire: the absolute apply-threshold (30 ms) AND a noise-floor gate (2x window standard deviation). The window resets on every applied correction. The system therefore self-throttles during noisy stretches and only acts when the evidence is consistent across multiple measurements.
+
+**Single-burst detection (slice 18)** — replaced the 3-burst-at-300ms-spacing pattern with a single isolated burst per cycle. This eliminated the ~100 ms detector artifacts visible in earlier 3-burst data, where the matcher could lock onto wrong bursts within the pattern or get confused by lingering room echoes. Empirical impact: 2C:FD cycle-to-cycle std improved from 42 ms to 15 ms (3x); jumps >100 ms dropped from 29% of cycles to 0.06%.
+
+**Persistent target (slice 11)** — runtime reads `target_total_ms` from the same persistence file the BLE startup-tune writes, so runtime and calibration stay synchronized when the operator changes the target.
+
+**Frontend transmission (slice 14)** — every applied correction surfaces to the React Native frontend via BLE `CALIBRATION_RESULT` with `phase='runtime_correction'`. Phone app animates the per-speaker slider in real time.
+
+**Permanent systemd unit + startup gate (slice 12)** — runtime-latency lives at `/etc/systemd/system/runtime-latency.service`, auto-starts after `syncsonic.service` when speakers are connected, exits cleanly after 5-minute timeout if no speakers join.
+
+**Raw-mic archive (slice 17)** — every burst arrival and miss is captured as a WAV file with JSON sidecar at `/var/lib/syncsonic/observe-raw/<session_id>/`, enabling any future detector improvement to be re-analyzed against the same physical signal. Already accumulated a 62-hour reference archive (650 MB / 7,277 captures).
+
+### Empirical verification record
+
+- **3-day soak (62.3 hours, 2 BT speakers, single-burst mode):** F4:6A median latency 499 ms, std 15.6 ms; 2C:FD median 502 ms, std 14.6 ms; cycle-to-cycle |delta| median ~9 ms.
+- **Jump frequency:** ≥100 ms cycle-to-cycle jumps occur in 0.06–0.17% of cycles. Cross-speaker correlation analysis (0% coincidence vs 11% baseline) confirms jumps are independent per-speaker BT codec internal-buffer behavior, not common-mode pipeline issues.
+- **Long-window drift:** essentially zero (≤0.2 ms/min). Real physical drift on these speakers is below the level our measurement can resolve cleanly.
+- **Live confidence-gate test (2026-06-03, 15 minutes):** zero corrections fired while window standard deviation was high; operator confirmed bursts inaudible in steady state and system audibly transparent.
+- **Operator framing 2026-06-03:** "we have a very strong fully fleshed out tool."
+
+## Future exploration
+
+The system is production-effective for the 2-speaker BT case at the operator's hardware. Areas where further work would improve the system but are explicitly not committed work-streams as of 2026-06-03:
+
+- **Cross-correlation precision improvements / measurement protocol research.** Slice 15 brought single-measurement precision to sub-millisecond; further detector work (longer integration as a "stage-1 join measurement", template tuning, better noise estimation) could enable lower apply thresholds and faster drift response.
+- **Frequency adaptation for bandwidth-limited BT speakers.** Some BT speakers brick-wall filter above ~16 kHz; F4:6A showed marginal SNR at 18.5 kHz on the operator's hardware. A fallback frequency ladder (drop to 17 / 16 kHz before resorting to audible chirp) would handle these without sticky-amp-950 audibility regressions.
+- **Raw-mic-archive analysis tooling.** The slice-17 archive is sitting unused; building a small re-analysis workflow against it would let any future detector be validated retroactively without recapturing data.
+- **24-hour soak validation.** The 62-hour single-burst-mode soak already approximates this; a formal 24-hour music session under varied acoustic conditions with structured pass/fail criteria remains as a polish item before formal epic promotion to main.
+- **WiFi speaker PipeWire integration.** Current implementation only sees speakers that have a `pw_delay_filter` socket; WiFi (Sonos / AirPlay / RAOP) speakers are out-of-band and the closed-loop has nothing to correct. This is the single most architecturally significant gap for true heterogeneous-transport setups. Operator notes it is the only future-exploration item that might warrant a real workstream eventually, but no commitment as of 2026-06-03 — there is open design space about whether PipeWire integration is even the right approach versus a separate trust-the-protocol design for WiFi.
+- **Adaptive measurement cadence.** Drift data confirms steady-state behavior is stable for long windows; slow cadence (60-120 sec) with fast cadence (5-10 sec) post-jump-detection would reduce burst emission rate and amp-ladder thrashing in normal operation.
+
+These are not committed slices. They are recorded here so future planning sessions have empirical context for whether to pick them up.
+
+
 ## Why This Lane Exists
 
 The coordinated engine ships with two Slice 2 + Slice 4 capabilities that almost solve runtime correction: an elastic delay engine that accepts smooth `set_rate_ppm` adjustments (no graph xrun), and a cross-correlation analyzer that can measure inter-speaker offset from a mic capture. What's missing is a continuous loop that emits an inaudible probe signal, measures its lag-per-speaker, and feeds bounded rate adjustments back to the elastic engine — all while music is playing.

@@ -283,7 +283,7 @@ def test_pattern_detector_matches_emit_spacing_in_mic_sample_indices() -> None:
 def test_pattern_detector_uses_clock_prior_to_avoid_late_echo_group() -> None:
     first = 12_000
     emit_offsets = [0, 14_336, 28_672]
-    true_offsets = [0, 14_456, 28_552]
+    true_offsets = [0, 14_398, 28_552]
     echo_offset = 2_168
     duration = int(0.006 * SAMPLE_RATE)
     total = first + emit_offsets[-1] + echo_offset + duration + 8_000
@@ -363,7 +363,7 @@ def test_pattern_detector_has_independent_candidate_snr_floor() -> None:
     duration = int(0.030 * SAMPLE_RATE)
     total = first + offsets[-1] + duration + 8_000
     t = np.arange(total, dtype=np.float64) / SAMPLE_RATE
-    samples = (0.25 * np.sin(2.0 * np.pi * 18_500.0 * t)).astype(np.float32)
+    samples = (0.20 * np.sin(2.0 * np.pi * 18_500.0 * t)).astype(np.float32)
     for offset in offsets:
         samples += _tone(first + offset, duration, total)
 

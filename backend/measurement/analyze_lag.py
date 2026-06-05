@@ -56,6 +56,23 @@ import numpy as np
 from measurement.correlation import quadratic_peak_interpolation as _qpi
 
 
+def _fft_correlate_full(
+    a: np.ndarray,
+    b: np.ndarray,
+    mode: str = "full",
+    method: str = "fft",
+) -> np.ndarray:
+    if mode != "full" or method != "fft":
+        raise ValueError("NumPy fallback only supports full FFT correlation")
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros(max(0, len(a) + len(b) - 1), dtype=np.float64)
+    out_len = len(a) + len(b) - 1
+    fft_len = 1 << (out_len - 1).bit_length()
+    spectrum_a = np.fft.fft(a, fft_len)
+    spectrum_b = np.fft.fft(b[::-1], fft_len)
+    return np.fft.ifft(spectrum_a * spectrum_b).real[:out_len]
+
+
 @dataclass
 class LagEstimate:
     """Result of one cross-correlation analysis.
@@ -177,11 +194,13 @@ def estimate_lag_samples(
     ref = _normalize(_to_mono(reference))
     cap = _normalize(_to_mono(captured))
 
-    # Use scipy.signal.correlate for FFT-based fast convolution; this
-    # is the only place we depend on scipy. ``method='fft'`` is the
-    # default for sufficiently large inputs but we set it explicitly
-    # to make the performance characteristic obvious.
-    from scipy.signal import correlate
+    # Prefer scipy.signal.correlate for the Pi/backend venv, but keep a NumPy
+    # FFT-compatible fallback so measurement tests still exercise the analyzer
+    # in lightweight CI images that have NumPy but not SciPy.
+    try:
+        from scipy.signal import correlate
+    except ImportError:  # pragma: no cover - covered by environments without SciPy.
+        correlate = _fft_correlate_full
 
     # ``correlate(cap, ref, mode='full')`` returns an array of length
     # len(cap) + len(ref) - 1 where index i corresponds to lag

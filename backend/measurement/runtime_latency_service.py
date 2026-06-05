@@ -922,13 +922,24 @@ class EnvelopeDetector:
 
                         peak_end = min(len(envelope), idx + refractory_samples)
                         local_peak_db = float(np.max(envelope_db[idx:peak_end])) if peak_end > idx else float(envelope_db[idx])
+                        landmark_offset_ms = (
+                            (landmark_sample_index - sample_index) * 1000.0 / SAMPLE_RATE
+                        )
+                        if (
+                            landmark_offset_ms < -ENVELOPE_EDGE_PRE_MS
+                            or landmark_offset_ms > ENVELOPE_EDGE_POST_MS
+                        ):
+                            landmark_sample_index = sample_index
+                            fractional_offset = 0.0
+                            landmark_offset_ms = 0.0
+
                         candidates.append(
                             {
                                 "sample_index": landmark_sample_index,
                                 "threshold_sample_index": sample_index,
                                 "power_db": local_peak_db,
                                 "snr_db": local_peak_db - noise_floor_db,
-                                "landmark_offset_ms": (landmark_sample_index - sample_index) * 1000.0 / SAMPLE_RATE,
+                                "landmark_offset_ms": landmark_offset_ms,
                                 "precision_us": precision_us,
                                 "fractional_offset": fractional_offset,
                             }

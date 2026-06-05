@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from pathlib import Path
 from typing import Any, Dict
 
 import dbus
@@ -25,6 +26,9 @@ from syncsonic_ble.utils.constants import (
 from syncsonic_ble.utils.logging_conf import get_logger
 
 logger = get_logger(__name__)
+ULTRASONIC_EXCLUDED_PATH = Path(
+    os.environ.get("SYNCSONIC_ULTRASONIC_EXCLUDED_PATH", "/run/syncsonic/ultrasonic_excluded.json")
+)
 
 
 def _encode(msg: Msg, payload: Dict[str, Any]):
@@ -246,6 +250,58 @@ def handle_set_mute(char, data):
 
     subprocess.run(["pactl", "set-sink-mute", sink_name, "1" if mute else "0"], check=True)
     return _encode(Msg.SUCCESS, {"mac": mac, "mute": mute})
+
+
+def _read_ultrasonic_excluded(path: Path = ULTRASONIC_EXCLUDED_PATH) -> set[str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+    excluded = payload.get("excluded_macs", [])
+    if not isinstance(excluded, list):
+        return set()
+    return {str(mac).upper() for mac in excluded if mac}
+
+
+def _write_ultrasonic_excluded(excluded: set[str], path: Path = ULTRASONIC_EXCLUDED_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"excluded_macs": sorted(excluded)}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def handle_set_ultrasonic_participation(char, data):
+    mac = data.get("mac")
+    if not mac:
+        return _encode(Msg.ERROR, {"error": "Missing mac"})
+    included = data.get("included")
+    if included is None:
+        return _encode(Msg.ERROR, {"error": "Missing included"})
+    mac_u = str(mac).upper()
+    excluded = _read_ultrasonic_excluded()
+    if bool(included):
+        excluded.discard(mac_u)
+    else:
+        excluded.add(mac_u)
+    try:
+        _write_ultrasonic_excluded(excluded)
+    except OSError as exc:
+        logger.exception("Failed to update ultrasonic participation file")
+        return _encode(Msg.ERROR, {"error": f"Failed to update ultrasonic participation: {exc}"})
+    emit(EventType.SET_LATENCY_REQUEST, {
+        "mac": mac_u,
+        "ultrasonic_included": bool(included),
+        "control_path": str(ULTRASONIC_EXCLUDED_PATH),
+    })
+    return _encode(
+        Msg.SUCCESS,
+        {
+            "mac": mac_u,
+            "included": bool(included),
+            "excluded_macs": sorted(excluded),
+        },
+    )
 
 
 def _scan_start(char, _):
@@ -504,6 +560,7 @@ HANDLERS = {
     Msg.SET_VOLUME: handle_set_volume,
     Msg.GET_PAIRED_DEVICES: handle_get_paired,
     Msg.SET_MUTE: handle_set_mute,
+    Msg.SET_ULTRASONIC_PARTICIPATION: handle_set_ultrasonic_participation,
     Msg.ULTRASONIC_SYNC: handle_ultrasonic_sync,
     Msg.CALIBRATE_SPEAKER: handle_calibrate_speaker,
     Msg.CALIBRATE_ALL_SPEAKERS: handle_calibrate_all_speakers,

@@ -6,6 +6,18 @@ _The strategic context — why runtime correction matters, why ultrasonic vs in-
 
 Close the loop between speakers continuously while music plays. Today's calibration is a discrete event triggered by a button press; this epic adds inaudible runtime correction that absorbs the 20–80 ppm BT clock drift before it becomes audible — without the operator pressing anything.
 
+## Status — Concluding default-aligner slice as of 2026-06-05
+
+The concluding slice makes runtime ultrasonic alignment the default aligner. The permanent `runtime-latency.service` is responsible for both initial convergence and maintenance corrections; the audible startup tune remains available only as an explicit operator action in the frontend.
+
+Pass criteria for this slice are operator-visible/listenable on the real speakers, not only unit-test metrics:
+
+- Restarting the service converges speakers through ultrasonic runtime correction with no default audible chirp.
+- A badly offset speaker around 600 ms receives a large confidence-gated `set_delay` correction instead of a `slice5_freak_outlier_skip`.
+- Per-speaker auto-align participation can be toggled off and on; excluded speakers receive no burst emission, measurement, or correction while excluded, and their delay is left untouched.
+- The app shows live per-speaker runtime correction feedback and excluded state.
+- The audible alignment tune still works when explicitly selected.
+
 ## Status — Production-effective as of 2026-06-03
 
 The runtime closed-loop ultrasonic alignment system is in **production-effective steady state**. After ~3 days of continuous operation (62 hours, 6,786 captured measurements on Pi 10.0.0.89) and live operator listening tests, the system holds 2-speaker BT alignment within ~15 ms one-sigma without operator intervention, generates zero audible artifacts in steady state, and self-recovers from amplitude-detection failures.
@@ -249,3 +261,4 @@ The `ultrasonic-runtime-sync` epic branch promotes to `main` only after slice 4+
 - 2026-05-31 — Slice 15: cross-correlation-on-envelope measurement upgrade 50-100x precision (f6a4f213): In progress. → docs/maverick/workstreams/f6a4f213-slice-15-cross-correlation-on-envelope-measurement-upgrade.md
 - 2026-05-31 — Slice 15: cross-correlation-on-envelope measurement upgrade (50-100x precision) (f6a4f213-852b-494f-a96e-8d2353e6611f): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/f6a4f213-852b-494f-a96e-8d2353e6611f.md
 - 2026-06-03 — Slice 18: production-effective measurement architecture (retrospective audit) (c6e68ccf-5e04-4ad4-b07d-7ed0efe34913): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/c6e68ccf-5e04-4ad4-b07d-7ed0efe34913.md
+- 2026-06-05 — Concluding ultrasonic default-aligner slice: removed the large-offset freak skip, added per-speaker ultrasonic participation control, demoted audible startup tune to explicit opt-in in the frontend, and surfaced live runtime correction status in the speaker list. Local verification plus operator Pi listening/visual protocol required before PR acceptance.

@@ -14,11 +14,16 @@ if str(_BACKEND_DIR) not in sys.path:
 sys.modules.setdefault("dbus", types.SimpleNamespace(SystemBus=lambda: None))
 
 from measurement.runtime_latency_service import (  # noqa: E402
+    CLOCK_PRIOR_RESET_CYCLES,
     EnvelopeDetector,
     RingBuffer,
     RuntimeSyncService,
     SAMPLE_RATE,
+    SpeakerTarget,
+    ActuationResult,
     _build_parser,
+    read_ultrasonic_exclusions,
+    discover_active_speakers,
 )
 from measurement.calibration_targets import (  # noqa: E402
     read_startup_tune_target,
@@ -73,6 +78,32 @@ def test_startup_tune_target_persists_shared_and_per_speaker_values(tmp_path: Pa
     assert read_startup_tune_target("11:22:33:44:55:66", 500.0, path=path).target_total_ms == 480.0
 
 
+def test_ultrasonic_exclusion_file_is_read_case_insensitively(tmp_path: Path) -> None:
+    path = tmp_path / "ultrasonic_excluded.json"
+    path.write_text('{"excluded_macs":["aa:bb:cc:dd:ee:ff"]}\n', encoding="utf-8")
+
+    assert read_ultrasonic_exclusions(path) == {"AA:BB:CC:DD:EE:FF"}
+
+
+def test_discovery_applies_ultrasonic_exclusions_before_limit(monkeypatch) -> None:
+    sockets = {
+        "AA:BB:CC:DD:EE:01": Path("/tmp/a.sock"),
+        "AA:BB:CC:DD:EE:02": Path("/tmp/b.sock"),
+    }
+    monkeypatch.setattr("measurement.runtime_latency_service._scan_filter_sockets", lambda: sockets)
+    monkeypatch.setattr(
+        "measurement.runtime_latency_service._connected_speaker_macs",
+        lambda: set(sockets),
+    )
+
+    targets = discover_active_speakers(
+        limit=1,
+        excluded_macs={"AA:BB:CC:DD:EE:01"},
+    )
+
+    assert [target.mac for target in targets] == ["AA:BB:CC:DD:EE:02"]
+
+
 def test_runtime_service_exits_cleanly_when_no_speakers_connected_after_timeout(monkeypatch) -> None:
     async def run() -> None:
         args = _build_parser().parse_args(
@@ -101,6 +132,83 @@ def test_runtime_service_exits_cleanly_when_no_speakers_connected_after_timeout(
         assert started_capture is False
         assert service.loop_task is None
         assert service.state.targets == []
+
+    asyncio.run(run())
+
+
+def test_applied_delay_correction_resets_sample_clock_prior_window(monkeypatch) -> None:
+    async def run() -> None:
+        args = _build_parser().parse_args(["--detector-mode", "pattern", "--warmup-sec", "0"])
+        service = RuntimeSyncService(args)
+        target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+        target.last_sample_clock_delta_samples = 12_345.0
+        target.sample_clock_baseline_samples = 12_345.0
+
+        send_calls: list[tuple[Path, str]] = []
+
+        def fake_send(socket_path: Path, payload: str):
+            send_calls.append((socket_path, payload))
+            if payload == "query":
+                return {"target_delay_samples": 0, "current_delay_samples": 0}
+            if payload == "query_emit_timestamps":
+                return {
+                    "entries": [
+                        {"frame_index": 1000},
+                        {"frame_index": 2000},
+                        {"frame_index": 3000},
+                    ],
+                }
+            if payload.startswith("emit_burst"):
+                return {"ok": True}
+            return {"ok": True}
+
+        async def fake_sleep(_delay: float) -> None:
+            return None
+
+        async def fake_analyze_pattern(*_args, **_kwargs):
+            return {
+                "selected": {
+                    "arrival_monotonic": 100.0,
+                    "arrival_sample_index": 14_000,
+                    "sample_clock_anchor_sample_index": 14_000,
+                    "sample_clock_anchor_monotonic": 100.0,
+                    "clock_delta_samples": 13_000.0,
+                    "peak_power_db": -10.0,
+                    "noise_floor_db": -40.0,
+                    "snr_db": 30.0,
+                    "detector_mode": "pattern",
+                    "candidate_count": 3,
+                    "matched_arrival_sample_indices": [14_000, 15_000, 16_000],
+                    "matched_error_ms": [0.0, 0.0, 0.0],
+                    "pattern_mean_abs_error_ms": 0.0,
+                    "pattern_max_abs_error_ms": 0.0,
+                    "pattern_min_snr_db": 9.0,
+                    "pattern_landmark": "envelope",
+                    "pattern_carrier_hz": 18_500.0,
+                    "pattern_clock_delta_spread_ms": 0.0,
+                    "pattern_selection_reason": "best_spacing",
+                    "pattern_match_count": 1,
+                    "pattern_rejected_by_clock_count": 0,
+                }
+            }
+
+        monkeypatch.setattr("measurement.runtime_latency_service._send_filter_command", fake_send)
+        monkeypatch.setattr("measurement.runtime_latency_service.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr(service.detector, "analyze_pattern", fake_analyze_pattern)
+        monkeypatch.setattr(
+            service,
+            "_apply_slice5_proposal",
+            lambda *_args, **_kwargs: ActuationResult(
+                action="corrected",
+                delta_ms=60.0,
+                clock_prior_reset=True,
+            ),
+        )
+
+        await service._measure_pattern(target)
+
+        assert target.last_sample_clock_delta_samples is None
+        assert target.clock_prior_reset_remaining == CLOCK_PRIOR_RESET_CYCLES
 
     asyncio.run(run())
 

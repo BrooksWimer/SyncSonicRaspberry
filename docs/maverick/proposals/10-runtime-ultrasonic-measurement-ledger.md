@@ -371,3 +371,32 @@ Run pattern mode with `--enable-relative-proposals`, without
 `relative_correction_proposed` records with small group-relative residuals and no
 actuator writes. Only after that should pattern residuals be wired into
 `set_rate_ppm`.
+
+## 2026-06-05: Concluding default-aligner slice
+
+Runtime ultrasonic alignment is now the default aligner for both initial convergence
+and maintenance. The confidence window remains the sole actuation gate: large
+consistent offsets, including an approximately 600 ms newly-booted speaker, can
+produce a single `set_delay` correction once the window agrees; noisy or
+disagreeing windows still produce no correction.
+
+Frontend behavior changed so normal sync/start flows do not send
+`calibration_mode="startup_tune"`. The audible startup tune remains available as
+an explicit "Audible alignment tune" action for difficult apartment-wide setups.
+
+A new BLE control message, `SET_ULTRASONIC_PARTICIPATION` (`0x6A`), writes
+per-speaker exclusions to `/run/syncsonic/ultrasonic_excluded.json`. The runtime
+service reads that file every measurement cycle and skips excluded MACs before
+burst emission, measurement, and correction.
+
+Operator verification protocol on the real Pi/speakers:
+
+1. Restart the runtime service and confirm speakers converge through ultrasonic
+   correction with no audible tune by default.
+2. Start one speaker around 600 ms off target and confirm it receives a large
+   confidence-gated correction rather than being skipped.
+3. Toggle a speaker OFF in the app and confirm no burst/measure/correct activity
+   for that MAC and no delay movement; toggle ON and confirm alignment resumes.
+4. Watch the speaker screen during alignment and confirm per-speaker live offset,
+   correction, state, and excluded status are legible.
+5. Explicitly run "Audible alignment tune" and confirm the chirp path still works.

@@ -15,7 +15,6 @@ from typing import Any, Callable, Mapping, Optional
 
 
 APPLY_THRESHOLD_MS = 30.0  # 2026-05-31 iter 2: raised 15->30 based on empirical 57-min run showing ~50% cycles still correcting at 15ms; 30 is final value for current measurement-precision regime, future work upgrades the measurement protocol
-FREAK_THRESHOLD_MS = 500.0  # raised from 100 — initial-alignment corrections after manual slider moves can legitimately be 200-400ms; the freak case we want to catch (BT buffer flush) is ~600ms+
 BURST_AMP_LADDER_X1000 = (300, 600, 950)
 BURST_MISS_ESCALATION_THRESHOLD = 1  # slice 18: smart adjustment - escalate on every miss, drop on every success
 CONFIDENCE_WINDOW_N = 5  # slice 18.2: act on median of last N successful measurements; gates over-correction from single bad measurements
@@ -50,14 +49,12 @@ class SpeakerActuator:
         sockets: Mapping[str, Path | str],
         *,
         apply_threshold_ms: float = APPLY_THRESHOLD_MS,
-        freak_threshold_ms: float = FREAK_THRESHOLD_MS,
         socket_writer: Optional[SocketWriter] = None,
         runtime_corrections_path: Path | str | None = RUNTIME_CORRECTIONS_PATH,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.sockets = {mac.upper(): Path(path) for mac, path in sockets.items()}
         self.apply_threshold_ms = abs(float(apply_threshold_ms))
-        self.freak_threshold_ms = abs(float(freak_threshold_ms))
         self.socket_writer = socket_writer or _send_filter_command
         self.runtime_corrections_path = (
             Path(runtime_corrections_path) if runtime_corrections_path is not None else None
@@ -156,26 +153,10 @@ class SpeakerActuator:
             self._log_action(mac, "baseline", measured_latency_ms=measured_latency_ms)
             return ActuationResult(action="baseline", clock_prior_reset=False)
 
-        # Slice 18.2: confidence-gated actuation. Per-measurement freak-skip first
-        # to keep wild outliers out of the window (would inflate std and either trigger
-        # a spurious correction or block legitimate ones for many cycles).
+        # Slice 18.2: confidence-gated actuation. The confidence window is the
+        # only large-offset gate: a big consistent initial offset is corrected,
+        # while a noisy/disagreeing window is held.
         offset_single = float(measured_latency_ms) - float(target_total_ms)
-        if abs(offset_single) >= self.freak_threshold_ms:
-            self.logger.warning(
-                json.dumps(
-                    {
-                        "event": "slice5_freak_outlier_skip",
-                        "timestamp_iso": _timestamp_iso(),
-                        "mac": mac,
-                        "measured_latency_ms": measured_latency_ms,
-                        "target_total_ms": target_total_ms,
-                        "offset_ms": offset_single,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-            return ActuationResult(action="freak_skip", clock_prior_reset=False)
 
         # Add to per-speaker sliding window
         window = self.measurement_window.setdefault(mac, [])

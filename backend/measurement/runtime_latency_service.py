@@ -79,6 +79,9 @@ except ImportError:  # pragma: no cover - desktop tests can exercise pure detect
 
 SOCKET_DIR = Path(os.environ.get("SYNCSONIC_FILTER_SOCKET_DIR", "/tmp/syncsonic-engine"))
 FILTER_SOCKET_GLOB = "syncsonic-delay-*.sock"
+ULTRASONIC_EXCLUDED_PATH = Path(
+    os.environ.get("SYNCSONIC_ULTRASONIC_EXCLUDED_PATH", "/run/syncsonic/ultrasonic_excluded.json")
+)
 BLUEZ_SERVICE_NAME = "org.bluez"
 DBUS_OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 ADAPTER_INTERFACE = "org.bluez.Adapter1"
@@ -188,6 +191,17 @@ def _scan_filter_sockets() -> dict[str, Path]:
     return sockets
 
 
+def read_ultrasonic_exclusions(path: Path = ULTRASONIC_EXCLUDED_PATH) -> set[str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+    excluded = payload.get("excluded_macs", [])
+    if not isinstance(excluded, list):
+        return set()
+    return {str(mac).upper() for mac in excluded if mac}
+
+
 def _connected_speaker_macs() -> set[str]:
     """Return connected BlueZ devices, degrading to empty on any probe failure."""
     if dbus is None:
@@ -204,17 +218,25 @@ def _connected_speaker_macs() -> set[str]:
     return connected
 
 
-def discover_active_speakers(limit: int = 2) -> list["SpeakerTarget"]:
+def discover_active_speakers(
+    limit: int = 2,
+    *,
+    excluded_macs: Optional[set[str]] = None,
+) -> list["SpeakerTarget"]:
     try:
+        excluded = {mac.upper() for mac in (excluded_macs or set())}
         sockets = _scan_filter_sockets()
         connected = _connected_speaker_macs()
-        active = sorted(mac for mac in sockets if mac in connected)
+        active_all = sorted(mac for mac in sockets if mac in connected)
+        active = [mac for mac in active_all if mac not in excluded]
         targets = [SpeakerTarget(mac=mac, socket_path=sockets[mac]) for mac in active[:limit]]
         _emit(
             "device_discovery",
             filter_socket_macs=sorted(sockets),
             connected_macs=sorted(connected),
             active_macs=[target.mac for target in targets],
+            excluded_macs=sorted(excluded),
+            skipped_macs=[mac for mac in active_all if mac in excluded],
             limit=limit,
         )
         return targets
@@ -1082,7 +1104,19 @@ class RuntimeSyncService:
         await self.detector.warmup(self.args.warmup_sec)
         while self.state.measuring:
             previous = {target.mac: target for target in self.state.targets}
-            discovered = discover_active_speakers(limit=self.args.max_speakers)
+            excluded_macs = read_ultrasonic_exclusions()
+            discovered = discover_active_speakers(
+                limit=self.args.max_speakers,
+                excluded_macs=excluded_macs,
+            )
+            skipped = sorted(excluded_macs & set(previous))
+            if excluded_macs:
+                _emit(
+                    "ultrasonic_participation_skipped",
+                    excluded_macs=sorted(excluded_macs),
+                    skipped_macs=skipped,
+                    control_path=str(ULTRASONIC_EXCLUDED_PATH),
+                )
             for target in discovered:
                 if target.mac in previous:
                     target.stable_count = previous[target.mac].stable_count

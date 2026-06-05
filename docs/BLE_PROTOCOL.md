@@ -95,6 +95,22 @@ These are written to the characteristic by the mobile app. Each one is dispatche
 | `ULTRASONIC_SYNC` | `0x67` | `handle_ultrasonic_sync` | `{}` | `SUCCESS` + later `CALIBRATION_RESULT` notifications |
 | `CALIBRATE_SPEAKER` | `0x68` | `handle_calibrate_speaker` | `{mac, calibration_mode?}` (Slice 4.2) | `SUCCESS` + later `CALIBRATION_RESULT` notifications |
 | `CALIBRATE_ALL_SPEAKERS` | `0x69` | `handle_calibrate_all_speakers` | `{}` (Slice 4.3) | `SUCCESS` + sequential per-output `CALIBRATION_RESULT` notifications |
+| `SET_ULTRASONIC_PARTICIPATION` | `0x6A` | `handle_set_ultrasonic_participation` | `{mac, included: boolean}` | `SUCCESS {mac, included, excluded_macs}` or `ERROR` |
+
+### `SET_ULTRASONIC_PARTICIPATION` payload
+
+Controls whether the permanent runtime ultrasonic alignment service includes a speaker in its measurement/correction loop.
+
+```json
+{
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "included": false
+}
+```
+
+- `included: false` writes the MAC into `/run/syncsonic/ultrasonic_excluded.json`.
+- `included: true` removes the MAC from that exclusion file.
+- The runtime service reads the file each measurement cycle. Excluded MACs are skipped before burst emission, measurement, and `set_delay` correction, so their current filter delay is left untouched until re-included.
 
 ### Common error envelope
 
@@ -138,7 +154,25 @@ These are pushed by the Pi via `Characteristic.send_notification(...)` outside o
 | `CONNECTION_STATUS_UPDATE` | `0x70` | `{mac, status: "connected"\|"disconnected"\|..., reason?, ...}` | Edge-triggered when a speaker's BlueZ `Connected` property flips, or when the coordinator's connection-status pipeline emits a phase change |
 | `COORDINATOR_STATE` | `0x71` | `{tick, n_speakers, speakers: [{mac, health, gain, rssi_dbm, rssi_dip_db, delay_samples}, ...]}` | 1 Hz per-speaker health snapshot from the coordinator (Slice 3.6). Backend authoritative source: `_push_ble_state` in `coordinator/coordinator.py`. |
 | `COORDINATOR_EVENT` | `0x72` | `{type: "soft_mute", phase: "mute"\|"unmute", mac, reason, ramp_ms, rssi_dbm?, rssi_dip_db?}` | Edge-triggered soft-mute / state-change from the coordinator (Slice 3.6). Backend authoritative source: `_push_ble_event`. |
-| `CALIBRATION_RESULT` | `0x73` | `{phase: "<phase-name>", ...phase-specific fields}` | Async per-phase progress + final result for `ULTRASONIC_SYNC`, `CALIBRATE_SPEAKER`, `CALIBRATE_ALL_SPEAKERS` (Slice 4.x). Many notifications per run. |
+| `CALIBRATION_RESULT` | `0x73` | `{phase: "<phase-name>", ...phase-specific fields}` | Async per-phase progress + final result for `ULTRASONIC_SYNC`, `CALIBRATE_SPEAKER`, `CALIBRATE_ALL_SPEAKERS`, plus permanent runtime ultrasonic correction telemetry (`phase: "runtime_correction"`). Many notifications per run. |
+
+### Runtime correction notification shape
+
+The permanent runtime ultrasonic loop appends correction events to `/run/syncsonic/runtime_corrections.jsonl`; `runtime_corrections.py` tails that file and forwards each applied correction as `CALIBRATION_RESULT`.
+
+```json
+{
+  "phase": "runtime_correction",
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "action": "corrected",
+  "timestamp_iso": "2026-06-05T12:34:56Z",
+  "measured_latency_ms": 970.0,
+  "target_total_ms": 370.0,
+  "current_filter_delay_ms": 800.0,
+  "delta_ms": 600.0,
+  "new_filter_delay_ms": 200.0
+}
+```
 
 ### CoordinatorState shape (TypeScript mirror)
 

@@ -17,7 +17,7 @@ from typing import Any, Callable, Mapping, Optional
 APPLY_THRESHOLD_MS = 30.0  # 2026-05-31 iter 2: raised 15->30 based on empirical 57-min run showing ~50% cycles still correcting at 15ms; 30 is final value for current measurement-precision regime, future work upgrades the measurement protocol
 BURST_AMP_LADDER_X1000 = (300, 600, 950)
 BURST_MISS_ESCALATION_THRESHOLD = 1  # slice 18: smart adjustment - escalate on every miss, drop on every success
-CONFIDENCE_WINDOW_N = 5  # slice 18.2: act on median of last N successful measurements; gates over-correction from single bad measurements
+CONFIDENCE_WINDOW_N = 3  # slice 18.2: act on median of last N successful measurements; gates over-correction from single bad measurements. 3 is sufficient — outliers inflate std which raises the sigma floor, so the gate is conservative under noise.
 CONFIDENCE_SIGMA_RATIO = 2.0  # |median_offset| must exceed window_std * this ratio to apply correction; prevents acting on noisy stretches
 BURST_AMP_X1000 = BURST_AMP_LADDER_X1000[0]
 SOCKET_TIMEOUT_SEC = 0.25

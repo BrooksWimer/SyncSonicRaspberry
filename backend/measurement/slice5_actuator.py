@@ -296,25 +296,36 @@ class SpeakerActuator:
         )
 
     def _log_action(self, mac: str, action: str, **fields: Any) -> None:
+        payload = {
+            "event": "slice5_actuation",
+            "phase": "runtime_correction",
+            "timestamp_iso": _timestamp_iso(),
+            "mac": mac,
+            "action": action,
+            **fields,
+        }
         self.logger.info(
-            json.dumps(
-                {
-                    "event": "slice5_actuation",
-                    "timestamp_iso": _timestamp_iso(),
-                    "mac": mac,
-                    "action": action,
-                    **fields,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+            json.dumps(payload, sort_keys=True, separators=(",", ":"))
         )
+        if self.runtime_corrections_path is None:
+            return
+        try:
+            self.runtime_corrections_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.runtime_corrections_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+        except OSError as exc:
+            self.logger.warning(
+                "failed to write action event to %s: %s",
+                self.runtime_corrections_path,
+                exc,
+            )
 
     def _write_runtime_correction(self, mac: str, **fields: Any) -> None:
         if self.runtime_corrections_path is None:
             return
         payload = {
             "event": "runtime_correction",
+            "phase": "runtime_correction",
             "timestamp_iso": _timestamp_iso(),
             "mac": mac,
             "action": "corrected",

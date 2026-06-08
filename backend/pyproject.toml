@@ -1,0 +1,69 @@
+# SyncSonic backend Python tooling config.
+#
+# This file is intentionally minimal — it does NOT declare a build
+# system or package metadata, because the backend ships as a systemd
+# service (`syncsonic.service`) running module-style invocations
+# (`python -m syncsonic_ble.main`) rather than an installable package.
+# Future packaging work would add [build-system] / [project] here.
+#
+# What it does provide today:
+#   - mypy configuration so `python -m mypy syncsonic_ble measurement`
+#     produces a consistent, reviewable report across machines.
+#   - A baseline of accepted-for-now relaxations (see comments below).
+# The current findings live in MYPY_AUDIT.md.
+
+[tool.mypy]
+python_version = "3.11"
+
+# The backend was bootstrapped before mypy was wired in, so there are
+# legacy untyped helpers and external-lib boundaries. These flags let
+# us run mypy without an avalanche of "you didn't annotate this" noise
+# while leaving the real type-narrowing errors (str-or-None mismatches,
+# missing attributes on dataclasses, etc.) visible.
+
+# dbus, gopacket-equivalent libs, and BlueZ helpers don't ship type
+# stubs. Treat them as `Any` rather than failing with "untyped import".
+ignore_missing_imports = true
+
+# The repo has `syncsonic_ble/` and `measurement/` at the same level
+# without a top-level package wrapper. Without this, mypy errors with
+# "Source file found twice under different module names".
+explicit_package_bases = true
+
+# Surface mismatches between an annotation and reality. Catches the
+# `Argument 1 has incompatible type "str | None"; expected "str"`
+# class of bug (currently 6 occurrences across connection_manager.py
+# and device_manager.py — see MYPY_AUDIT.md).
+check_untyped_defs = false   # flip to true once the type-narrowing
+                              # bugs in MYPY_AUDIT.md are addressed;
+                              # otherwise the noise floor jumps from
+                              # 19 errors to >100.
+
+# Loud about unused `# type: ignore` comments — they tend to mask
+# the real reason a type-check was failing.
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+# Per-module relaxations live below. Add a narrowly-scoped override
+# here rather than disabling a global flag.
+
+[[tool.mypy.overrides]]
+# DBus + BlueZ helpers are dynamic by nature; the mixin pattern in
+# `infra/gatt_service.py` (DBusPathMixin reading `self.path`) trips
+# mypy because there's no protocol declaration. Adding a Protocol or
+# typing the mixin via `Generic[Path]` is a real-but-larger change.
+module = ["syncsonic_ble.infra.gatt_service"]
+disable_error_code = ["attr-defined"]
+
+[[tool.mypy.overrides]]
+# `socket.AF_UNIX` is Linux/Mac-only; on Windows-host mypy runs the
+# typeshed reports it as missing. The Pi is Linux, so the runtime is
+# correct — silence the false positives without losing other
+# coordinator / pipewire type checks.
+module = [
+    "measurement._filter_ctl",
+    "measurement.calibrate_one",
+    "syncsonic_ble.helpers.pipewire_transport",
+    "syncsonic_ble.coordinator.coordinator",
+]
+disable_error_code = ["attr-defined"]

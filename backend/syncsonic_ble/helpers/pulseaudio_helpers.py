@@ -122,7 +122,11 @@ def create_loopback(expected_sink_prefix: str, latency_ms: int = 100, wait_secon
     Waits for a specific sink to appear (matching by prefix), unloads any existing loopbacks for it,
     and then creates a clean new loopback.
     """
-    def find_actual_sink_name() -> str:
+    def find_actual_sink_name() -> str | None:
+        """Return the first sink whose name starts with the expected
+        prefix, or None if none has shown up yet (sinks register lazily
+        when bluez_output.<MAC> connects). Callers must check for None
+        and decide whether to keep retrying or bail."""
         result = subprocess.run(["pactl", "list", "sinks", "short"],
                                 capture_output=True, text=True)
         for line in result.stdout.strip().splitlines():

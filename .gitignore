@@ -33,4 +33,7 @@ spectrum.png
 # Env and secrets (if you add any)
 .env
 .env.local
-.env.*.local.claude/
+.env.*.local
+
+# Claude Code worktrees + agent scratch
+.claude/

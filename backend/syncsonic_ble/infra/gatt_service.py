@@ -73,7 +73,7 @@ class GattService(dbus.service.Object, DBusPathMixin):
         self.bus             = bus
         self.uuid            = uuid
         self.primary         = primary
-        self.characteristics = []
+        self.characteristics: list[dbus.service.Object] = []
         super().__init__(bus, self.path)
         log.info("GattService created at %s (UUID=%s)", self.path, uuid)
 

@@ -30,7 +30,7 @@ def connect_one_plan(target_mac: str, allowed_macs: list[str], objects: dict) ->
     allowed_macs = [mac.upper() for mac in allowed_macs]
     disconnect_list = []
     target_connected_on = []
-    config_speaker_usage = {}
+    config_speaker_usage: dict[str, list[str]] = {}
     used_controllers = set()
     adapters = {}
 

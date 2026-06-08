@@ -169,6 +169,48 @@ Tail logs:
 journalctl -u syncsonic.service -f
 ```
 
+### Runtime latency service
+
+Runtime ultrasonic correction is installed as a separate unit that starts after
+the main SyncSonic service has prepared the audio runtime and speaker filter
+sockets.
+
+**Sparse-checkout note:** the default Pi clone of /home/syncsonic/SyncSonicPi
+uses sparse-checkout and excludes deploy/. If ls deploy/ returns
+"No such file or directory" after git pull, add the directory to the
+sparse pattern first:
+
+```bash
+echo "/deploy/" >> .git/info/sparse-checkout
+git read-tree -mu HEAD
+```
+
+Then install and enable the unit:
+
+```bash
+sudo cp deploy/runtime-latency.service /etc/systemd/system/runtime-latency.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now runtime-latency.service
+```
+
+**Venv python:** the unit ExecStart uses
+/home/syncsonic/SyncSonicPi/backend/.venv/bin/python3. Do NOT change this
+to system /usr/bin/python3 — the measurement code requires numpy and
+scipy which only exist in the project venv.
+
+The unit runs as `syncsonic`, requires `syncsonic.service`, and bakes the
+pattern-mode runtime latency arguments directly into `ExecStart`. On boot it
+polls for an active connected speaker every 5 seconds for up to 60 attempts
+(5 minutes). If no speaker becomes available, it exits cleanly; systemd will not
+restart that clean timeout because the unit uses `Restart=on-failure`.
+
+Inspect or stop it with:
+
+```bash
+journalctl -u runtime-latency.service -f
+sudo systemctl stop runtime-latency.service
+```
+
 ---
 
 ## Environment variables
@@ -200,4 +242,3 @@ Wi‑Fi discovery uses separate message types: `WIFI_SCAN_START` (0x44), `WIFI_S
 Logs are emitted via `logging_conf.get_logger()` and by default go to
 `stdout` (systemd captures them in the journal).  Adjust the configuration as
 needed for file rotation or remote aggregation.
-

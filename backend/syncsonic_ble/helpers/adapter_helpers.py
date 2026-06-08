@@ -43,12 +43,29 @@ RESERVED_HCI = os.getenv("RESERVED_HCI")
 if not RESERVED_HCI:
     raise RuntimeError("RESERVED_HCI environment variable not set – cannot pick phone adapter")
 
-# Lazy-loaded SystemBus instance; set by syncsonic_ble.main
+# Lazy-loaded SystemBus instance; set by syncsonic_ble.main via set_bus().
 _BUS = None
 
 def set_bus(bus):
     global _BUS
     _BUS = bus
+
+def _require_bus():
+    """Return the initialized D-Bus connection.
+
+    Raises a clear error if `set_bus()` hasn't been called yet. Without this
+    guard, calling `find_adapter()` (or any of the other helpers below)
+    before `syncsonic_ble.main` initializes the bus throws an opaque
+    `AttributeError: 'NoneType' object has no attribute 'get_object'` deep
+    inside dbus.Interface — annoying to debug because the stack trace
+    points at the dbus library rather than the missing init step.
+    """
+    if _BUS is None:
+        raise RuntimeError(
+            "D-Bus connection not initialized. Call set_bus(bus) before using "
+            "adapter_helpers — typically syncsonic_ble.main does this at startup."
+        )
+    return _BUS
 
 def find_adapter(preferred: str | None = None):
     """
@@ -58,13 +75,14 @@ def find_adapter(preferred: str | None = None):
     Returns:
         Tuple of (adapter_path, adapter_interface) or (None, None) if no adapter is found.
     """
-    om = dbus.Interface(_BUS.get_object(BLUEZ_SERVICE_NAME, "/"), DBUS_OM_IFACE)
+    bus = _require_bus()
+    om = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, "/"), DBUS_OM_IFACE)
     for path, ifaces in om.GetManagedObjects().items():
         if ADAPTER_INTERFACE not in ifaces:
             continue
         if preferred and path.split("/")[-1] != preferred:
             continue
-        adapter = dbus.Interface(_BUS.get_object(BLUEZ_SERVICE_NAME, path), ADAPTER_INTERFACE)
+        adapter = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, path), ADAPTER_INTERFACE)
         return path, adapter
     return None, None
 
@@ -76,7 +94,8 @@ def reset_adapter(adapter):
         adapter: The adapter interface to reset.
     """
     try:
-        props = dbus.Interface(_BUS.get_object(BLUEZ_SERVICE_NAME, adapter.object_path), DBUS_PROP_IFACE)
+        bus = _require_bus()
+        props = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter.object_path), DBUS_PROP_IFACE)
         log.debug("Power-cycling %s", adapter.object_path)
         props.Set(ADAPTER_INTERFACE, "Powered", dbus.Boolean(False))
         time.sleep(2.0)

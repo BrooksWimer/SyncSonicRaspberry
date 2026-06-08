@@ -26,6 +26,7 @@ from syncsonic_ble.infra.gatt_service import (
     GattService,
 )
 from syncsonic_ble.coordinator.coordinator import build_and_start_coordinator
+from syncsonic_ble.runtime_corrections import build_and_start_runtime_correction_watcher
 from syncsonic_ble.state_management.bus_manager import get_bus
 from syncsonic_ble.state_management.connection_manager import ConnectionService
 from syncsonic_ble.state_management.device_manager import DeviceManager
@@ -169,6 +170,12 @@ def main() -> None:
         log.warning("Coordinator failed to start, continuing without it: %s", exc)
         coordinator = None
 
+    try:
+        runtime_correction_watcher = build_and_start_runtime_correction_watcher(char.send_notification)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Runtime correction watcher failed to start, continuing without it: %s", exc)
+        runtime_correction_watcher = None
+
     log.info("SyncSonic BLE server ready, service UUID %s", SERVICE_UUID)
     loop = GLib.MainLoop()
     try:
@@ -186,6 +193,11 @@ def main() -> None:
                 collector.stop()
             except Exception as exc:  # noqa: BLE001
                 log.warning("Telemetry collector stop failed: %s", exc)
+        if runtime_correction_watcher is not None:
+            try:
+                runtime_correction_watcher.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Runtime correction watcher stop failed: %s", exc)
 
 
 if __name__ == "__main__":

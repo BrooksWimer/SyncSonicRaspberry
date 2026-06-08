@@ -6,12 +6,17 @@ SyncSonic is a Raspberry Pi-based audio hub that synchronizes playback across mi
 
 As of 2026-05-05, the **North Star is reached** on the current PipeWire stack: 3-speaker (2 BT + 1 Wi-Fi Sonos) end-to-end auto-aligned playback works on the Pi at 10.0.0.89. The system handles startup calibration (chirp/music anchor), pipeline stability under transport stress, and during-playback correction by soft-mute + phase-aligned re-entry. Five epics (`epic/01..05`) carried that work; their content has been merged into a new `main` branch on 2026-05-05 EDT, and they are retained as historical references in git.
 
-Forward work splits into six durable lanes (see [`PROJECT_ROADMAP.md`](PROJECT_ROADMAP.md)): `feature-hardening`, `ui-polish`, `custom-hardware-design`, `patent-application`, `ultrasonic-runtime-sync`, and `spatial-audio-awareness`.
+Forward work splits into **ten durable lanes** (see [`PROJECT_ROADMAP.md`](PROJECT_ROADMAP.md), [`WORKSTREAM_MODEL.md`](WORKSTREAM_MODEL.md) for the full table, and the 2026-05-09 entry in [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md) for the elevation history):
+
+- **Six post-North-Star lanes:** `feature-hardening`, `ui-polish`, `custom-hardware-design`, `patent-application`, `ultrasonic-runtime-sync`, `spatial-audio-awareness`.
+- **Four lanes elevated from historical epics on 2026-05-09:** `pipewire-stability`, `startup-mic`, `runtime-ultrasonic`, `wifi-manual`. Their v1 implementations shipped via the coordinated engine merge into `main`; each lane now owns ongoing forward work on its slice of the engine.
+
+All ten are first-class peers branching off `main`; the old `epic/01..05` branches stay in git as historical references. Maverick's `config/control-plane.shared.json` registers all ten as `epicBranches` for the `syncsonic` project.
 
 ## Operating Model
 
 - Production / default base branch: **`main`** (created 2026-05-05 from `epic/05-coordinated-engine`, Pi-validated identical to deployed reality).
-- Each new workstream branches from `main`, attaches to one of the six durable epics, finishes back into the epic branch, and only the epic gets explicitly promoted to `main`.
+- Each new workstream branches from `main`, attaches to one of the **ten durable lanes**, finishes back into the lane branch, and only the lane gets explicitly promoted to `main`.
 - Every change touching audio routing, BLE, latency, or service startup requires Pi validation evidence on `syncsonic@10.0.0.89`. Local checks (`compileall`, lint) are necessary but never sufficient.
 - Telemetry retention pattern: `/home/syncsonic/syncsonic-telemetry/` events are durable; pre-deploy `tar -czf` snapshots of `/home/syncsonic/SyncSonicPi/backend/` are the rollback artifact.
 

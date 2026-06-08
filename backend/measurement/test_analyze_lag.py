@@ -176,6 +176,88 @@ def test_overlap_window_with_silence():
            expected_lag, est, tol_samples=0)
 
 
+# -------------------------------------------------------------------------
+# Edge cases. These model failure modes that show up on real Pi captures
+# but weren't in the original synthetic suite: very short capture windows,
+# room reflections that create a competing peak, mic over-gain that clips
+# the capture, and sub-integer-sample lag.
+# -------------------------------------------------------------------------
+
+
+def test_short_signal_half_second():
+    """0.5 seconds is the floor of useful capture window: enough to
+    fit our typical lag range (max_lag_ms ~ 200 ms default) but barely
+    enough samples for stable correlation statistics. Analyzer should
+    still hit the answer within +/- 1 sample on clean input."""
+    rng = np.random.default_rng(seed=49)
+    ref = _pink_noise(SR // 2, rng)  # 0.5 s = 24000 samples at 48 kHz
+    cap = _delay_signal(ref, lag_samples=200)
+    est = estimate_lag_samples(ref, cap, sample_rate=SR)
+    _check("test_short_signal_half_second (0.5 s window, 200 sample lag)",
+           200, est, tol_samples=1)
+
+
+def test_multi_peak_dominant_path_wins():
+    """Models a room reflection: main signal at lag=800, a quieter
+    echo at lag=1600 (e.g. wall bounce). The 8 dB attenuation gap
+    means the primary lag should win unambiguously even though there's
+    a clearly visible second peak. confidence_secondary should reflect
+    the competing peak (drops well below the noise-free single-peak
+    case)."""
+    rng = np.random.default_rng(seed=50)
+    ref = _pink_noise(5 * SR, rng)
+    main = _delay_signal(ref, lag_samples=800, attenuation_db=-6.0)
+    echo = _delay_signal(ref, lag_samples=1600, attenuation_db=-14.0)
+    cap = main + echo
+    est = estimate_lag_samples(ref, cap, sample_rate=SR)
+    _check("test_multi_peak_dominant_path_wins (main 800 @ -6 dB, echo 1600 @ -14 dB)",
+           800, est, tol_samples=1)
+    # We don't enforce a hard ceiling on confidence_secondary here — the
+    # exact ratio depends on the FFT length and pink noise seed. What
+    # matters is the analyzer doesn't lock onto the echo.
+
+
+def test_clipped_capture():
+    """Mic over-gain produces hard clipping. The captured signal is
+    nonlinear (peaks flattened) but the underlying timing is still
+    there. The analyzer should still recover the lag within +/- 1
+    sample — losing confidence is acceptable, losing the answer is
+    not."""
+    rng = np.random.default_rng(seed=51)
+    ref = _pink_noise(5 * SR, rng)
+    delayed = _delay_signal(ref, lag_samples=500)
+    # Hard-clip at +/- 0.5 of the post-delay range. Pink noise
+    # nominally lives in roughly +/- 4 sigma, so this clips a
+    # noticeable fraction of samples without obliterating the signal.
+    cap_unclipped_peak = float(np.max(np.abs(delayed))) or 1.0
+    cap = np.clip(delayed, -0.5 * cap_unclipped_peak, 0.5 * cap_unclipped_peak)
+    est = estimate_lag_samples(ref, cap, sample_rate=SR)
+    _check("test_clipped_capture (500 sample lag, hard-clipped to 50% range)",
+           500, est, tol_samples=1)
+
+
+def test_sub_sample_lag_rounds_to_nearest_integer():
+    """Slice 4.1 is integer-sample resolution by design (see the
+    analyzer's docstring: 'we deliberately do NOT do sub-sample lag
+    estimation here'). A real acoustic delay won't snap to an integer
+    number of samples, so the analyzer should round to the nearest
+    integer rather than diverging wildly. This test phase-shifts the
+    captured signal by exactly 500.5 samples; either 500 or 501 is
+    acceptable."""
+    rng = np.random.default_rng(seed=52)
+    ref = _pink_noise(5 * SR, rng)
+    n = len(ref)
+    freqs = np.fft.rfftfreq(n)
+    # Fractional-sample delay implemented as a frequency-domain phase
+    # ramp; equivalent to delaying by a non-integer number of samples
+    # in the time domain.
+    phase_shift = np.exp(-2j * np.pi * freqs * 500.5)
+    cap = np.fft.irfft(np.fft.rfft(ref) * phase_shift, n=n)
+    est = estimate_lag_samples(ref, cap, sample_rate=SR)
+    _check("test_sub_sample_lag_500_point_5 (expected: rounds to 500 or 501)",
+           500, est, tol_samples=1)
+
+
 if __name__ == "__main__":
     print(f"=== Slice 4.1 analyzer synthetic tests (SR={SR} Hz) ===\n")
     tests = [
@@ -186,6 +268,11 @@ if __name__ == "__main__":
         test_zero_delay,
         test_negative_delay,
         test_overlap_window_with_silence,
+        # Edge cases:
+        test_short_signal_half_second,
+        test_multi_peak_dominant_path_wins,
+        test_clipped_capture,
+        test_sub_sample_lag_rounds_to_nearest_integer,
     ]
     failures = 0
     for fn in tests:

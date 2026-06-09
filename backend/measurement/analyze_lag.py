@@ -53,6 +53,25 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from measurement.correlation import quadratic_peak_interpolation as _qpi
+
+
+def _fft_correlate_full(
+    a: np.ndarray,
+    b: np.ndarray,
+    mode: str = "full",
+    method: str = "fft",
+) -> np.ndarray:
+    if mode != "full" or method != "fft":
+        raise ValueError("NumPy fallback only supports full FFT correlation")
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros(max(0, len(a) + len(b) - 1), dtype=np.float64)
+    out_len = len(a) + len(b) - 1
+    fft_len = 1 << (out_len - 1).bit_length()
+    spectrum_a = np.fft.fft(a, fft_len)
+    spectrum_b = np.fft.fft(b[::-1], fft_len)
+    return np.fft.ifft(spectrum_a * spectrum_b).real[:out_len]
+
 
 @dataclass
 class LagEstimate:
@@ -73,6 +92,7 @@ class LagEstimate:
     reference_n_samples: int
     captured_n_samples: int
     search_window_samples: Tuple[int, int]  # (min_lag, max_lag) actually searched
+    lag_fractional_offset: float = 0.0
     # Optional correlation peak width (FWHM of |corr| around argmax).
     # Useful diagnostics for isolated-speaker captures (Slice 4.2): a
     # narrow peak usually means an unambiguous lag; a very wide peak
@@ -174,11 +194,13 @@ def estimate_lag_samples(
     ref = _normalize(_to_mono(reference))
     cap = _normalize(_to_mono(captured))
 
-    # Use scipy.signal.correlate for FFT-based fast convolution; this
-    # is the only place we depend on scipy. ``method='fft'`` is the
-    # default for sufficiently large inputs but we set it explicitly
-    # to make the performance characteristic obvious.
-    from scipy.signal import correlate
+    # Prefer scipy.signal.correlate for the Pi/backend venv, but keep a NumPy
+    # FFT-compatible fallback so measurement tests still exercise the analyzer
+    # in lightweight CI images that have NumPy but not SciPy.
+    try:
+        from scipy.signal import correlate
+    except ImportError:  # pragma: no cover - covered by environments without SciPy.
+        correlate = _fft_correlate_full
 
     # ``correlate(cap, ref, mode='full')`` returns an array of length
     # len(cap) + len(ref) - 1 where index i corresponds to lag
@@ -232,6 +254,8 @@ def estimate_lag_samples(
     )
 
     lag_samples = peak_idx_in_full - zero_lag_idx
+    frac_idx = _qpi(full, peak_idx_in_full)
+    lag_fractional_offset = float(frac_idx - zero_lag_idx) - float(lag_samples)
     lag_ms = lag_samples * 1000.0 / sample_rate
 
     # Slice 4.4: peak FWHM as alignment-health signal.
@@ -248,6 +272,7 @@ def estimate_lag_samples(
         reference_n_samples=len(ref),
         captured_n_samples=len(cap),
         search_window_samples=(int(min_lag_samples), int(max_lag_samples)),
+        lag_fractional_offset=float(lag_fractional_offset),
         peak_fwhm_samples=int(fwhm_samples),
         peak_fwhm_ms=float(fwhm_ms),
     )
@@ -314,6 +339,7 @@ def _cli() -> int:
         print(f"captured:  {args.captured.name}  ({est.captured_n_samples} samples)")
         print(f"")
         print(f"lag:                  {est.lag_samples} samples = {est.lag_ms:+.2f} ms")
+        print(f"lag sub-sample:       {est.lag_fractional_offset:+.4f} samples")
         print(f"peak correlation:     {est.peak_correlation:+.4f}  (Pearson r at best lag)")
         print(f"confidence primary:   {est.confidence_primary:.2f}x  (peak / mean,  >5 is solid)")
         print(f"confidence secondary: {est.confidence_secondary:.2f}x  (peak / 2nd-peak, >2 unambiguous)")

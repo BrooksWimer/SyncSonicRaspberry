@@ -52,9 +52,9 @@ The North Star is reached. From here, the work is hardening the coordinated engi
 
 **Scope.** Ultrasonic burst generator that integrates with the playback graph (psychoacoustic masking + speaker bandwidth gating), runtime measurement that doesn't require muting, bounded runtime correction (cap ±50 ppm rate adjustment), UX switch + "drift correction: on" status pill in `SpeakerConfigScreen.tsx`. Open question still active: ultrasonic vs in-band/quiet-region — small experiment before committing.
 
-**Status (2026-05-19).** Slice 0 complete — open question resolved. See [`epics/ultrasonic-runtime-sync.md`](epics/ultrasonic-runtime-sync.md) "Slice 0 Findings" for the conclusion and slice-1 architecture.
+**Status (2026-06-08).** **Promoted to `main`.** Conclusionary slice validated on `syncsonic@10.0.0.89` and merged 2026-06-08. Ultrasonic alignment is now the unconditional default: always-on at service start, per-speaker opt-out toggle in the app, real-time correction display via BLE. Known follow-on: post-correction settling race and dynamic alignment target (static 5000 ms target is legacy Sonos artifact) — both scoped to a planned `correction-hardening` workstream. See `epics/ultrasonic-runtime-sync.md` "Follow-on workstream" section for the full scope.
 
-**Success signal.** A system that holds 3-speaker alignment within audible threshold over a 1-hour music session without operator intervention.
+**Success signal.** A system that holds 2-speaker alignment within audible threshold over a 1-hour music session without operator intervention. Multi-speaker scaling to 3+ is slice 4+ work; the 2-speaker target reflects the operator's current verified hardware setup.
 
 **Lane.** [`ultrasonic-runtime-sync`](epics/ultrasonic-runtime-sync.md) → branches from `main`. Architecturally downstream of the coordinated engine (already shipped on `main`).
 

@@ -86,7 +86,7 @@ The operator has prior ultrasonic experiments on old branches that proved the bu
 
 ## Roadmap
 
-_Current best plan, refreshed 2026-05-30. Detailed slice prose for the older slices lives in the **Path to full-time runtime alignment** section below; this section is the canonical short-form for what is done, what is next, and why._
+_Refreshed 2026-06-08. Epic promoted to `main` this date. Detailed slice prose for the older slices lives in the **Path to full-time runtime alignment** section below._
 
 ### Done
 
@@ -97,19 +97,29 @@ _Current best plan, refreshed 2026-05-30. Detailed slice prose for the older sli
 - **Slice 3 follow-up** — Measurement cleanup + pattern/relative-proposal CLI flags. (workstream `f16ede00`, 2026-05-30, software-only verified)
 - **Slice 4** — Live observation of proposed alignment adjustments on Pi. (workstream `dfec41a7`, 2026-05-30, software-plus-pi verified)
 - **Slice 5** — Closed-loop actuation, **ppm-only** (slider stage stripped after live testing exposed architectural mismatch — slider changes filter delay, residual is sample-clock-derived and invariant to filter-delay changes, so slider could not drive residual to zero). System ships with: bounded ±50 ppm `set_rate_ppm` corrections, per-speaker confidence gating, SIGUSR1 + `MAVERICK_CORRECTION_STOP` env var operator escape (<1 s response), opt-in via `--enable-correction`. (workstream `cbb33bdc`, 2026-05-30, software-plus-pi verified)
+- **Slices 6–18** — Latency-baseline slider, stability fixes, adaptive amplitude ladder, cross-correlation-on-envelope precision upgrade (50–100× vs peak detector), observe-only soak mode, raw-mic capture archive, confidence-gated actuation (median-of-3 + 2σ floor). Full detail in measurement ledger at `docs/maverick/proposals/10-runtime-ultrasonic-measurement-ledger.md`.
+- **Conclusionary slice** _(2026-06-08, operator-validated)_ — Promoted ultrasonic to the unconditional default aligner:
+  - Removed `FREAK_THRESHOLD_MS` outlier guard; the confidence window (median-of-3 + σ gate) is now the sole input gate, enabling correction of large initial offsets without false outlier rejection.
+  - Per-speaker opt-out toggle added to `SpeakerConfigScreen.tsx` (`SET_ULTRASONIC_PARTICIPATION` BLE opcode `0x6A`); exclusion state persisted in `/run/syncsonic/ultrasonic_excluded.json`.
+  - `RuntimeCorrectionWatcher` daemon thread added to the GATT service (`syncsonic_ble/runtime_corrections.py`): tails `runtime_corrections.jsonl` at 250 ms intervals and forwards all phase=`runtime_correction` events as `CALIBRATION_RESULT` BLE notifications so the frontend autosync card and latency slider update in real time.
+  - Fixed `"event"` vs `"phase"` field mismatch between actuator JSONL output and frontend parser.
+  - All actuation states (`building_window`, `within_threshold`, `insufficient_confidence`, `corrected`) now written to JSONL, enabling full frontend state progression.
+  - Measurement cadence tuned: `cadence_sec` 15 → 5, `CONFIDENCE_WINDOW_N` 5 → 3 (time to first correction ~36 s vs ~2.5 min). Pattern gap and sigma ratio left unchanged.
+  - Stale `--slice4-observe` flag removed from `runtime-latency.service`.
+  - 4 pre-existing stale backend tests greened.
 
-### Next
+### Promoted to main
 
-- **Slice 6** — Latency-baseline slider stage (see Later list — promoted to Next as of slice-5 finish, 2026-05-30).
+**2026-06-08** — `ultrasonic-runtime-sync` merged to `main` by operator decision. The formal Slice 7 soak gate was overridden; the conclusionary validation session on `syncsonic@10.0.0.89` (2-BT-speaker setup, JBL + secondary, live music, frontend confirmed receiving BLE corrections) was accepted as sufficient for promotion. The post-correction settling race (identified during validation: short cadence + window reset produces transient measurements before BT codec pipeline settles → potential over-correction) is a known open issue documented in the `correction-hardening` planned workstream below.
 
-### Later (subject to discovery)
+### Follow-on workstream: correction-hardening
 
-
-- **Slice 6** — Latency-baseline slider stage. Reintroduce the slider as a two-stage actuator pair to `set_rate_ppm`, but drive it from `measured_latency_ms` deviation against a per-speaker baseline (not relative residual). Slider handles fast recovery from large absolute offsets; ppm continues drift tracking. The control signal IS conjugate to the slider action this time.
-  - Verification scope: `software-pi-and-listening` — slider is audible by nature
-- **Slice 7** — Hardening + soak. Multi-speaker beyond two, UX surface (coordinated with `ui-polish`), 24-hour soak under stress. Promotion gate.
-  - **Stability bug from slice-6 listening test (operator, 2026-05-30):** natural CONFIDENCE_DROP suspend does NOT zero outstanding `set_rate_ppm`. When 45:7A:D9:00:81:19 auto-suspended at miss-rate 30%, its previously-applied `set_rate_ppm=-50` stayed in effect, causing the suspended speaker to silently drift at ~3 ms/min relative to nominal. Fix: when transitioning ACTIVE→SUSPENDED via any non-emergency path, also write `set_rate_ppm 0` to that speaker's socket. Targeted unit test + Pi confirmation.
-  - **Stability bug from slice-6 listening test (operator, 2026-05-30):** slider one-shots invalidate the slice-3 pattern matcher's `clock_prior_delta_samples`, causing the next 1-3 burst measurements to be rejected as `reject_reason: clock_prior_mismatch`. With slice-6 firing slider ~once per minute under normal drift, this produces a measurement blackout window after each fire, which causes more drift to accumulate before the next measurement, which triggers another slider fire — a slow self-induced cycle. Fix: after firing a slider one-shot, reset/widen the actuator-side clock prior tolerance for N cycles (separate from the existing `slider_cooldown_cycles` which controls re-firing, not measurement acceptance). Targeted Pi test under continuous music.
+Not yet opened. Planned scope:
+1. **Post-correction settling holdoff** — suppress actuation for N cycles after any correction fires, independent of `clock_prior_reset_remaining`. Fixes the settling race observed during conclusionary validation.
+2. **Per-cycle correction magnitude cap** — hard ceiling (e.g. ±150 ms per firing) so a bad transient window cannot produce a large single-cycle mis-alignment.
+3. **Adaptive per-sample input clamp** — per-speaker rolling mean ± k×σ replaces the hard `FREAK_THRESHOLD_MS`; rejects outliers without blocking legitimate large-offset corrections.
+4. **Dynamic alignment target** — at session start compute `target = max(per-speaker baseline latencies) + safety_margin` rather than using a static stored value. Eliminates the 5000 ms target that lingers from prior Sonos sessions when only BT speakers are present; minimises total system latency while still achieving alignment.
+5. **Convergence / tracking two-phase control** — wide-net fast-convergence phase on first connect, narrow-net slow-tracking phase once within threshold. Reduces time to initial alignment without sacrificing steady-state stability.
 
 ### Strategy decisions on record
 
@@ -118,13 +128,11 @@ _Current best plan, refreshed 2026-05-30. Detailed slice prose for the older sli
 - **Filter-resident emission, NOT direct-to-BlueZ.** Decided slice 1 revision; direct `paplay` bypasses the delay filter and causes audible chop.
 - **Bounded rate adjustment.** Per `ROADMAP.md` section 4 — never jump filter delay during music; cap at the documented limit.
 - **Burst amplitude: amp_x1000=300 (0.30 linear).** Decided 2026-05-30 empirically via slice-4 amplitude sweep. Standalone bursts inaudible at amp 0.95; sweep showed no consistent audible codec interaction at 0.95/0.30/0.10/0.03. Chose 300 (one order of magnitude below original) as conservative slice-5 default with +41 dB detection headroom. Drop further if any audibility recurs in live test.
-- **Slider stage is NOT conjugate to relative_residual_ms.** Decided 2026-05-30 empirically via slice-5 live testing. Moving filter delay shifts both the emit-frame and arrival-sample indices by the same amount, so `sample_clock_delta` (and therefore relative residual) is largely invariant to slider corrections. Slice 5 ships ppm-only as a result. Slice 6 reintroduces slider with a different control signal (absolute latency offset from per-speaker baseline) that IS conjugate.
-- **Two-speaker scope first.** Architecture must not bake in N=2, but tuning + validation done on the operator current setup; multi-speaker is slice 6.
+- **Slider stage is NOT conjugate to relative_residual_ms.** Decided 2026-05-30 empirically via slice-5 live testing. Moving filter delay shifts both the emit-frame and arrival-sample indices by the same amount, so `sample_clock_delta` (and therefore relative residual) is largely invariant to slider corrections. Slice 5 ships ppm-only as a result.
+- **Two-speaker scope first.** Architecture must not bake in N=2, but tuning + validation done on the operator current setup.
 - **Single-direction first, closed-loop second.** Measurement (slices 2/3) shipped before actuation (slice 5) so we can validate proposals against reality without risking audio.
-
-### Promotion gate
-
-`ultrasonic-runtime-sync` → `main` only after slice 7 soak validation passes. Until then, opt in via the slice-3 service start command.
+- **Confidence window is the sole outlier gate (post-conclusionary).** Decided 2026-06-08; `FREAK_THRESHOLD_MS` removed. Median-of-3 + σ floor provides outlier resistance without blocking large legitimate offsets. Known risk: post-correction transient measurements can dominate the window when cadence is short — addressed in `correction-hardening` workstream.
+- **Dynamic alignment target needed for BT-only setups.** Decided 2026-06-08; 5000 ms static target is legacy artifact of sessions with a Sonos present. Proper fix is `target = max(baselines) + margin`, planned for `correction-hardening`.
 
 ## Planning Guidance
 

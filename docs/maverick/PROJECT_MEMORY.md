@@ -2,6 +2,20 @@
 
 Durable cross-workstream facts, decisions, and conventions. Operator-editable; planning agents read this before each slice.
 
+## 2026-06-08 — ultrasonic-runtime-sync promoted to main
+
+**What shipped.** The `ultrasonic-runtime-sync` lane was validated and merged to `main` today. Ultrasonic alignment is now the unconditional default: `runtime-latency.service` starts automatically and actuates without any opt-in flag. Key changes in the conclusionary slice:
+
+- `FREAK_THRESHOLD_MS` removed — confidence window (median-of-3 + 2σ floor) is the sole input gate. Enables large initial-offset correction without false outlier rejection.
+- Per-speaker opt-out toggle in `SpeakerConfigScreen.tsx` — `SET_ULTRASONIC_PARTICIPATION` BLE opcode `0x6A`, exclusion state in `/run/syncsonic/ultrasonic_excluded.json`.
+- `RuntimeCorrectionWatcher` in `syncsonic_ble/runtime_corrections.py` — daemon thread inside the GATT service that tails `runtime_corrections.jsonl` and forwards all `phase=runtime_correction` events as `CALIBRATION_RESULT` BLE notifications. All actuation states (building_window, within_threshold, corrected) are now reflected in the frontend autosync card and latency slider in real time.
+- Measurement cadence tuned: `cadence_sec` 15 → 5, `CONFIDENCE_WINDOW_N` 5 → 3. Time to first correction ~36 s vs ~2.5 min previously.
+- Promotion gate override: the formal Slice 7 24-hour soak was waived by operator decision; conclusionary validation session on `syncsonic@10.0.0.89` accepted as sufficient.
+
+**Known open issue — post-correction settling race.** Short cadence (5 s) + window reset after every correction = the three post-correction measurements are taken while the BT codec pipeline is still settling at the new delay. With N=3 and no per-cycle magnitude cap, two transient readings can dominate the window median and fire a second large correction in the wrong direction. Observed in the JBL speaker during validation. Not regressed from before — it's a consequence of the cadence speedup. Scoped to `correction-hardening` workstream.
+
+**Planned follow-on workstream: correction-hardening.** Not yet opened. Scope: post-correction settling holdoff, per-cycle correction magnitude cap, adaptive per-sample input clamp (per-speaker rolling mean ± k×σ replacing the removed `FREAK_THRESHOLD_MS`), dynamic alignment target (`target = max(baselines) + margin` replaces stale static value — fixes the 5000 ms Sonos-legacy target that wastes latency on BT-only setups), and convergence/tracking two-phase control.
+
 ## 2026-05-01 - North Star reached on PipeWire stack
 
 - 3-speaker (2 BT + 1 Wi-Fi Sonos) auto-aligned playback validated end-to-end on Pi `syncsonic@10.0.0.89`.

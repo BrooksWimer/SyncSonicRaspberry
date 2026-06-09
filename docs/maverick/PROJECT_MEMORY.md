@@ -2,6 +2,21 @@
 
 Durable cross-workstream facts, decisions, and conventions. Operator-editable; planning agents read this before each slice.
 
+## 2026-06-08 — correction-hardening workstream landed on `correction-hardening` branch
+
+Immediately after promoting `ultrasonic-runtime-sync` to main, a follow-on `correction-hardening` workstream was implemented on a new lane branch of the same name (branched from `main`, commit `c5898be`). Not yet merged to main — awaiting Pi validation.
+
+**What shipped:**
+- **Post-correction settling holdoff** (`slice5_actuator.py`): `POST_CORRECTION_HOLDOFF_CYCLES=4` — 4 cycles (~20 s) of actuation suppression after any correction, while the window still accumulates. Fixes the settling race that caused the JBL mis-alignment during conclusionary testing.
+- **Adaptive per-sample input clamp** (`slice5_actuator.py`): per-speaker rolling history (last 12 samples), 3.5σ outlier rejection, 6-sample bootstrap phase. Self-calibrating replacement for the removed hard `FREAK_THRESHOLD_MS`.
+- **Dynamic alignment target** (`runtime_latency_service.py`): first 5 measurements per speaker establish baselines; `target = max(baselines) + 50 ms` computed and persisted automatically. Eliminates 5000 ms Sonos-legacy static target on BT-only setups.
+- **Silent ultrasonic alignment** (BLE opcode `0x6B`, backend + frontend): new "Silent Align" button triggers fast-align mode (1 s cadence, converges all speakers, exits when 2 consecutive converged cycles). Same ultrasonic burst/xcorr-on-envelope stack — inaudible. Frontend shows aligning.../aligned ✓ states.
+
+**Design decisions recorded:**
+- Per-cycle magnitude cap explicitly rejected by operator — partial corrections are never acceptable; rigorous gating on whether to correct (not how much) is the right model.
+- Per-sample clamp uses rolling per-speaker stats rather than a global hard threshold — adapts to each speaker's noise profile.
+- Silent align uses trigger-file IPC (GATT service → runtime service) consistent with the existing `ultrasonic_excluded.json` pattern.
+
 ## 2026-06-08 — ultrasonic-runtime-sync promoted to main
 
 **What shipped.** The `ultrasonic-runtime-sync` lane was validated and merged to `main` today. Ultrasonic alignment is now the unconditional default: `runtime-latency.service` starts automatically and actuates without any opt-in flag. Key changes in the conclusionary slice:

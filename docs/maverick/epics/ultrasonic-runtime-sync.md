@@ -114,12 +114,12 @@ _Refreshed 2026-06-08. Epic promoted to `main` this date. Detailed slice prose f
 
 ### Follow-on workstream: correction-hardening
 
-Not yet opened. Planned scope:
-1. **Post-correction settling holdoff** — suppress actuation for N cycles after any correction fires, independent of `clock_prior_reset_remaining`. Fixes the settling race observed during conclusionary validation.
-2. **Per-cycle correction magnitude cap** — hard ceiling (e.g. ±150 ms per firing) so a bad transient window cannot produce a large single-cycle mis-alignment.
-3. **Adaptive per-sample input clamp** — per-speaker rolling mean ± k×σ replaces the hard `FREAK_THRESHOLD_MS`; rejects outliers without blocking legitimate large-offset corrections.
-4. **Dynamic alignment target** — at session start compute `target = max(per-speaker baseline latencies) + safety_margin` rather than using a static stored value. Eliminates the 5000 ms target that lingers from prior Sonos sessions when only BT speakers are present; minimises total system latency while still achieving alignment.
-5. **Convergence / tracking two-phase control** — wide-net fast-convergence phase on first connect, narrow-net slow-tracking phase once within threshold. Reduces time to initial alignment without sacrificing steady-state stability.
+**Opened 2026-06-08. Branch: `correction-hardening`.** Implemented in a single workstream commit (`c5898be`). Operator reviewed scope and adjusted before implementation:
+- ❌ Per-cycle correction magnitude cap was **explicitly rejected** — partial corrections are never acceptable; the gate on *whether* to correct must be rigorous, not a limit on *how much*. The confidence window + adaptive clamp are the correct gates.
+- ✅ **Item 1 — Post-correction settling holdoff** (`slice5_actuator.py`): `POST_CORRECTION_HOLDOFF_CYCLES=4` suppresses actuation for 4 cycles (~20 s) after any correction fires. Window still accumulates during holdoff; only the actuation trigger is suppressed. Fixes the settling race observed during conclusionary validation.
+- ✅ **Item 2 — Adaptive per-sample input clamp** (`slice5_actuator.py`): Per-speaker rolling history (last 12 measurements). Any new measurement more than 3.5σ from rolling mean is rejected as a spurious outlier before entering the confidence window. Bootstrap phase (first 6 measurements) always accepted to seed the history. Replaces the removed hard `FREAK_THRESHOLD_MS=500` with a self-calibrating per-speaker gate.
+- ✅ **Item 3 — Dynamic alignment target** (`runtime_latency_service.py`): On service start, the first 5 measurements per speaker establish per-speaker baselines. Once all active speakers have baselines, `target_total_ms = max(baselines) + 50 ms` (floor 150 ms) is computed and persisted. Eliminates the 5000 ms Sonos-legacy static target on BT-only setups.
+- ✅ **Item 4 — Silent ultrasonic alignment** (backend + frontend): New BLE command `START_SILENT_ALIGN = 0x6B`. GATT handler creates `/run/syncsonic/silent_align_requested`; runtime service enters fast-align mode (1 s cadence, resets windows) and converges all speakers. Exits fast-align after 2 consecutive converged cycles; writes `silent_align_complete` event to JSONL for frontend pickup. Frontend "Silent Align" button with aligning.../aligned ✓ states. Same ultrasonic burst + xcorr-on-envelope measurement stack — no audible sound.
 
 ### Strategy decisions on record
 

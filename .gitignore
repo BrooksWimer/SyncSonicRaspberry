@@ -25,6 +25,9 @@ yarn-error.log*
 dist/
 build/
 
+# Maverick orchestrator worktree staging directory
+.generated/
+
 # Debug / generated (keep syncsonic_debug and spectrum images local)
 syncsonic_debug/
 recorded_spectrum*.png

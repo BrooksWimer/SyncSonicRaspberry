@@ -99,9 +99,12 @@ class RuntimeCorrectionWatcher:
         except json.JSONDecodeError as exc:
             log.warning("Skipping malformed runtime correction JSONL line: %s", exc)
             return
-        # Forward all events that carry phase=runtime_correction so the frontend
-        # can render the full progression (building_window → within_threshold → corrected).
-        if event.get("phase") != "runtime_correction":
+        # Forward all events that carry recognised phases so the frontend
+        # can render the full progression (building_window → within_threshold → corrected)
+        # as well as silent_align lifecycle events.
+        if event.get("phase") is None and event.get("action") == "corrected":
+            event["phase"] = "runtime_correction"
+        if event.get("phase") not in self._FORWARDED_PHASES:
             return
         self.notification_sink(Msg.CALIBRATION_RESULT, event)
 

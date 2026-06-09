@@ -117,6 +117,11 @@ SLICE4_HISTORY_LIMIT = 5
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
 CLOCK_PRIOR_RESET_CYCLES = 3
+DYNAMIC_TARGET_BASELINE_N = 5        # measurements per speaker before dynamic target is computed
+DYNAMIC_TARGET_MARGIN_MS = 50.0      # ms added to max baseline to derive target
+DYNAMIC_TARGET_MIN_MS = 150.0        # floor for computed dynamic target
+FAST_ALIGN_CADENCE_SEC = 1.0         # cadence (sec) during fast-align (silent align) mode
+FAST_ALIGN_TRIGGER_PATH = Path("/run/syncsonic/silent_align_requested")
 
 
 @functools.lru_cache(maxsize=8)
@@ -1047,6 +1052,7 @@ class RuntimeSyncService:
         self.stop_event = asyncio.Event()
         self.loop_task: Optional[asyncio.Task[None]] = None
         self.slice5_actuator: Optional[SpeakerActuator] = None
+        self.baseline_samples: dict[str, list[float]] = {}  # dynamic target: per-speaker raw codec latency samples
         self._slice4_observe_enabled = bool(getattr(args, "slice4_observe", False))
         self.slice4_observer: Optional[ObservationWriter] = (
             ObservationWriter(Path(args.slice4_observation_path))
@@ -1583,7 +1589,61 @@ class RuntimeSyncService:
     ) -> Optional[ActuationResult]:
         if self.slice5_actuator is None:
             return None
-        target_total = read_startup_tune_target(target.mac, float(self.args.target_total_ms))
+
+        # Item 3: dynamic alignment target — accumulate per-speaker baseline samples.
+        # Use raw codec latency (measured - current filter delay) so the stored
+        # calibration delay doesn't inflate the baseline and produce a spurious
+        # 5000 ms target on BT-only sessions that follow a Sonos session.
+        mac = target.mac
+        samples = self.baseline_samples.setdefault(mac, [])
+        if len(samples) < DYNAMIC_TARGET_BASELINE_N:
+            baseline_latency_ms = max(0.0, measured_latency_ms - current_filter_delay_ms)
+            samples.append(baseline_latency_ms)
+            _emit(
+                "dynamic_target_baseline_accumulating",
+                mac=mac,
+                baseline_count=len(samples),
+                baseline_needed=DYNAMIC_TARGET_BASELINE_N,
+                measured_latency_ms=measured_latency_ms,
+                current_filter_delay_ms=current_filter_delay_ms,
+                baseline_latency_ms=baseline_latency_ms,
+            )
+            # Don't feed to actuator yet — wait for all baselines.
+            return None
+
+        # Once this speaker has its baseline, check if ALL active speakers do.
+        active_macs = {t.mac for t in self.state.targets}
+        all_have_baseline = all(
+            len(self.baseline_samples.get(m, [])) >= DYNAMIC_TARGET_BASELINE_N
+            for m in active_macs
+        )
+        if all_have_baseline and active_macs:
+            import statistics as _stat_target
+            per_speaker_medians = {
+                m: _stat_target.median(self.baseline_samples[m])
+                for m in active_macs
+                if len(self.baseline_samples.get(m, [])) >= DYNAMIC_TARGET_BASELINE_N
+            }
+            if per_speaker_medians:
+                new_target = max(per_speaker_medians.values()) + DYNAMIC_TARGET_MARGIN_MS
+                new_target = max(new_target, DYNAMIC_TARGET_MIN_MS)
+                old_target = float(self.args.target_total_ms)
+                if abs(new_target - old_target) > 10.0:
+                    self.args.target_total_ms = new_target
+                    _emit(
+                        "dynamic_target_set",
+                        old_target_ms=old_target,
+                        new_target_ms=new_target,
+                        per_speaker_medians=per_speaker_medians,
+                    )
+                    # Persist so BLE service stays in sync.
+                    try:
+                        from measurement.calibration_targets import record_startup_tune_target
+                        record_startup_tune_target(new_target)
+                    except Exception as _exc:  # noqa: BLE001
+                        _emit("dynamic_target_persist_failed", error=repr(_exc))
+
+        target_total = read_startup_tune_target(mac, float(self.args.target_total_ms))
         _emit(
             "runtime_target_total_resolved",
             mac=target.mac,

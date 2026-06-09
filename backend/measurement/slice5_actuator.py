@@ -117,6 +117,7 @@ class SpeakerActuator:
         current_filter_delay: Optional[float],
         *,
         missed_burst: bool = False,
+        confidence_window_n: int = CONFIDENCE_WINDOW_N,
     ) -> ActuationResult:
         mac = speaker_id.upper()
         self.baseline_established.setdefault(mac, False)
@@ -157,19 +158,20 @@ class SpeakerActuator:
         # only large-offset gate: a big consistent initial offset is corrected,
         # while a noisy/disagreeing window is held.
         offset_single = float(measured_latency_ms) - float(target_total_ms)
+        window_needed = max(1, int(confidence_window_n))
 
         # Add to per-speaker sliding window
         window = self.measurement_window.setdefault(mac, [])
         window.append(float(measured_latency_ms))
-        if len(window) > CONFIDENCE_WINDOW_N:
+        if len(window) > window_needed:
             window.pop(0)
 
         # Building phase: not enough measurements yet to be confident
-        if len(window) < CONFIDENCE_WINDOW_N:
+        if len(window) < window_needed:
             self._log_action(
                 mac, "building_window",
                 window_n=len(window),
-                window_needed=CONFIDENCE_WINDOW_N,
+                window_needed=window_needed,
                 measured_latency_ms=measured_latency_ms,
                 offset_single_ms=offset_single,
             )

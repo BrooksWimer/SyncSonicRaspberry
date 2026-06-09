@@ -15,7 +15,10 @@ sys.modules.setdefault("dbus", types.SimpleNamespace(SystemBus=lambda: None))
 
 from measurement.runtime_latency_service import (  # noqa: E402
     CLOCK_PRIOR_RESET_CYCLES,
+    CONFIDENCE_WINDOW_N,
+    DYNAMIC_TARGET_BASELINE_N,
     EnvelopeDetector,
+    FAST_ALIGN_CONFIDENCE_WINDOW_N,
     RingBuffer,
     RuntimeSyncService,
     SAMPLE_RATE,
@@ -151,6 +154,7 @@ def test_dynamic_target_baseline_excludes_existing_filter_delay(monkeypatch) -> 
             measured_latency_ms: float,
             target_total_ms: float,
             current_filter_delay_ms: float,
+            **_kwargs,
         ) -> ActuationResult:
             applied.append((measured_latency_ms, target_total_ms, current_filter_delay_ms))
             return ActuationResult(action="baseline")
@@ -177,6 +181,75 @@ def test_dynamic_target_baseline_excludes_existing_filter_delay(monkeypatch) -> 
     assert result is not None
     assert service.args.target_total_ms == 538.0
     assert applied == [(5022.0, 538.0, 4534.0)]
+
+
+def test_fast_align_uses_smaller_window_n(monkeypatch) -> None:
+    args = _build_parser().parse_args(["--detector-mode", "pattern", "--target-total-ms", "370"])
+    service = RuntimeSyncService(args)
+    target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+    service.state.targets = [target]
+    service.baseline_samples[target.mac] = [370.0] * DYNAMIC_TARGET_BASELINE_N
+    captured_window_n: list[int] = []
+
+    class FakeActuator:
+        def apply(
+            self,
+            _mac: str,
+            _measured_latency_ms: float,
+            _target_total_ms: float,
+            _current_filter_delay_ms: float,
+            *,
+            confidence_window_n: int = CONFIDENCE_WINDOW_N,
+        ) -> ActuationResult:
+            captured_window_n.append(confidence_window_n)
+            return ActuationResult(action="corrected")
+
+    monkeypatch.setattr(
+        "measurement.runtime_latency_service.read_startup_tune_target",
+        lambda _mac, target_total_ms: types.SimpleNamespace(
+            target_total_ms=target_total_ms,
+            source="test",
+            path=Path("/tmp/startup_tune_targets.json"),
+        ),
+    )
+    service.slice5_actuator = FakeActuator()  # type: ignore[assignment]
+
+    service._fast_align_active = False
+    service._apply_slice5_proposal(
+        target,
+        current_filter_delay_ms=0.0,
+        measured_latency_ms=430.0,
+    )
+    service._fast_align_active = True
+    service._apply_slice5_proposal(
+        target,
+        current_filter_delay_ms=0.0,
+        measured_latency_ms=430.0,
+    )
+
+    assert captured_window_n == [CONFIDENCE_WINDOW_N, FAST_ALIGN_CONFIDENCE_WINDOW_N]
+
+
+def test_fast_align_entry_preserves_amp_index(monkeypatch, tmp_path: Path) -> None:
+    args = _build_parser().parse_args(["--detector-mode", "pattern"])
+    service = RuntimeSyncService(args)
+    target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+    service._sync_slice5_actuator([target])
+    assert service.slice5_actuator is not None
+    service.slice5_actuator.burst_amp_indices[target.mac] = 2
+
+    trigger_path = tmp_path / "silent_align_requested"
+    trigger_path.touch()
+    monkeypatch.setattr("measurement.runtime_latency_service.FAST_ALIGN_TRIGGER_PATH", trigger_path)
+
+    assert service._refresh_fast_align_state() is True
+    assert service.slice5_actuator.burst_amp_indices[target.mac] == 2
+
+    joining = SpeakerTarget(mac="11:22:33:44:55:66", socket_path=Path("/tmp/filter2.sock"))
+    service._sync_slice5_actuator([target, joining])
+
+    assert service.slice5_actuator.burst_amp_indices[target.mac] == 2
+    assert service.slice5_actuator.burst_amp_indices[joining.mac] == 0
 
 
 def test_applied_delay_correction_resets_sample_clock_prior_window(monkeypatch) -> None:

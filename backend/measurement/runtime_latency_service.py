@@ -67,6 +67,7 @@ from measurement.slice5_actuator import (
     BURST_AMP_X1000,
     BURST_AMP_LADDER_X1000,
     BURST_MISS_ESCALATION_THRESHOLD,
+    CONFIDENCE_WINDOW_N,
     ActuationResult,
     SpeakerActuator,
     register_ble_stop_callback,
@@ -121,6 +122,7 @@ DYNAMIC_TARGET_BASELINE_N = 5        # measurements per speaker before dynamic t
 DYNAMIC_TARGET_MARGIN_MS = 50.0      # ms added to max baseline to derive target
 DYNAMIC_TARGET_MIN_MS = 150.0        # floor for computed dynamic target
 FAST_ALIGN_CADENCE_SEC = 1.0         # cadence (sec) during fast-align (silent align) mode
+FAST_ALIGN_CONFIDENCE_WINDOW_N = 2   # actuation confidence window during fast-align mode
 FAST_ALIGN_TRIGGER_PATH = Path("/run/syncsonic/silent_align_requested")
 
 
@@ -1053,6 +1055,7 @@ class RuntimeSyncService:
         self.loop_task: Optional[asyncio.Task[None]] = None
         self.slice5_actuator: Optional[SpeakerActuator] = None
         self.baseline_samples: dict[str, list[float]] = {}  # dynamic target: per-speaker raw codec latency samples
+        self._fast_align_active = False
         self._slice4_observe_enabled = bool(getattr(args, "slice4_observe", False))
         self.slice4_observer: Optional[ObservationWriter] = (
             ObservationWriter(Path(args.slice4_observation_path))
@@ -1120,6 +1123,7 @@ class RuntimeSyncService:
     async def _measurement_loop(self) -> None:
         await self.detector.warmup(self.args.warmup_sec)
         while self.state.measuring:
+            fast_align_active = self._refresh_fast_align_state()
             previous = {target.mac: target for target in self.state.targets}
             excluded_macs = read_ultrasonic_exclusions()
             discovered = discover_active_speakers(
@@ -1155,8 +1159,35 @@ class RuntimeSyncService:
                 if not self.state.measuring:
                     break
                 await self._measure_once(target)
-                await asyncio.sleep(self.args.cadence_sec)
+                cadence_sec = FAST_ALIGN_CADENCE_SEC if fast_align_active else self.args.cadence_sec
+                await asyncio.sleep(cadence_sec)
             self.state.cycles += 1
+
+    def _refresh_fast_align_state(self) -> bool:
+        try:
+            active = FAST_ALIGN_TRIGGER_PATH.exists()
+        except OSError as exc:
+            _emit(
+                "fast_align_trigger_probe_failed",
+                path=str(FAST_ALIGN_TRIGGER_PATH),
+                error=repr(exc),
+            )
+            active = False
+        if active != self._fast_align_active:
+            self._fast_align_active = active
+            _emit(
+                "fast_align_mode_changed",
+                active=active,
+                trigger_path=str(FAST_ALIGN_TRIGGER_PATH),
+                cadence_sec=FAST_ALIGN_CADENCE_SEC if active else self.args.cadence_sec,
+                confidence_window_n=(
+                    FAST_ALIGN_CONFIDENCE_WINDOW_N if active else CONFIDENCE_WINDOW_N
+                ),
+            )
+        return active
+
+    def _confidence_window_n(self) -> int:
+        return FAST_ALIGN_CONFIDENCE_WINDOW_N if self._fast_align_active else CONFIDENCE_WINDOW_N
 
     def _sync_slice5_actuator(self, targets: list[SpeakerTarget]) -> None:
         if getattr(self.args, "detector_mode", None) != "pattern":
@@ -1656,6 +1687,7 @@ class RuntimeSyncService:
             measured_latency_ms,
             target_total.target_total_ms,
             current_filter_delay_ms,
+            confidence_window_n=self._confidence_window_n(),
         )
 
     def _record_slice4_observation(

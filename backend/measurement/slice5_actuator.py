@@ -23,6 +23,14 @@ BURST_AMP_X1000 = BURST_AMP_LADDER_X1000[0]
 SOCKET_TIMEOUT_SEC = 0.25
 RUNTIME_CORRECTIONS_PATH = Path("/run/syncsonic/runtime_corrections.jsonl")
 
+# Item 1: post-correction settling holdoff
+POST_CORRECTION_HOLDOFF_CYCLES = 4  # 4 cycles × ~5s cadence = ~20s of settling time
+
+# Item 2: adaptive per-sample input clamp
+CLAMP_HISTORY_N = 12          # rolling history window for per-speaker baseline stats
+CLAMP_SIGMA_MULTIPLIER = 3.5  # reject measurements > mean ± 3.5σ from rolling history
+CLAMP_BOOTSTRAP_N = 6         # accept all measurements until we have this many history samples
+
 BleStopCallback = Callable[[], None]
 SocketWriter = Callable[[Path, str], Optional[dict[str, Any]]]
 
@@ -67,6 +75,10 @@ class SpeakerActuator:
         # Confidence gate uses median(window) vs target as effective offset, and
         # stdev(window) as the noise estimate that must be exceeded before acting.
         self.measurement_window: dict[str, list[float]] = {mac: [] for mac in self.sockets}
+        # Item 1: post-correction settling holdoff counters.
+        self.holdoff_remaining: dict[str, int] = {mac: 0 for mac in self.sockets}
+        # Item 2: per-speaker rolling history for adaptive input clamping.
+        self.measurement_history: dict[str, list[float]] = {mac: [] for mac in self.sockets}
 
     @property
     def states(self) -> dict[str, str]:
@@ -101,6 +113,8 @@ class SpeakerActuator:
             self.baseline_established.setdefault(mac, False)
             self.consecutive_missed_bursts.setdefault(mac, 0)
             self.burst_amp_indices.setdefault(mac, 0)
+            self.holdoff_remaining.setdefault(mac, 0)
+            self.measurement_history.setdefault(mac, [])
         self.sockets = new_sockets
 
     def re_enable(self, mac: Optional[str] = None) -> None:
@@ -122,6 +136,8 @@ class SpeakerActuator:
         self.baseline_established.setdefault(mac, False)
         self.consecutive_missed_bursts.setdefault(mac, 0)
         self.burst_amp_indices.setdefault(mac, 0)
+        self.holdoff_remaining.setdefault(mac, 0)
+        self.measurement_history.setdefault(mac, [])
         if os.environ.get("MAVERICK_CORRECTION_STOP") == "1":
             self.emergency_stop()
             return ActuationResult(action="emergency_stop", clock_prior_reset=True)
@@ -157,6 +173,49 @@ class SpeakerActuator:
         # only large-offset gate: a big consistent initial offset is corrected,
         # while a noisy/disagreeing window is held.
         offset_single = float(measured_latency_ms) - float(target_total_ms)
+
+        # Item 2: adaptive per-sample input clamp.
+        # Always append to history (history tracks physical reality, not filtered signal).
+        # Reject into confidence window only when outside mean ± CLAMP_SIGMA_MULTIPLIER * std.
+        import statistics as _stat_for_clamp
+        history = self.measurement_history.setdefault(mac, [])
+        history.append(float(measured_latency_ms))
+        if len(history) > CLAMP_HISTORY_N:
+            history.pop(0)
+        if len(history) >= CLAMP_BOOTSTRAP_N and len(history) > 1:
+            history_mean = _stat_for_clamp.mean(history)
+            history_std = _stat_for_clamp.stdev(history)
+            if history_std > 0.0:
+                sigma_distance = abs(float(measured_latency_ms) - history_mean) / history_std
+                if sigma_distance > CLAMP_SIGMA_MULTIPLIER:
+                    self._log_action(
+                        mac,
+                        "clamped_outlier",
+                        measurement_ms=float(measured_latency_ms),
+                        history_mean=history_mean,
+                        history_std=history_std,
+                        sigma_distance=sigma_distance,
+                    )
+                    return ActuationResult(action="clamped_outlier", clock_prior_reset=False)
+
+        # Item 1: post-correction settling holdoff.
+        # Measurement is added to window even during holdoff — window tracks truth.
+        # Only actuation trigger is suppressed.
+        if self.holdoff_remaining.get(mac, 0) > 0:
+            self.holdoff_remaining[mac] -= 1
+            # Still add to the window below so it accumulates during settling.
+            window = self.measurement_window.setdefault(mac, [])
+            window.append(float(measured_latency_ms))
+            if len(window) > CONFIDENCE_WINDOW_N:
+                window.pop(0)
+            self._log_action(
+                mac,
+                "holdoff",
+                holdoff_remaining_before=self.holdoff_remaining[mac] + 1,
+                holdoff_remaining_after=self.holdoff_remaining[mac],
+                measured_latency_ms=float(measured_latency_ms),
+            )
+            return ActuationResult(action="holdoff", clock_prior_reset=False)
 
         # Add to per-speaker sliding window
         window = self.measurement_window.setdefault(mac, [])
@@ -209,6 +268,9 @@ class SpeakerActuator:
         # measurements would bias the next decision.
         new_delay = max(0.0, float(current_filter_delay) - median_offset)
         self.measurement_window[mac] = []
+        # Item 1: arm the post-correction holdoff so transient settle measurements
+        # don't immediately re-trigger another correction.
+        self.holdoff_remaining[mac] = POST_CORRECTION_HOLDOFF_CYCLES
         self.set_delay(mac, new_delay)
         offset = median_offset  # for downstream logging compatibility
         self._log_action(

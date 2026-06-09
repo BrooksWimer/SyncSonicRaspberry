@@ -90,6 +90,13 @@ class RuntimeCorrectionWatcher:
                 self._handle_line(line)
             self._offset = fh.tell()
 
+    # Phases forwarded to the BLE frontend via CALIBRATION_RESULT.
+    _FORWARDED_PHASES = frozenset({
+        "runtime_correction",
+        "silent_align_complete",
+        "silent_align_started",
+    })
+
     def _handle_line(self, line: str) -> None:
         stripped = line.strip()
         if not stripped:
@@ -99,9 +106,10 @@ class RuntimeCorrectionWatcher:
         except json.JSONDecodeError as exc:
             log.warning("Skipping malformed runtime correction JSONL line: %s", exc)
             return
-        # Forward all events that carry phase=runtime_correction so the frontend
-        # can render the full progression (building_window → within_threshold → corrected).
-        if event.get("phase") != "runtime_correction":
+        # Forward all events that carry recognised phases so the frontend
+        # can render the full progression (building_window → within_threshold → corrected)
+        # as well as silent_align lifecycle events.
+        if event.get("phase") not in self._FORWARDED_PHASES:
             return
         self.notification_sink(Msg.CALIBRATION_RESULT, event)
 

@@ -150,7 +150,12 @@ def test_disagreeing_high_std_window_does_not_correct_large_offset() -> None:
         for measured in values
     ]
 
-    assert [item.action for item in actions] == ["building_window"] * (CONFIDENCE_WINDOW_N - 1) + ["insufficient_confidence"]
+    # Key property: no correction must fire on a disagreeing window.
+    # The first CONFIDENCE_WINDOW_N-1 are building; thereafter the window
+    # alternates between insufficient_confidence (high-value majority) and
+    # within_threshold (low-value majority), but never "corrected".
+    assert "corrected" not in [item.action for item in actions]
+    assert [item.action for item in actions[:CONFIDENCE_WINDOW_N - 1]] == ["building_window"] * (CONFIDENCE_WINDOW_N - 1)
     assert actions[-1].clock_prior_reset is False
     assert calls == []
 
@@ -302,7 +307,13 @@ def test_corrected_action_appends_runtime_correction_jsonl(tmp_path: Path) -> No
     result = actions[-1]
 
     assert result.action == "corrected"
-    event = json.loads(path.read_text(encoding="utf-8").strip())
+    # The JSONL file may contain multiple events (e.g. slice5_actuation log lines);
+    # find the canonical runtime_correction event that the watcher forwards to BLE.
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    events = [json.loads(line) for line in lines]
+    correction_events = [e for e in events if e.get("event") == "runtime_correction"]
+    assert correction_events, "No runtime_correction event found in JSONL"
+    event = correction_events[-1]
     assert event["action"] == "corrected"
     assert event["event"] == "runtime_correction"
     assert event["mac"] == MAC

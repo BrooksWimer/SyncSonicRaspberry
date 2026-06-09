@@ -79,6 +79,11 @@ except ImportError:  # pragma: no cover - desktop tests can exercise pure detect
 
 SOCKET_DIR = Path(os.environ.get("SYNCSONIC_FILTER_SOCKET_DIR", "/tmp/syncsonic-engine"))
 FILTER_SOCKET_GLOB = "syncsonic-delay-*.sock"
+DYNAMIC_TARGET_MARGIN_MS = 50.0
+DYNAMIC_TARGET_BASELINE_N = 5
+DYNAMIC_TARGET_MIN_MS = 150.0
+FAST_ALIGN_CADENCE_SEC = 1.0
+FAST_ALIGN_TRIGGER_PATH = Path("/run/syncsonic/silent_align_requested")
 ULTRASONIC_EXCLUDED_PATH = Path(
     os.environ.get("SYNCSONIC_ULTRASONIC_EXCLUDED_PATH", "/run/syncsonic/ultrasonic_excluded.json")
 )
@@ -1053,6 +1058,8 @@ class RuntimeSyncService:
             if self._slice4_observe_enabled
             else None
         )
+        # Item 3: per-speaker baseline accumulator for dynamic alignment target.
+        self.baseline_samples: dict[str, list[float]] = {}
 
     async def run(self) -> None:
         with self.slice4_observer if self.slice4_observer is not None else contextlib.nullcontext():
@@ -1075,6 +1082,12 @@ class RuntimeSyncService:
         self.state.measuring = True
         self.loop_task = asyncio.create_task(self._measurement_loop())
         return {"ok": True, "state": "started"}
+
+    async def _measure_once_with_result(self, target: SpeakerTarget) -> Optional["ActuationResult"]:
+        """Wrapper around _measure_once that returns the last actuation result for convergence tracking."""
+        self._last_actuation_result: Optional[ActuationResult] = None
+        await self._measure_once(target)
+        return getattr(self, "_last_actuation_result", None)
 
     def emergency_stop(self) -> None:
         if self.slice5_actuator is not None:
@@ -1113,7 +1126,28 @@ class RuntimeSyncService:
 
     async def _measurement_loop(self) -> None:
         await self.detector.warmup(self.args.warmup_sec)
+        fast_align_active = False
+        fast_align_start_monotonic: Optional[float] = None
+        fast_align_converged_cycles = 0
         while self.state.measuring:
+            # Item 4d: check for fast-align trigger file.
+            if FAST_ALIGN_TRIGGER_PATH.exists():
+                try:
+                    FAST_ALIGN_TRIGGER_PATH.unlink()
+                except OSError:
+                    pass
+                fast_align_active = True
+                fast_align_start_monotonic = time.monotonic()
+                fast_align_converged_cycles = 0
+                # Reset all speaker windows, holdoff counters, and baseline samples.
+                if self.slice5_actuator is not None:
+                    for mac in list(self.slice5_actuator.measurement_window):
+                        self.slice5_actuator.measurement_window[mac] = []
+                    for mac in list(self.slice5_actuator.holdoff_remaining):
+                        self.slice5_actuator.holdoff_remaining[mac] = 0
+                self.baseline_samples = {}
+                _emit("fast_align_started")
+
             previous = {target.mac: target for target in self.state.targets}
             excluded_macs = read_ultrasonic_exclusions()
             discovered = discover_active_speakers(
@@ -1145,12 +1179,47 @@ class RuntimeSyncService:
                 _emit("measurement_idle", reason="no_active_speakers")
                 await asyncio.sleep(5.0)
                 continue
+            cycle_actions: list[str] = []
+            cadence = FAST_ALIGN_CADENCE_SEC if fast_align_active else self.args.cadence_sec
             for target in list(self.state.targets):
                 if not self.state.measuring:
                     break
-                await self._measure_once(target)
-                await asyncio.sleep(self.args.cadence_sec)
+                result = await self._measure_once_with_result(target)
+                if result is not None:
+                    cycle_actions.append(result.action)
+                await asyncio.sleep(cadence)
             self.state.cycles += 1
+
+            # Item 4d: convergence check during fast-align.
+            if fast_align_active and cycle_actions:
+                all_converged = all(
+                    action in ("within_threshold", "holdoff")
+                    for action in cycle_actions
+                )
+                if all_converged:
+                    fast_align_converged_cycles += 1
+                else:
+                    fast_align_converged_cycles = 0
+                if fast_align_converged_cycles >= 2:
+                    fast_align_active = False
+                    duration_sec = time.monotonic() - (fast_align_start_monotonic or time.monotonic())
+                    speaker_macs = [t.mac for t in self.state.targets]
+                    _emit("fast_align_complete", speaker_macs=speaker_macs, duration_sec=duration_sec)
+                    from measurement.slice5_actuator import RUNTIME_CORRECTIONS_PATH as _RCP
+                    _fa_payload = {
+                        "event": "runtime_correction",
+                        "phase": "silent_align_complete",
+                        "speaker_macs": speaker_macs,
+                        "duration_sec": duration_sec,
+                        "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                    try:
+                        _RCP.parent.mkdir(parents=True, exist_ok=True)
+                        with _RCP.open("a", encoding="utf-8") as _fh:
+                            import json as _json
+                            _fh.write(_json.dumps(_fa_payload, sort_keys=True, separators=(",", ":")) + "\n")
+                    except OSError as _exc:
+                        _emit("fast_align_complete_write_failed", error=repr(_exc))
 
     def _sync_slice5_actuator(self, targets: list[SpeakerTarget]) -> None:
         if getattr(self.args, "detector_mode", None) != "pattern":
@@ -1502,6 +1571,7 @@ class RuntimeSyncService:
                 current_filter_delay_ms=current_filter_delay_ms,
                 measured_latency_ms=latency_ms,
             )
+        self._last_actuation_result = actuation_result
         if actuation_result is not None and actuation_result.clock_prior_reset:
             target.last_sample_clock_delta_samples = None
             target.clock_prior_reset_remaining = CLOCK_PRIOR_RESET_CYCLES
@@ -1583,16 +1653,64 @@ class RuntimeSyncService:
     ) -> Optional[ActuationResult]:
         if self.slice5_actuator is None:
             return None
-        target_total = read_startup_tune_target(target.mac, float(self.args.target_total_ms))
+
+        # Item 3: dynamic alignment target — accumulate per-speaker baseline samples.
+        mac = target.mac
+        samples = self.baseline_samples.setdefault(mac, [])
+        if len(samples) < DYNAMIC_TARGET_BASELINE_N:
+            samples.append(measured_latency_ms)
+            _emit(
+                "dynamic_target_baseline_accumulating",
+                mac=mac,
+                baseline_count=len(samples),
+                baseline_needed=DYNAMIC_TARGET_BASELINE_N,
+                measured_latency_ms=measured_latency_ms,
+            )
+            # Don't feed to actuator yet — wait for all baselines.
+            return None
+
+        # Once this speaker has its baseline, check if ALL active speakers do.
+        active_macs = {t.mac for t in self.state.targets}
+        all_have_baseline = all(
+            len(self.baseline_samples.get(m, [])) >= DYNAMIC_TARGET_BASELINE_N
+            for m in active_macs
+        )
+        if all_have_baseline and active_macs:
+            import statistics as _stat_target
+            per_speaker_medians = {
+                m: _stat_target.median(self.baseline_samples[m])
+                for m in active_macs
+                if len(self.baseline_samples.get(m, [])) >= DYNAMIC_TARGET_BASELINE_N
+            }
+            if per_speaker_medians:
+                new_target = max(per_speaker_medians.values()) + DYNAMIC_TARGET_MARGIN_MS
+                new_target = max(new_target, DYNAMIC_TARGET_MIN_MS)
+                old_target = float(self.args.target_total_ms)
+                if abs(new_target - old_target) > 10.0:
+                    self.args.target_total_ms = new_target
+                    _emit(
+                        "dynamic_target_set",
+                        old_target_ms=old_target,
+                        new_target_ms=new_target,
+                        per_speaker_medians=per_speaker_medians,
+                    )
+                    # Persist so BLE service stays in sync.
+                    try:
+                        from measurement.calibration_targets import record_startup_tune_target
+                        record_startup_tune_target(new_target)
+                    except Exception as _exc:  # noqa: BLE001
+                        _emit("dynamic_target_persist_failed", error=repr(_exc))
+
+        target_total = read_startup_tune_target(mac, float(self.args.target_total_ms))
         _emit(
             "runtime_target_total_resolved",
-            mac=target.mac,
+            mac=mac,
             target_total_ms=target_total.target_total_ms,
             target_total_source=target_total.source,
             target_total_path=str(target_total.path),
         )
         return self.slice5_actuator.apply(
-            target.mac,
+            mac,
             measured_latency_ms,
             target_total.target_total_ms,
             current_filter_delay_ms,

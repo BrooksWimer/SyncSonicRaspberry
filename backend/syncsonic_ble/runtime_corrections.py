@@ -20,6 +20,14 @@ log = get_logger(__name__)
 class RuntimeCorrectionWatcher:
     """Follow the actuator JSONL stream and emit one BLE event per correction."""
 
+    _FORWARDED_PHASES: frozenset[str] = frozenset(
+        {
+            "runtime_correction",
+            "silent_align_started",
+            "silent_align_complete",
+        },
+    )
+
     def __init__(
         self,
         notification_sink: NotificationSink,

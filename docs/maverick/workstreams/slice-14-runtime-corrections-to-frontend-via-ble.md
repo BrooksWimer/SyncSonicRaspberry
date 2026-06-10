@@ -2,7 +2,7 @@
 
 - Workstream branch: `slice-14-surface-runtime-corrections-to-the-react-native-frontend-via-ble-6e5641ba`
 - Epic lane: `ultrasonic-runtime-sync`
-- Updated: `2026-05-31T21:57:28Z`
+- Updated: `2026-06-10T12:18:28-04:00`
 
 ## Scope
 
@@ -27,10 +27,20 @@ updates each affected speaker card as corrections arrive.
   flashing a correction badge.
 - Added focused backend tests for JSONL event writing and watcher payload
   forwarding.
+- Added the missing `RuntimeCorrectionWatcher._FORWARDED_PHASES` class
+  constant so the JSONL tail loop no longer raises an `AttributeError` on each
+  poll.
+- Expanded `syncsonic_ble/tests/test_runtime_corrections.py` to cover
+  recognised runtime-correction forwarding, unrecognised phase suppression, and
+  legacy `action=corrected` phase injection.
 
 ## Verification
 
 - `python3 -m compileall syncsonic_ble measurement` passed from `backend/`.
+- `python3 -m compileall syncsonic_ble` passed from `backend/` on
+  2026-06-10 after the `_FORWARDED_PHASES` fix.
+- `python3 -m pytest backend/syncsonic_ble/ -q` passed on 2026-06-10:
+  `3 passed in 0.02s`.
 - `git diff --check` passed.
 - `python3 -m pytest measurement/tests/test_slice5_actuator.py syncsonic_ble/tests/test_runtime_corrections.py`
   was attempted but blocked because this environment does not have `pytest`
@@ -60,3 +70,5 @@ updates each affected speaker card as corrections arrive.
 - Deploy this branch to the Pi and verify live `runtime_correction`
   `CALIBRATION_RESULT` notifications during runtime latency corrections before
   claiming hardware completion.
+- No Pi deploy was performed for the 2026-06-10 watcher constant fix; operator
+  will restart the service after promotion.

@@ -275,3 +275,4 @@ The `ultrasonic-runtime-sync` epic branch promotes to `main` only after slice 4+
 - 2026-06-09 — fast-align speed improvement (680c73d5-619b-442f-af5e-28a6d951b4b1): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/680c73d5-619b-442f-af5e-28a6d951b4b1.md
 - 2026-06-09 — gitignore generated dir (09d471ee-3d43-4670-a175-5b152dbd14c5): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/09d471ee-3d43-4670-a175-5b152dbd14c5.md
 - 2026-06-10 — skip baseline wait when target known (30e7d2c9-7221-454d-bb9f-6791ff4d0627): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/30e7d2c9-7221-454d-bb9f-6791ff4d0627.md
+- 2026-06-10 — fix missing FORWARDED PHASES constant (80a5b00b-b754-4363-a474-c7c1cdb4c5e2): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/80a5b00b-b754-4363-a474-c7c1cdb4c5e2.md

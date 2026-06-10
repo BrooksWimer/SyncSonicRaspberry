@@ -587,3 +587,28 @@ After an iterative design conversation spanning slices 15-18 (cross-correlation 
 **Future exploration documented in `epics/ultrasonic-runtime-sync.md`** — six areas of potential improvement (xcorr precision, frequency adaptation, raw-mic analysis tooling, 24-hour soak, WiFi PipeWire integration, adaptive cadence). Operator decision 2026-06-03: not filed as committed workstreams. Only the WiFi integration is flagged as potentially warranting real workstream status eventually, and even there the architectural shape is undecided.
 
 **Epic promotion gate:** ultrasonic-runtime-sync epic remains unmerged to main as of 2026-06-03. Promotion is a separate operator-triggered step; not on this entry's critical path.
+
+## 2026-06-10 — spatial-audio-awareness Slice 0 feasibility conclusion
+
+Slice 0 documented the Pi 4 + one USB mic + three-speaker spatial boundary in
+[`workstreams/spatial-slice-0-feasibility.md`](workstreams/spatial-slice-0-feasibility.md).
+
+Durable conclusions:
+
+- **Go candidate:** per-speaker stereo channel-role routing is measurable now.
+  The current PipeWire graph already has one stereo delay filter per speaker and
+  consumed per-speaker left/right mix state; the missing product piece is
+  explicit speaker placement/role metadata plus an engine channel-selection
+  policy.
+- **Promising but not automatic:** one static USB mic can measure time of
+  arrival/range-to-mic after transport latency is controlled, but it cannot
+  infer unique 2D/3D speaker coordinates or bearing. Room geometry needs a
+  second mic, known mic relocation points, or user-entered placement.
+- **Defer as research:** listener-position awareness via BLE RSSI, UWB, or
+  phone audio TOA is not a current Pi 4 feature. RSSI remains a coarse
+  transport-health signal, UWB needs new radios, and phone TOA needs a new
+  phone-side measurement protocol.
+- **No-go for now:** Atmos/surround decode requires multichannel input, decode
+  or render support, output-role metadata, and an N-to-M mix matrix. HDMI
+  ARC/eARC is a Pi 4 hardware dead end without an external extractor/capture
+  device because the Pi exposes HDMI output, not ARC/eARC input.

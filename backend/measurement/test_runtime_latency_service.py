@@ -165,7 +165,7 @@ def test_dynamic_target_baseline_excludes_existing_filter_delay(monkeypatch) -> 
     )
     service.slice5_actuator = FakeActuator()  # type: ignore[assignment]
 
-    for _ in range(5):
+    for _ in range(DYNAMIC_TARGET_BASELINE_N - 1):
         assert service._apply_slice5_proposal(
             target,
             current_filter_delay_ms=4534.0,
@@ -179,6 +179,99 @@ def test_dynamic_target_baseline_excludes_existing_filter_delay(monkeypatch) -> 
     )
 
     assert result is not None
+    assert service.args.target_total_ms == 538.0
+    assert applied == [(5022.0, 538.0, 4534.0)]
+
+
+def test_persisted_target_skips_baseline_wait(monkeypatch) -> None:
+    args = _build_parser().parse_args(["--detector-mode", "pattern", "--target-total-ms", "500"])
+    service = RuntimeSyncService(args)
+    target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+    service.state.targets = [target]
+
+    applied: list[tuple[float, float, float]] = []
+
+    class FakeActuator:
+        def apply(
+            self,
+            _mac: str,
+            measured_latency_ms: float,
+            target_total_ms: float,
+            current_filter_delay_ms: float,
+            **_kwargs,
+        ) -> ActuationResult:
+            applied.append((measured_latency_ms, target_total_ms, current_filter_delay_ms))
+            return ActuationResult(action="corrected")
+
+    monkeypatch.setattr(
+        "measurement.runtime_latency_service.read_startup_tune_target",
+        lambda _mac, _target_total_ms: types.SimpleNamespace(
+            target_total_ms=538.0,
+            source="shared",
+            path=Path("/tmp/startup_tune_targets.json"),
+        ),
+    )
+    service.slice5_actuator = FakeActuator()  # type: ignore[assignment]
+
+    result = service._apply_slice5_proposal(
+        target,
+        current_filter_delay_ms=4534.0,
+        measured_latency_ms=5022.0,
+    )
+
+    assert result is not None
+    assert service._target_from_persistence is True
+    assert service.baseline_samples[target.mac] == [488.0]
+    assert applied == [(5022.0, 538.0, 4534.0)]
+
+
+def test_cold_start_waits_for_baseline(monkeypatch) -> None:
+    args = _build_parser().parse_args(["--detector-mode", "pattern", "--target-total-ms", "500"])
+    service = RuntimeSyncService(args)
+    target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+    service.state.targets = [target]
+
+    applied: list[tuple[float, float, float]] = []
+
+    class FakeActuator:
+        def apply(
+            self,
+            _mac: str,
+            measured_latency_ms: float,
+            target_total_ms: float,
+            current_filter_delay_ms: float,
+            **_kwargs,
+        ) -> ActuationResult:
+            applied.append((measured_latency_ms, target_total_ms, current_filter_delay_ms))
+            return ActuationResult(action="baseline")
+
+    monkeypatch.setattr(
+        "measurement.runtime_latency_service.read_startup_tune_target",
+        lambda _mac, target_total_ms: types.SimpleNamespace(
+            target_total_ms=target_total_ms,
+            source="cli_default_missing_file",
+            path=Path("/tmp/startup_tune_targets.json"),
+        ),
+    )
+    monkeypatch.setattr(
+        "measurement.calibration_targets.record_startup_tune_target",
+        lambda _target_total_ms: None,
+    )
+    service.slice5_actuator = FakeActuator()  # type: ignore[assignment]
+
+    results = [
+        service._apply_slice5_proposal(
+            target,
+            current_filter_delay_ms=4534.0,
+            measured_latency_ms=5022.0,
+        )
+        for _ in range(DYNAMIC_TARGET_BASELINE_N)
+    ]
+
+    assert results[0] is None
+    assert results[1] is None
+    assert results[2] is not None
+    assert service._target_from_persistence is False
     assert service.args.target_total_ms == 538.0
     assert applied == [(5022.0, 538.0, 4534.0)]
 

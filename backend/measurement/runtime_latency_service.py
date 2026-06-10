@@ -118,7 +118,7 @@ SLICE4_HISTORY_LIMIT = 5
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
 CLOCK_PRIOR_RESET_CYCLES = 3
-DYNAMIC_TARGET_BASELINE_N = 5        # measurements per speaker before dynamic target is computed
+DYNAMIC_TARGET_BASELINE_N = 3        # measurements per speaker before dynamic target is computed
 DYNAMIC_TARGET_MARGIN_MS = 50.0      # ms added to max baseline to derive target
 DYNAMIC_TARGET_MIN_MS = 150.0        # floor for computed dynamic target
 FAST_ALIGN_CADENCE_SEC = 1.0         # cadence (sec) during fast-align (silent align) mode
@@ -1055,6 +1055,7 @@ class RuntimeSyncService:
         self.loop_task: Optional[asyncio.Task[None]] = None
         self.slice5_actuator: Optional[SpeakerActuator] = None
         self.baseline_samples: dict[str, list[float]] = {}  # dynamic target: per-speaker raw codec latency samples
+        self._target_from_persistence: bool = False
         self._fast_align_active = False
         self._slice4_observe_enabled = bool(getattr(args, "slice4_observe", False))
         self.slice4_observer: Optional[ObservationWriter] = (
@@ -1626,6 +1627,19 @@ class RuntimeSyncService:
         # calibration delay doesn't inflate the baseline and produce a spurious
         # 5000 ms target on BT-only sessions that follow a Sonos session.
         mac = target.mac
+        target_total = read_startup_tune_target(mac, float(self.args.target_total_ms))
+        if target_total.source in {"shared", "per_speaker"}:
+            self._target_from_persistence = True
+
+        def emit_target_total_resolved() -> None:
+            _emit(
+                "runtime_target_total_resolved",
+                mac=target.mac,
+                target_total_ms=target_total.target_total_ms,
+                target_total_source=target_total.source,
+                target_total_path=str(target_total.path),
+            )
+
         samples = self.baseline_samples.setdefault(mac, [])
         if len(samples) < DYNAMIC_TARGET_BASELINE_N:
             baseline_latency_ms = max(0.0, measured_latency_ms - current_filter_delay_ms)
@@ -1639,8 +1653,10 @@ class RuntimeSyncService:
                 current_filter_delay_ms=current_filter_delay_ms,
                 baseline_latency_ms=baseline_latency_ms,
             )
-            # Don't feed to actuator yet — wait for all baselines.
-            return None
+            # Don't feed to actuator yet on cold start — wait for enough baseline samples.
+            if not self._target_from_persistence and len(samples) < DYNAMIC_TARGET_BASELINE_N:
+                emit_target_total_resolved()
+                return None
 
         # Once this speaker has its baseline, check if ALL active speakers do.
         active_macs = {t.mac for t in self.state.targets}
@@ -1674,14 +1690,9 @@ class RuntimeSyncService:
                     except Exception as _exc:  # noqa: BLE001
                         _emit("dynamic_target_persist_failed", error=repr(_exc))
 
-        target_total = read_startup_tune_target(mac, float(self.args.target_total_ms))
-        _emit(
-            "runtime_target_total_resolved",
-            mac=target.mac,
-            target_total_ms=target_total.target_total_ms,
-            target_total_source=target_total.source,
-            target_total_path=str(target_total.path),
-        )
+        if not self._target_from_persistence:
+            target_total = read_startup_tune_target(mac, float(self.args.target_total_ms))
+        emit_target_total_resolved()
         return self.slice5_actuator.apply(
             target.mac,
             measured_latency_ms,

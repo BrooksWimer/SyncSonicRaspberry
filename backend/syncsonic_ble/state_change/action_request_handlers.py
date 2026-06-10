@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from pathlib import Path
 from typing import Any, Dict
 
 import dbus
@@ -25,6 +26,9 @@ from syncsonic_ble.utils.constants import (
 from syncsonic_ble.utils.logging_conf import get_logger
 
 logger = get_logger(__name__)
+ULTRASONIC_EXCLUDED_PATH = Path(
+    os.environ.get("SYNCSONIC_ULTRASONIC_EXCLUDED_PATH", "/run/syncsonic/ultrasonic_excluded.json")
+)
 
 
 def _encode(msg: Msg, payload: Dict[str, Any]):
@@ -248,6 +252,58 @@ def handle_set_mute(char, data):
     return _encode(Msg.SUCCESS, {"mac": mac, "mute": mute})
 
 
+def _read_ultrasonic_excluded(path: Path = ULTRASONIC_EXCLUDED_PATH) -> set[str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+    excluded = payload.get("excluded_macs", [])
+    if not isinstance(excluded, list):
+        return set()
+    return {str(mac).upper() for mac in excluded if mac}
+
+
+def _write_ultrasonic_excluded(excluded: set[str], path: Path = ULTRASONIC_EXCLUDED_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"excluded_macs": sorted(excluded)}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def handle_set_ultrasonic_participation(char, data):
+    mac = data.get("mac")
+    if not mac:
+        return _encode(Msg.ERROR, {"error": "Missing mac"})
+    included = data.get("included")
+    if included is None:
+        return _encode(Msg.ERROR, {"error": "Missing included"})
+    mac_u = str(mac).upper()
+    excluded = _read_ultrasonic_excluded()
+    if bool(included):
+        excluded.discard(mac_u)
+    else:
+        excluded.add(mac_u)
+    try:
+        _write_ultrasonic_excluded(excluded)
+    except OSError as exc:
+        logger.exception("Failed to update ultrasonic participation file")
+        return _encode(Msg.ERROR, {"error": f"Failed to update ultrasonic participation: {exc}"})
+    emit(EventType.SET_LATENCY_REQUEST, {
+        "mac": mac_u,
+        "ultrasonic_included": bool(included),
+        "control_path": str(ULTRASONIC_EXCLUDED_PATH),
+    })
+    return _encode(
+        Msg.SUCCESS,
+        {
+            "mac": mac_u,
+            "included": bool(included),
+            "excluded_macs": sorted(excluded),
+        },
+    )
+
+
 def _scan_start(char, _):
     hci = os.getenv("RESERVED_HCI")
     adapter_path = f"/org/bluez/{hci}"
@@ -396,6 +452,13 @@ def handle_calibrate_speaker(char, data):
         )
 
     def _push(_phase: str, payload: Dict[str, Any]) -> None:
+        if calibration_mode == "startup_tune" and _phase == "applied":
+            try:
+                from measurement.calibration_targets import record_startup_tune_target
+
+                record_startup_tune_target(float(payload.get("target_total_ms", target_total_ms)), mac=mac)
+            except Exception as exc:  # noqa: BLE001 - notification should still be sent if persistence fails.
+                logger.warning("Failed to persist startup-tune target_total_ms for %s: %s", mac, exc)
         # The Characteristic's send_notification is already known to
         # be safe from worker threads (existing ConnectionService and
         # DeviceManager use the same pattern). Failures inside the
@@ -452,6 +515,13 @@ def handle_calibrate_all_speakers(char, data):
     )
 
     def _push(_phase: str, payload: Dict[str, Any]) -> None:
+        if calibration_mode == "startup_tune" and _phase == "sequence_started":
+            try:
+                from measurement.calibration_targets import record_startup_tune_target
+
+                record_startup_tune_target(float(payload.get("target_total_ms", target_total_ms)))
+            except Exception as exc:  # noqa: BLE001 - notification should still be sent if persistence fails.
+                logger.warning("Failed to persist shared startup-tune target_total_ms: %s", exc)
         char.send_notification(Msg.CALIBRATION_RESULT, payload)
 
     wifi_device_ids: list[str] = []
@@ -490,6 +560,7 @@ HANDLERS = {
     Msg.SET_VOLUME: handle_set_volume,
     Msg.GET_PAIRED_DEVICES: handle_get_paired,
     Msg.SET_MUTE: handle_set_mute,
+    Msg.SET_ULTRASONIC_PARTICIPATION: handle_set_ultrasonic_participation,
     Msg.ULTRASONIC_SYNC: handle_ultrasonic_sync,
     Msg.CALIBRATE_SPEAKER: handle_calibrate_speaker,
     Msg.CALIBRATE_ALL_SPEAKERS: handle_calibrate_all_speakers,

@@ -2,22 +2,15 @@
 
 Slice 2 deliberately measures only: filter-resident ultrasonic burst
 emission, USB mic capture, envelope detection, and JSON-lines journal
-records. It does not feed measurements back into ``set_rate_ppm``.
+records. Pattern mode feeds valid measurements into the Slice 5 delay-step actuator.
 
-Invocation (manual CLI; runs as the syncsonic user so it can access
-the filter sockets and the service's PipeWire/Pulse runtime):
+Permanent systemd unit:
 
-    sudo systemd-run --unit=runtime-latency \\
-        --uid=syncsonic --gid=syncsonic \\
-        --working-directory=/home/syncsonic/SyncSonicPi \\
-        --setenv=PULSE_SERVER=unix:/run/syncsonic/pulse/native \\
-        --setenv=RESERVED_HCI=hci3 \\
-        --setenv=RESERVED_ADAPTER_MAC=2C:CF:67:CE:57:91 \\
-        --setenv=PYTHONUNBUFFERED=1 \\
-        python3 /home/syncsonic/SyncSonicPi/backend/measurement/runtime_latency_service.py \\
-        --max-speakers 2
+    sudo cp deploy/runtime-latency.service /etc/systemd/system/runtime-latency.service
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now runtime-latency.service
 
-The four ``--setenv`` lines are mandatory:
+The unit's environment lines are mandatory:
 - ``PULSE_SERVER`` points at the syncsonic-owned PulseAudio runtime
   so ``parecord`` can read the USB mic source. Without it the service
   fails to start capture because the default PulseAudio path is empty.
@@ -40,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import math
@@ -61,10 +55,19 @@ from typing import Any, Deque, Iterable, Optional
 
 import numpy as np
 
+from measurement.correlation import (
+    build_envelope_template,
+    cross_correlate_envelope,
+    quadratic_peak_interpolation,
+)
 from measurement.service_env import slice4_observe_from_env
 from measurement.slice4_observer import DEFAULT_OBSERVATION_PATH, ObservationWriter
+from measurement.calibration_targets import read_startup_tune_target
 from measurement.slice5_actuator import (
     BURST_AMP_X1000,
+    BURST_AMP_LADDER_X1000,
+    BURST_MISS_ESCALATION_THRESHOLD,
+    CONFIDENCE_WINDOW_N,
     ActuationResult,
     SpeakerActuator,
     register_ble_stop_callback,
@@ -77,6 +80,9 @@ except ImportError:  # pragma: no cover - desktop tests can exercise pure detect
 
 SOCKET_DIR = Path(os.environ.get("SYNCSONIC_FILTER_SOCKET_DIR", "/tmp/syncsonic-engine"))
 FILTER_SOCKET_GLOB = "syncsonic-delay-*.sock"
+ULTRASONIC_EXCLUDED_PATH = Path(
+    os.environ.get("SYNCSONIC_ULTRASONIC_EXCLUDED_PATH", "/run/syncsonic/ultrasonic_excluded.json")
+)
 BLUEZ_SERVICE_NAME = "org.bluez"
 DBUS_OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 ADAPTER_INTERFACE = "org.bluez.Adapter1"
@@ -88,8 +94,10 @@ DEFAULT_CADENCE_SEC = 15.0
 DEFAULT_WARMUP_SEC = 5.0
 DEFAULT_FREQ_HZ = 18_500.0
 DEFAULT_DURATION_MS = 100
-DEFAULT_AMPLITUDE = 0.95
+DEFAULT_AMPLITUDE = 0.3  # 2026-05-31: slice-4 verified inaudibility floor; 0.95 is audibly loud and dangerous as a default
 DEFAULT_BT_CODEC_LATENCY_MS = 370.0
+STARTUP_GATE_INTERVAL_SEC = 5.0
+STARTUP_GATE_ATTEMPTS = 60
 INITIAL_WINDOW_MARGIN_MS = 250.0
 STABLE_WINDOW_MARGIN_MS = 100.0
 STABLE_MEASUREMENT_COUNT = 5
@@ -106,11 +114,28 @@ ENVELOPE_SMOOTH_MS = 2.0
 ENVELOPE_REFRACTORY_MS = 25.0
 ENVELOPE_EDGE_PRE_MS = 4.0
 ENVELOPE_EDGE_POST_MS = 8.0
-RELATIVE_CORRECTION_GAIN_PPM_PER_MS = 5.0
-RELATIVE_PEER_MAX_AGE_SEC = 90.0
 SLICE4_HISTORY_LIMIT = 5
 MIN_SNR_DB = 12.0
 SOCKET_TIMEOUT_SEC = 1.5
+CLOCK_PRIOR_RESET_CYCLES = 3
+DYNAMIC_TARGET_BASELINE_N = 3        # measurements per speaker before dynamic target is computed
+DYNAMIC_TARGET_MARGIN_MS = 50.0      # ms added to max baseline to derive target
+DYNAMIC_TARGET_MIN_MS = 150.0        # floor for computed dynamic target
+FAST_ALIGN_CADENCE_SEC = 1.0         # cadence (sec) during fast-align (silent align) mode
+FAST_ALIGN_CONFIDENCE_WINDOW_N = 2   # actuation confidence window during fast-align mode
+FAST_ALIGN_TRIGGER_PATH = Path("/run/syncsonic/silent_align_requested")
+
+
+@functools.lru_cache(maxsize=8)
+def _burst_envelope_template(duration_ms: int, carrier_hz_x10: int, sample_rate: int) -> np.ndarray:
+    """Cache burst envelope templates keyed by duration, carrier, and sample rate."""
+    return build_envelope_template(
+        float(duration_ms),
+        float(carrier_hz_x10) / 10.0,
+        sample_rate,
+        mix_low_pass_ms=ENVELOPE_MIX_LOW_PASS_MS,
+        smooth_ms=ENVELOPE_SMOOTH_MS,
+    )
 
 
 def _emit(event: str, **fields: Any) -> None:
@@ -173,6 +198,17 @@ def _scan_filter_sockets() -> dict[str, Path]:
     return sockets
 
 
+def read_ultrasonic_exclusions(path: Path = ULTRASONIC_EXCLUDED_PATH) -> set[str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+    excluded = payload.get("excluded_macs", [])
+    if not isinstance(excluded, list):
+        return set()
+    return {str(mac).upper() for mac in excluded if mac}
+
+
 def _connected_speaker_macs() -> set[str]:
     """Return connected BlueZ devices, degrading to empty on any probe failure."""
     if dbus is None:
@@ -189,17 +225,25 @@ def _connected_speaker_macs() -> set[str]:
     return connected
 
 
-def discover_active_speakers(limit: int = 2) -> list["SpeakerTarget"]:
+def discover_active_speakers(
+    limit: int = 2,
+    *,
+    excluded_macs: Optional[set[str]] = None,
+) -> list["SpeakerTarget"]:
     try:
+        excluded = {mac.upper() for mac in (excluded_macs or set())}
         sockets = _scan_filter_sockets()
         connected = _connected_speaker_macs()
-        active = sorted(mac for mac in sockets if mac in connected)
+        active_all = sorted(mac for mac in sockets if mac in connected)
+        active = [mac for mac in active_all if mac not in excluded]
         targets = [SpeakerTarget(mac=mac, socket_path=sockets[mac]) for mac in active[:limit]]
         _emit(
             "device_discovery",
             filter_socket_macs=sorted(sockets),
             connected_macs=sorted(connected),
             active_macs=[target.mac for target in targets],
+            excluded_macs=sorted(excluded),
+            skipped_macs=[mac for mac in active_all if mac in excluded],
             limit=limit,
         )
         return targets
@@ -434,7 +478,6 @@ class EnvelopeDetector:
         min_snr_db: float = PATTERN_MIN_SNR_DB,
         landmark: str = PATTERN_LANDMARK,
         carrier_hz: float = DEFAULT_FREQ_HZ,
-        enforce_clock_prior: bool = True,
     ) -> Optional[dict[str, Any]]:
         analysis = await self.analyze_pattern(
             start_time,
@@ -446,7 +489,6 @@ class EnvelopeDetector:
             min_snr_db=min_snr_db,
             landmark=landmark,
             carrier_hz=carrier_hz,
-            enforce_clock_prior=enforce_clock_prior,
         )
         return analysis.get("selected")
 
@@ -461,7 +503,6 @@ class EnvelopeDetector:
         min_snr_db: float = PATTERN_MIN_SNR_DB,
         landmark: str = PATTERN_LANDMARK,
         carrier_hz: float = DEFAULT_FREQ_HZ,
-        enforce_clock_prior: bool = True,
     ) -> dict[str, Any]:
         window = await self.ring.read_window_with_index(start_time, end_time)
         return self.analyze_pattern_in_samples(
@@ -476,7 +517,6 @@ class EnvelopeDetector:
             min_snr_db=min_snr_db,
             landmark=landmark,
             carrier_hz=carrier_hz,
-            enforce_clock_prior=enforce_clock_prior,
         )
 
     @classmethod
@@ -550,7 +590,6 @@ class EnvelopeDetector:
         min_snr_db: float = PATTERN_MIN_SNR_DB,
         landmark: str = PATTERN_LANDMARK,
         carrier_hz: float = DEFAULT_FREQ_HZ,
-        enforce_clock_prior: bool = True,
     ) -> Optional[dict[str, Any]]:
         analysis = cls.analyze_pattern_in_samples(
             samples,
@@ -564,7 +603,6 @@ class EnvelopeDetector:
             min_snr_db=min_snr_db,
             landmark=landmark,
             carrier_hz=carrier_hz,
-            enforce_clock_prior=enforce_clock_prior,
         )
         return analysis.get("selected")
 
@@ -582,7 +620,6 @@ class EnvelopeDetector:
         min_snr_db: float = PATTERN_MIN_SNR_DB,
         landmark: str = PATTERN_LANDMARK,
         carrier_hz: float = DEFAULT_FREQ_HZ,
-        enforce_clock_prior: bool = True,
     ) -> dict[str, Any]:
         analysis: dict[str, Any] = {
             "candidate_count": 0,
@@ -640,6 +677,8 @@ class EnvelopeDetector:
                         "power_db": nearest["power_db"],
                         "snr_db": nearest["snr_db"],
                         "landmark_offset_ms": nearest.get("landmark_offset_ms"),
+                        "precision_us": nearest.get("precision_us"),
+                        "fractional_offset": nearest.get("fractional_offset"),
                     }
                 )
                 total_abs_error += abs(error_samples)
@@ -667,7 +706,7 @@ class EnvelopeDetector:
             return analysis
         best_unprioritized = min(matches, key=lambda match: match["mean_abs_error_samples"])
         analysis.update(cls._pattern_match_debug(best_unprioritized, prefix="best_unprioritized"))
-        if expected_delta_samples is not None and enforce_clock_prior:
+        if expected_delta_samples is not None:
             clock_tolerance_samples = clock_tolerance_ms * SAMPLE_RATE / 1000.0
             viable = [
                 match
@@ -688,11 +727,16 @@ class EnvelopeDetector:
             selection_reason = "clock_prior"
         else:
             best = best_unprioritized
-            selection_reason = "clock_prior_reset" if expected_delta_samples is not None else "best_spacing"
+            selection_reason = "best_spacing"
         first = best["first"]
         offset = first["sample_index"] - base_sample_index
         snrs = [match["snr_db"] for match in best["matched"]]
         powers = [match["power_db"] for match in best["matched"]]
+        precision_values = [
+            match.get("precision_us", 1000.0)
+            for match in best["matched"]
+            if match.get("precision_us") is not None
+        ]
         clock_delta_samples = best["clock_delta_samples"]
         clock_anchor_sample_index = emit_frame_indices[0] + clock_delta_samples
         selected = {
@@ -722,6 +766,8 @@ class EnvelopeDetector:
             "pattern_match_count": len(matches),
             "pattern_rejected_by_clock_count": analysis["pattern_rejected_by_clock_count"],
         }
+        if precision_values:
+            selected["measurement_precision_us"] = float(np.mean(precision_values))
         for key in (
             "envelope_noise_floor_db",
             "envelope_threshold_db",
@@ -861,38 +907,73 @@ class EnvelopeDetector:
             return [], scan
 
         refractory_samples = max(1, int(round(ENVELOPE_REFRACTORY_MS * SAMPLE_RATE / 1000.0)))
-        pre_samples = max(1, int(round(ENVELOPE_EDGE_PRE_MS * SAMPLE_RATE / 1000.0)))
-        post_samples = max(1, int(round(ENVELOPE_EDGE_POST_MS * SAMPLE_RATE / 1000.0)))
         candidates: list[dict[str, Any]] = []
         above = envelope_db >= threshold_db
+
+        template = _burst_envelope_template(
+            int(round(DEFAULT_DURATION_MS)),
+            int(round(carrier_hz * 10)),
+            SAMPLE_RATE,
+        )
+        xcorr, _peak_norm = cross_correlate_envelope(envelope, template)
+        xcorr_zero_lag = len(template) - 1
+
         previous_above = False
         last_sample_index = -refractory_samples
         for idx, is_above in enumerate(above):
             if bool(is_above) and not previous_above:
                 sample_index = base_sample_index + idx
                 if sample_index - last_sample_index >= refractory_samples:
-                    edge_start = max(0, idx - pre_samples)
-                    edge_end = min(len(envelope), idx + post_samples + 1)
-                    edge = envelope[edge_start:edge_end]
-                    if len(edge) >= 2:
-                        slope = np.diff(edge)
-                        slope_idx = int(np.argmax(slope))
-                        landmark_offset = edge_start + slope_idx + 1
-                    else:
-                        landmark_offset = idx
-                    peak_end = min(len(envelope), idx + refractory_samples)
-                    local_peak_db = float(np.max(envelope_db[idx:peak_end])) if peak_end > idx else float(envelope_db[idx])
-                    landmark_sample_index = base_sample_index + landmark_offset
-                    candidates.append(
-                        {
-                            "sample_index": landmark_sample_index,
-                            "threshold_sample_index": sample_index,
-                            "power_db": local_peak_db,
-                            "snr_db": local_peak_db - noise_floor_db,
-                            "landmark_offset_ms": (landmark_offset - idx) * 1000.0 / SAMPLE_RATE,
-                        }
-                    )
-                    last_sample_index = landmark_sample_index
+                    search_half = len(template) // 2 + refractory_samples
+                    xcorr_lo = max(0, xcorr_zero_lag + idx - search_half)
+                    xcorr_hi = min(len(xcorr) - 1, xcorr_zero_lag + idx + search_half)
+                    if xcorr_lo < xcorr_hi:
+                        region = xcorr[xcorr_lo : xcorr_hi + 1]
+                        local_peak_idx_in_region = int(np.argmax(np.abs(region)))
+                        local_peak_idx_in_xcorr = xcorr_lo + local_peak_idx_in_region
+                        frac_peak = quadratic_peak_interpolation(xcorr, local_peak_idx_in_xcorr)
+                        frac_lag = frac_peak - xcorr_zero_lag
+                        frac_sample_index = base_sample_index + frac_lag
+                        landmark_sample_index = int(round(frac_sample_index))
+                        fractional_offset = frac_sample_index - landmark_sample_index
+
+                        peak_val = float(np.abs(xcorr[local_peak_idx_in_xcorr]))
+                        half_val = peak_val * 0.5
+                        left_w = local_peak_idx_in_xcorr
+                        right_w = local_peak_idx_in_xcorr
+                        while left_w > 0 and abs(xcorr[left_w]) >= half_val:
+                            left_w -= 1
+                        while right_w < len(xcorr) - 1 and abs(xcorr[right_w]) >= half_val:
+                            right_w += 1
+                        fwhm_samples = max(1, right_w - left_w)
+                        precision_us = (float(fwhm_samples) * 1e6 / SAMPLE_RATE) / 8.0
+                        precision_us = max(0.5, min(5000.0, precision_us))
+
+                        peak_end = min(len(envelope), idx + refractory_samples)
+                        local_peak_db = float(np.max(envelope_db[idx:peak_end])) if peak_end > idx else float(envelope_db[idx])
+                        landmark_offset_ms = (
+                            (landmark_sample_index - sample_index) * 1000.0 / SAMPLE_RATE
+                        )
+                        if (
+                            landmark_offset_ms < -ENVELOPE_EDGE_PRE_MS
+                            or landmark_offset_ms > ENVELOPE_EDGE_POST_MS
+                        ):
+                            landmark_sample_index = sample_index
+                            fractional_offset = 0.0
+                            landmark_offset_ms = 0.0
+
+                        candidates.append(
+                            {
+                                "sample_index": landmark_sample_index,
+                                "threshold_sample_index": sample_index,
+                                "power_db": local_peak_db,
+                                "snr_db": local_peak_db - noise_floor_db,
+                                "landmark_offset_ms": landmark_offset_ms,
+                                "precision_us": precision_us,
+                                "fractional_offset": fractional_offset,
+                            }
+                        )
+                        last_sample_index = landmark_sample_index
             previous_above = bool(is_above)
         return candidates, scan
 
@@ -929,328 +1010,6 @@ class EnvelopeDetector:
         return 10.0 * math.log10(max(power, 1e-20))
 
 
-# Slice 3: closed-loop drift correction.
-# Conservative starting gain (0.1) — tune after Pi validation.
-# Spec: docs/maverick/proposals/09-slice-3-implementation-spec.md
-CORRECTION_PPM_GAIN = 0.1
-CORRECTION_SNR_FLOOR_DB = 10.0
-CORRECTION_STABLE_FLOOR = 5
-CORRECTION_PAUSE_AFTER_SKIPS = 3
-
-
-class DriftController:
-    """Per-speaker drift correction state + decision logic.
-
-    Maintains a rolling baseline of (latency_ms - slider_ms) per speaker
-    = intrinsic codec latency. Detects drift as the deviation of the
-    recent rolling mean from the long-term baseline. Applied correction
-    is bounded at +/-max_ppm per ROADMAP section 4.
-
-    Confidence gating: requires stable_count >= smoothing_window AND
-    snr_db >= 10.0 dB before applying any correction for that speaker.
-
-    Auto-pause: if a speaker accumulates 3+ consecutive correction_skipped
-    events AND its SNR is below 10 dB, the controller stops issuing
-    corrections for THAT speaker. Other speakers continue normally.
-    """
-
-    def __init__(
-        self,
-        max_ppm: float = 50.0,
-        smoothing_window: int = 5,
-        gain: float = CORRECTION_PPM_GAIN,
-    ):
-        self.max_ppm = max_ppm
-        self.smoothing_window = smoothing_window
-        self.gain = gain
-        self.baselines: dict[str, float] = {}
-        self.recent_samples: dict[str, list[float]] = {}
-        self.consecutive_skips: dict[str, int] = {}
-        self.paused: set[str] = set()
-
-    def observe(
-        self,
-        mac: str,
-        latency_ms: float,
-        slider_ms: float,
-        snr_db: float,
-        stable_count: int,
-    ) -> Optional[dict[str, Any]]:
-        """Record a measurement; return a JSON-line-ready record dict or None."""
-        codec_ms = latency_ms - slider_ms
-
-        # Update rolling samples
-        recent = self.recent_samples.setdefault(mac, [])
-        recent.append(codec_ms)
-        if len(recent) > self.smoothing_window:
-            recent.pop(0)
-
-        # Establish baseline once we have enough stable measurements
-        if mac not in self.baselines and stable_count >= self.smoothing_window:
-            self.baselines[mac] = sum(recent) / len(recent)
-            return {
-                "event": "correction_proposed",
-                "mac": mac,
-                "reason": "baseline_established",
-                "baseline_codec_ms": self.baselines[mac],
-            }
-
-        # Already paused: no-op
-        if mac in self.paused:
-            return None
-
-        # Confidence gating
-        if stable_count < self.smoothing_window or snr_db < CORRECTION_SNR_FLOOR_DB:
-            self.consecutive_skips[mac] = self.consecutive_skips.get(mac, 0) + 1
-            if (
-                self.consecutive_skips[mac] >= CORRECTION_PAUSE_AFTER_SKIPS
-                and snr_db < CORRECTION_SNR_FLOOR_DB
-            ):
-                self.paused.add(mac)
-                return {
-                    "event": "controller_paused",
-                    "mac": mac,
-                    "reason": f"3+ low-confidence skips, snr={snr_db:.1f}dB",
-                }
-            return {
-                "event": "correction_skipped",
-                "mac": mac,
-                "reason": "low_confidence",
-                "snr_db": snr_db,
-                "stable_count": stable_count,
-            }
-
-        # Compute correction
-        self.consecutive_skips[mac] = 0
-        if mac not in self.baselines:
-            return None
-        recent_mean = sum(recent) / len(recent)
-        drift_ms = recent_mean - self.baselines[mac]
-        applied_ppm = max(
-            -self.max_ppm,
-            min(self.max_ppm, drift_ms * self.gain),
-        )
-        return {
-            "event": "correction_applied",
-            "mac": mac,
-            "baseline_codec_ms": self.baselines[mac],
-            "current_codec_ms": recent_mean,
-            "drift_ppm_estimated": drift_ms * self.gain,
-            "applied_ppm": applied_ppm,
-        }
-
-
-@dataclass
-class RelativeClockObservation:
-    mac: str
-    monotonic: float
-    delta_samples: float
-    drift_samples: float
-    snr_db: float
-    stable_count: int
-
-
-class RelativeDriftEstimator:
-    """Group-relative sample-clock drift estimator.
-
-    Pattern mode produces ``arrival_sample_index - emit_frame_index``. That
-    delta is useful, but it contains both speaker latency and any shared slope
-    between the mic capture clock and the PipeWire/filter frame clock. This
-    estimator removes the common-mode part before proposing any per-speaker
-    correction, so speakers that move together produce near-zero proposals.
-
-    Positive residual means this speaker is late relative to the group. In the
-    C filter, positive ``set_rate_ppm`` increases effective delay over time, so
-    a positive residual maps to a negative proposed rate.
-    """
-
-    def __init__(
-        self,
-        max_ppm: float = 50.0,
-        smoothing_window: int = 5,
-        gain_ppm_per_ms: float = RELATIVE_CORRECTION_GAIN_PPM_PER_MS,
-        peer_max_age_sec: float = RELATIVE_PEER_MAX_AGE_SEC,
-    ) -> None:
-        self.max_ppm = max_ppm
-        self.smoothing_window = max(1, int(smoothing_window))
-        self.gain_ppm_per_ms = float(gain_ppm_per_ms)
-        self.peer_max_age_sec = max(0.0, float(peer_max_age_sec))
-        self.baselines: dict[str, float] = {}
-        self.latest: dict[str, RelativeClockObservation] = {}
-        self.recent_residuals_ms: dict[str, list[float]] = {}
-        self.common_history: list[tuple[float, float]] = []
-
-    def observe(
-        self,
-        *,
-        mac: str,
-        monotonic: float,
-        delta_samples: float,
-        snr_db: float,
-        stable_count: int,
-        pattern_mean_abs_error_ms: Optional[float] = None,
-        pattern_clock_delta_spread_ms: Optional[float] = None,
-    ) -> dict[str, Any]:
-        mac = mac.upper()
-        if mac not in self.baselines:
-            self.baselines[mac] = float(delta_samples)
-        drift_samples = float(delta_samples) - self.baselines[mac]
-        obs = RelativeClockObservation(
-            mac=mac,
-            monotonic=float(monotonic),
-            delta_samples=float(delta_samples),
-            drift_samples=drift_samples,
-            snr_db=float(snr_db),
-            stable_count=int(stable_count),
-        )
-        self.latest[mac] = obs
-
-        active = self._active_observations(float(monotonic))
-        if len(active) < 2:
-            return self._skip_record(
-                obs,
-                reason="insufficient_recent_peers",
-                active=active,
-                pattern_mean_abs_error_ms=pattern_mean_abs_error_ms,
-                pattern_clock_delta_spread_ms=pattern_clock_delta_spread_ms,
-            )
-
-        common_drift_samples = self._median([item.drift_samples for item in active])
-        common_drift_ms = common_drift_samples * 1000.0 / SAMPLE_RATE
-        self._remember_common(float(monotonic), common_drift_samples)
-        residual_samples = drift_samples - common_drift_samples
-        residual_ms = residual_samples * 1000.0 / SAMPLE_RATE
-
-        recent = self.recent_residuals_ms.setdefault(mac, [])
-        recent.append(residual_ms)
-        if len(recent) > self.smoothing_window:
-            recent.pop(0)
-        recent_residual_ms = sum(recent) / len(recent)
-
-        fields = self._base_record(
-            obs,
-            active=active,
-            common_drift_ms=common_drift_ms,
-            residual_ms=residual_ms,
-            recent_residual_ms=recent_residual_ms,
-            pattern_mean_abs_error_ms=pattern_mean_abs_error_ms,
-            pattern_clock_delta_spread_ms=pattern_clock_delta_spread_ms,
-        )
-
-        if stable_count < self.smoothing_window:
-            return {
-                "event": "relative_correction_skipped",
-                "reason": "warming_up",
-                **fields,
-            }
-        if snr_db < CORRECTION_SNR_FLOOR_DB:
-            return {
-                "event": "relative_correction_skipped",
-                "reason": "low_snr",
-                **fields,
-            }
-
-        proposed_uncapped = -recent_residual_ms * self.gain_ppm_per_ms
-        proposed_ppm = self._clamp_ppm(proposed_uncapped)
-        return {
-            "event": "relative_correction_proposed",
-            "reason": "group_residual",
-            "proposed_rate_ppm_uncapped": proposed_uncapped,
-            "proposed_rate_ppm": proposed_ppm,
-            "gain_ppm_per_ms": self.gain_ppm_per_ms,
-            "set_rate_ppm_sign": "negative_reduces_delay_positive_increases_delay",
-            **fields,
-        }
-
-    def _active_observations(self, now: float) -> list[RelativeClockObservation]:
-        return [
-            obs
-            for obs in self.latest.values()
-            if now - obs.monotonic <= self.peer_max_age_sec
-        ]
-
-    def _remember_common(self, monotonic: float, common_drift_samples: float) -> None:
-        self.common_history.append((monotonic, common_drift_samples))
-        max_len = max(4, self.smoothing_window * 4)
-        if len(self.common_history) > max_len:
-            self.common_history = self.common_history[-max_len:]
-
-    def _base_record(
-        self,
-        obs: RelativeClockObservation,
-        *,
-        active: list[RelativeClockObservation],
-        common_drift_ms: Optional[float],
-        residual_ms: Optional[float],
-        recent_residual_ms: Optional[float],
-        pattern_mean_abs_error_ms: Optional[float],
-        pattern_clock_delta_spread_ms: Optional[float],
-    ) -> dict[str, Any]:
-        return {
-            "mac": obs.mac,
-            "sample_clock_delta_ms": obs.delta_samples * 1000.0 / SAMPLE_RATE,
-            "speaker_sample_clock_drift_ms": obs.drift_samples * 1000.0 / SAMPLE_RATE,
-            "group_common_drift_ms": common_drift_ms,
-            "relative_residual_ms": residual_ms,
-            "recent_relative_residual_ms": recent_residual_ms,
-            "common_clock_slope_ppm": self._common_slope_ppm(),
-            "active_peer_count": len(active),
-            "active_peer_macs": sorted(item.mac for item in active),
-            "peer_max_age_sec": self.peer_max_age_sec,
-            "stable_count": obs.stable_count,
-            "snr_db": obs.snr_db,
-            "pattern_mean_abs_error_ms": pattern_mean_abs_error_ms,
-            "pattern_clock_delta_spread_ms": pattern_clock_delta_spread_ms,
-        }
-
-    def _skip_record(
-        self,
-        obs: RelativeClockObservation,
-        *,
-        reason: str,
-        active: list[RelativeClockObservation],
-        pattern_mean_abs_error_ms: Optional[float],
-        pattern_clock_delta_spread_ms: Optional[float],
-    ) -> dict[str, Any]:
-        return {
-            "event": "relative_correction_skipped",
-            "reason": reason,
-            **self._base_record(
-                obs,
-                active=active,
-                common_drift_ms=None,
-                residual_ms=None,
-                recent_residual_ms=None,
-                pattern_mean_abs_error_ms=pattern_mean_abs_error_ms,
-                pattern_clock_delta_spread_ms=pattern_clock_delta_spread_ms,
-            ),
-        }
-
-    def _common_slope_ppm(self) -> Optional[float]:
-        if len(self.common_history) < 2:
-            return None
-        t0 = self.common_history[0][0]
-        xs = [item[0] - t0 for item in self.common_history]
-        ys = [item[1] for item in self.common_history]
-        mean_x = sum(xs) / len(xs)
-        mean_y = sum(ys) / len(ys)
-        denom = sum((x - mean_x) ** 2 for x in xs)
-        if denom <= 0.0:
-            return None
-        slope_samples_per_sec = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
-        return slope_samples_per_sec / SAMPLE_RATE * 1_000_000.0
-
-    def _clamp_ppm(self, value: float) -> float:
-        return max(-self.max_ppm, min(self.max_ppm, float(value)))
-
-    @staticmethod
-    def _median(values: list[float]) -> float:
-        ordered = sorted(values)
-        mid = len(ordered) // 2
-        if len(ordered) % 2:
-            return ordered[mid]
-        return (ordered[mid - 1] + ordered[mid]) / 2.0
-
 
 def _current_emit_entry(entries: list[Any]) -> Optional[dict[str, Any]]:
     parsed = [entry for entry in entries if isinstance(entry, dict) and "frame_index" in entry]
@@ -1285,16 +1044,6 @@ def _sample_clock_fields(
     }
 
 
-def _consume_clock_prior_reset_window(
-    target: SpeakerTarget,
-    expected_delta_samples: Optional[float],
-) -> bool:
-    if expected_delta_samples is None or target.clock_prior_reset_remaining <= 0:
-        return True
-    target.clock_prior_reset_remaining -= 1
-    return False
-
-
 class RuntimeSyncService:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -1304,32 +1053,10 @@ class RuntimeSyncService:
         self.state = RuntimeSyncState()
         self.stop_event = asyncio.Event()
         self.loop_task: Optional[asyncio.Task[None]] = None
-        # Slice 3: closed-loop drift correction. Opt-in via --enable-correction;
-        # default is measure-only (slice 2 behavior). Spec:
-        # docs/maverick/proposals/09-slice-3-implementation-spec.md
-        self.controller: Optional[DriftController] = (
-            DriftController(
-                max_ppm=args.max_ppm,
-                smoothing_window=args.smoothing_window,
-            )
-            if getattr(args, "enable_correction", False) and getattr(args, "detector_mode", None) != "pattern"
-            else None
-        )
-        self.relative_estimator: Optional[RelativeDriftEstimator] = (
-            RelativeDriftEstimator(
-                max_ppm=args.max_ppm,
-                smoothing_window=args.smoothing_window,
-                gain_ppm_per_ms=args.relative_gain_ppm_per_ms,
-                peer_max_age_sec=args.relative_peer_max_age_sec,
-            )
-            if (
-                getattr(args, "enable_relative_proposals", False)
-                or getattr(args, "slice4_observe", False)
-                or getattr(args, "enable_correction", False)
-            )
-            else None
-        )
         self.slice5_actuator: Optional[SpeakerActuator] = None
+        self.baseline_samples: dict[str, list[float]] = {}  # dynamic target: per-speaker raw codec latency samples
+        self._target_from_persistence: bool = False
+        self._fast_align_active = False
         self._slice4_observe_enabled = bool(getattr(args, "slice4_observe", False))
         self.slice4_observer: Optional[ObservationWriter] = (
             ObservationWriter(Path(args.slice4_observation_path))
@@ -1339,6 +1066,10 @@ class RuntimeSyncService:
 
     async def run(self) -> None:
         with self.slice4_observer if self.slice4_observer is not None else contextlib.nullcontext():
+            startup_targets = await self._wait_for_startup_speaker()
+            if not startup_targets:
+                return
+            self.state.targets = startup_targets
             await self.capture.start()
             await self.start_measurement()
             await self.stop_event.wait()
@@ -1359,11 +1090,55 @@ class RuntimeSyncService:
         if self.slice5_actuator is not None:
             self.slice5_actuator.emergency_stop()
 
+    async def _wait_for_startup_speaker(self) -> list[SpeakerTarget]:
+        attempts = int(getattr(self.args, "startup_gate_attempts", STARTUP_GATE_ATTEMPTS))
+        interval_sec = float(getattr(self.args, "startup_gate_interval_sec", STARTUP_GATE_INTERVAL_SEC))
+        for attempt in range(1, attempts + 1):
+            targets = discover_active_speakers(limit=self.args.max_speakers)
+            if targets:
+                _emit(
+                    "startup_gate_ready",
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    active_macs=[target.mac for target in targets],
+                )
+                return targets
+            _emit(
+                "startup_gate_waiting",
+                attempt=attempt,
+                max_attempts=attempts,
+                interval_sec=interval_sec,
+                reason="no_connected_speaker_macs",
+            )
+            if attempt < attempts:
+                await asyncio.sleep(interval_sec)
+        _emit(
+            "startup_gate_timeout",
+            attempts=attempts,
+            interval_sec=interval_sec,
+            max_wait_sec=attempts * interval_sec,
+            reason="no_connected_speaker_macs",
+        )
+        return []
+
     async def _measurement_loop(self) -> None:
         await self.detector.warmup(self.args.warmup_sec)
         while self.state.measuring:
+            fast_align_active = self._refresh_fast_align_state()
             previous = {target.mac: target for target in self.state.targets}
-            discovered = discover_active_speakers(limit=self.args.max_speakers)
+            excluded_macs = read_ultrasonic_exclusions()
+            discovered = discover_active_speakers(
+                limit=self.args.max_speakers,
+                excluded_macs=excluded_macs,
+            )
+            skipped = sorted(excluded_macs & set(previous))
+            if excluded_macs:
+                _emit(
+                    "ultrasonic_participation_skipped",
+                    excluded_macs=sorted(excluded_macs),
+                    skipped_macs=skipped,
+                    control_path=str(ULTRASONIC_EXCLUDED_PATH),
+                )
             for target in discovered:
                 if target.mac in previous:
                     target.stable_count = previous[target.mac].stable_count
@@ -1374,9 +1149,7 @@ class RuntimeSyncService:
                         target.mac
                     ].last_sample_clock_delta_samples
                     target.pattern_clock_reject_count = previous[target.mac].pattern_clock_reject_count
-                    target.clock_prior_reset_remaining = previous[
-                        target.mac
-                    ].clock_prior_reset_remaining
+                    target.clock_prior_reset_remaining = previous[target.mac].clock_prior_reset_remaining
             self.state.targets = discovered
             self._sync_slice5_actuator(discovered)
             if not self.state.targets:
@@ -1387,25 +1160,52 @@ class RuntimeSyncService:
                 if not self.state.measuring:
                     break
                 await self._measure_once(target)
-                await asyncio.sleep(self.args.cadence_sec)
+                cadence_sec = FAST_ALIGN_CADENCE_SEC if fast_align_active else self.args.cadence_sec
+                await asyncio.sleep(cadence_sec)
             self.state.cycles += 1
 
+    def _refresh_fast_align_state(self) -> bool:
+        try:
+            active = FAST_ALIGN_TRIGGER_PATH.exists()
+        except OSError as exc:
+            _emit(
+                "fast_align_trigger_probe_failed",
+                path=str(FAST_ALIGN_TRIGGER_PATH),
+                error=repr(exc),
+            )
+            active = False
+        if active != self._fast_align_active:
+            self._fast_align_active = active
+            _emit(
+                "fast_align_mode_changed",
+                active=active,
+                trigger_path=str(FAST_ALIGN_TRIGGER_PATH),
+                cadence_sec=FAST_ALIGN_CADENCE_SEC if active else self.args.cadence_sec,
+                confidence_window_n=(
+                    FAST_ALIGN_CONFIDENCE_WINDOW_N if active else CONFIDENCE_WINDOW_N
+                ),
+            )
+        return active
+
+    def _confidence_window_n(self) -> int:
+        return FAST_ALIGN_CONFIDENCE_WINDOW_N if self._fast_align_active else CONFIDENCE_WINDOW_N
+
     def _sync_slice5_actuator(self, targets: list[SpeakerTarget]) -> None:
-        if not getattr(self.args, "enable_correction", False):
+        if getattr(self.args, "detector_mode", None) != "pattern":
             return
         sockets = {target.mac: target.socket_path for target in targets}
         if self.slice5_actuator is None:
-            self.slice5_actuator = SpeakerActuator(
-                sockets,
-                max_rate_ppm=self.args.max_ppm,
-            )
+            self.slice5_actuator = SpeakerActuator(sockets)
             register_ble_stop_callback(self.slice5_actuator.emergency_stop)
-            _emit("slice5_actuator_started", speaker_macs=sorted(sockets), burst_amp_x1000=BURST_AMP_X1000)
+            _emit(
+                "slice5_actuator_started",
+                speaker_macs=sorted(sockets),
+                burst_amp_x1000=BURST_AMP_X1000,
+                burst_amp_ladder_x1000=list(BURST_AMP_LADDER_X1000),
+                burst_miss_escalation_threshold=BURST_MISS_ESCALATION_THRESHOLD,
+            )
             return
-        old_states = self.slice5_actuator.states
         self.slice5_actuator.sync_sockets(sockets)
-        for mac in set(old_states) | {mac.upper() for mac in sockets}:
-            self.slice5_actuator._state(mac)
 
     async def _measure_once(self, target: SpeakerTarget) -> None:
         if self.args.detector_mode == "pattern":
@@ -1482,30 +1282,6 @@ class RuntimeSyncService:
             **sample_clock,
         )
 
-        # Slice 3: closed-loop drift correction (opt-in via --enable-correction).
-        # Observe the new measurement; if the controller decides to apply, push
-        # the bounded set_rate_ppm command to this speaker's filter socket.
-        if self.controller is not None:
-            record = self.controller.observe(
-                mac=target.mac,
-                latency_ms=latency_ms,
-                slider_ms=target_delay_ms,
-                snr_db=detection["snr_db"],
-                stable_count=target.stable_count,
-            )
-            if record is not None:
-                _emit(**record)
-                if record["event"] == "correction_applied":
-                    response = _send_filter_command(
-                        target.socket_path,
-                        f"set_rate_ppm {record['applied_ppm']:.3f}",
-                    )
-                    _emit(
-                        "correction_applied_response",
-                        mac=target.mac,
-                        response=response,
-                        applied_ppm=record["applied_ppm"],
-                    )
 
     async def _measure_pattern(self, target: SpeakerTarget) -> None:
         query = _send_filter_command(target.socket_path, "query") or {}
@@ -1515,9 +1291,10 @@ class RuntimeSyncService:
         _send_filter_command(target.socket_path, "query_emit_timestamps")
 
         emit_records: list[dict[str, Any]] = []
+        burst_amp_x1000 = self._burst_amp_x1000_for(target)
         emit_payload = (
             f"emit_burst {int(round(self.args.freq_hz * 10))} "
-            f"{int(self.args.duration_ms)} {int(round(self.args.amplitude * 1000))}"
+            f"{int(self.args.duration_ms)} {burst_amp_x1000}"
         )
         pattern_gap_sec = max(
             self.args.pattern_gap_ms / 1000.0,
@@ -1546,6 +1323,7 @@ class RuntimeSyncService:
                 slider_target_delay_samples=target_delay_samples,
                 slider_target_delay_ms=target_delay_ms,
                 pattern_gap_sec=pattern_gap_sec,
+                burst_amp_x1000=burst_amp_x1000,
                 ack=ack,
             )
             if not ack or not ack.get("ok"):
@@ -1586,6 +1364,7 @@ class RuntimeSyncService:
                     "emit_entry_count": len(emit_entries),
                     "detect_start_monotonic": detect_start,
                     "detect_end_monotonic": detect_end,
+                    "burst_amp_x1000": burst_amp_x1000,
                     "stable_count": target.stable_count,
                 },
             )
@@ -1598,15 +1377,16 @@ class RuntimeSyncService:
                 frame_entries=entries,
                 detect_start_monotonic=detect_start,
                 detect_end_monotonic=detect_end,
+                burst_amp_x1000=burst_amp_x1000,
             )
             return
 
         emit_frame_indices = [int(entry["frame_index"]) for entry in emit_entries[: self.args.pattern_bursts]]
-        clock_prior_delta_samples = target.last_sample_clock_delta_samples
-        enforce_clock_prior = _consume_clock_prior_reset_window(
-            target,
-            clock_prior_delta_samples,
+        clock_prior_delta_samples = (
+            None if target.clock_prior_reset_remaining > 0 else target.last_sample_clock_delta_samples
         )
+        if target.clock_prior_reset_remaining > 0:
+            target.clock_prior_reset_remaining -= 1
         analysis = await self.detector.analyze_pattern(
             detect_start,
             detect_end,
@@ -1617,10 +1397,7 @@ class RuntimeSyncService:
             min_snr_db=self.args.pattern_min_snr_db,
             landmark=self.args.pattern_landmark,
             carrier_hz=self.args.freq_hz,
-            enforce_clock_prior=enforce_clock_prior,
         )
-        if not enforce_clock_prior:
-            analysis["clock_prior_reset_remaining"] = target.clock_prior_reset_remaining
         detection = analysis.get("selected")
         if not detection:
             target.stable_count = 0
@@ -1647,9 +1424,35 @@ class RuntimeSyncService:
                     "pattern_clock_reject_count": pattern_clock_reject_count,
                     "reset_clock_prior": reset_clock_prior,
                     "stable_count": target.stable_count,
+                    "burst_amp_x1000": burst_amp_x1000,
                     "analysis": analysis,
                 },
             )
+            if _CAPTURE_SESSION is not None:
+                _miss_detection = {
+                    "detect_end_monotonic": detect_end,
+                    "detect_start_monotonic": detect_start,
+                    "snr_db": analysis.get("envelope_peak_snr_db") if isinstance(analysis, dict) else None,
+                    "envelope_noise_floor_db": analysis.get("envelope_noise_floor_db") if isinstance(analysis, dict) else None,
+                    "envelope_peak_db": analysis.get("envelope_peak_db") if isinstance(analysis, dict) else None,
+                }
+                _miss_emit_records = [
+                    {"emit_monotonic": e.get("emit_monotonic"), "emit_frame_index": e.get("emit_frame_index")}
+                    for e in emit_records
+                ]
+                _enqueue_arrival_capture(
+                    ring=self.ring,
+                    mac=target.mac,
+                    detection=_miss_detection,
+                    emit_records=_miss_emit_records,
+                    outcome="missed",
+                    burst_amp_x1000=burst_amp_x1000,
+                    pattern_bursts=self.args.pattern_bursts,
+                    pattern_gap_ms=self.args.pattern_gap_ms,
+                    burst_freq_hz=self.args.freq_hz,
+                    burst_duration_ms=self.args.duration_ms,
+                    reject_reason=reject_reason,
+                )
             _emit(
                 "burst_pattern_missed",
                 mac=target.mac,
@@ -1660,6 +1463,8 @@ class RuntimeSyncService:
                 detect_end_monotonic=detect_end,
                 pattern_clock_reject_count=pattern_clock_reject_count,
                 reset_clock_prior=reset_clock_prior,
+                clock_prior_reset_remaining=target.clock_prior_reset_remaining,
+                burst_amp_x1000=burst_amp_x1000,
                 **analysis,
             )
             return
@@ -1672,6 +1477,19 @@ class RuntimeSyncService:
         if len(target.latency_history_ms) > SLICE4_HISTORY_LIMIT:
             target.latency_history_ms = target.latency_history_ms[-SLICE4_HISTORY_LIMIT:]
         sample_clock = _sample_clock_fields(target, detection, [emit_entries[0]])
+        if _CAPTURE_SESSION is not None:
+            _enqueue_arrival_capture(
+                ring=self.ring,
+                mac=target.mac,
+                detection=detection,
+                emit_records=emit_records,
+                outcome="arrival",
+                burst_amp_x1000=burst_amp_x1000,
+                pattern_bursts=self.args.pattern_bursts,
+                pattern_gap_ms=self.args.pattern_gap_ms,
+                burst_freq_hz=self.args.freq_hz,
+                burst_duration_ms=self.args.duration_ms,
+            )
         _emit(
             "burst_pattern_arrival",
             mac=target.mac,
@@ -1700,6 +1518,8 @@ class RuntimeSyncService:
             pattern_clock_prior_delta_samples=detection.get("pattern_clock_prior_delta_samples"),
             pattern_clock_prior_error_ms=detection.get("pattern_clock_prior_error_ms"),
             pattern_clock_prior_tolerance_ms=detection.get("pattern_clock_prior_tolerance_ms"),
+            measurement_precision_us=detection.get("measurement_precision_us"),
+            clock_prior_reset_remaining=target.clock_prior_reset_remaining,
             envelope_noise_floor_db=detection.get("envelope_noise_floor_db"),
             envelope_threshold_db=detection.get("envelope_threshold_db"),
             envelope_peak_db=detection.get("envelope_peak_db"),
@@ -1709,50 +1529,51 @@ class RuntimeSyncService:
             emit_frame_indices=emit_frame_indices,
             frame_entries=entries,
             stable_count=target.stable_count,
+            burst_amp_x1000=burst_amp_x1000,
             **sample_clock,
         )
-        if self.relative_estimator is not None and "sample_clock_delta_samples" in sample_clock:
-            record = self.relative_estimator.observe(
-                mac=target.mac,
-                monotonic=float(
-                    detection.get("sample_clock_anchor_monotonic")
-                    or detection.get("arrival_monotonic")
-                    or emit_records[0]["emit_monotonic"]
-                ),
-                delta_samples=float(sample_clock["sample_clock_delta_samples"]),
-                snr_db=float(detection["snr_db"]),
-                stable_count=target.stable_count,
-                pattern_mean_abs_error_ms=detection.get("pattern_mean_abs_error_ms"),
-                pattern_clock_delta_spread_ms=detection.get("pattern_clock_delta_spread_ms"),
-            )
+        if self.args.observe_only:
+            actuation_result = None
+        else:
             actuation_result = self._apply_slice5_proposal(
                 target,
-                proposal_record=record,
                 current_filter_delay_ms=current_filter_delay_ms,
                 measured_latency_ms=latency_ms,
             )
-            self._record_slice4_observation(
-                target,
-                measured_latency_ms=latency_ms,
-                current_filter_delay_ms=current_filter_delay_ms,
-                snr_db=float(detection["snr_db"]),
-                proposal_record=record,
-                pattern_state_snapshot={
-                    "stable_count": target.stable_count,
-                    "sample_clock": sample_clock,
-                    "detection": {
-                        "pattern_mean_abs_error_ms": detection.get("pattern_mean_abs_error_ms"),
-                        "pattern_clock_delta_spread_ms": detection.get("pattern_clock_delta_spread_ms"),
-                        "pattern_selection_reason": detection.get("pattern_selection_reason"),
-                        "pattern_match_count": detection.get("pattern_match_count"),
-                        "pattern_rejected_by_clock_count": detection.get("pattern_rejected_by_clock_count"),
-                    },
-                    "relative_proposal": record,
+        if actuation_result is not None and actuation_result.clock_prior_reset:
+            target.last_sample_clock_delta_samples = None
+            target.clock_prior_reset_remaining = (
+                actuation_result.clock_prior_reset_cycles
+                or CLOCK_PRIOR_RESET_CYCLES
+            )
+        self._record_slice4_observation(
+            target,
+            measured_latency_ms=latency_ms,
+            current_filter_delay_ms=current_filter_delay_ms,
+            snr_db=float(detection["snr_db"]),
+            pattern_state_snapshot={
+                "stable_count": target.stable_count,
+                "sample_clock": sample_clock,
+                "detection": {
+                    "pattern_mean_abs_error_ms": detection.get("pattern_mean_abs_error_ms"),
+                    "pattern_clock_delta_spread_ms": detection.get("pattern_clock_delta_spread_ms"),
+                    "pattern_selection_reason": detection.get("pattern_selection_reason"),
+                    "pattern_match_count": detection.get("pattern_match_count"),
+                    "pattern_rejected_by_clock_count": detection.get("pattern_rejected_by_clock_count"),
+                    "burst_amp_x1000": burst_amp_x1000,
                 },
-                actuation_result=actuation_result,
-            )
-            if getattr(self.args, "enable_relative_proposals", False):
-                _emit(**record)
+                "actuation": (
+                    None
+                    if actuation_result is None
+                    else {
+                        "action": actuation_result.action,
+                        "delta_ms": actuation_result.delta_ms,
+                        "clock_prior_reset": actuation_result.clock_prior_reset,
+                    }
+                ),
+            },
+            actuation_result=actuation_result,
+        )
 
     def _record_slice4_missed_burst(
         self,
@@ -1782,36 +1603,106 @@ class RuntimeSyncService:
         if self.slice5_actuator is None:
             return None
         return self.slice5_actuator.apply(
-            {
-                "mac": target.mac,
-                "missed_burst": True,
-                "proposed_adjustment_ppm": math.nan,
-                "current_filter_delay_ms": current_filter_delay_ms,
-            }
+            target.mac,
+            None,
+            None,
+            current_filter_delay_ms,
+            missed_burst=True,
         )
+
+    def _burst_amp_x1000_for(self, target: SpeakerTarget) -> int:
+        if self.slice5_actuator is None:
+            return int(round(self.args.amplitude * 1000))
+        return self.slice5_actuator.burst_amp_x1000_for(target.mac)
 
     def _apply_slice5_proposal(
         self,
         target: SpeakerTarget,
         *,
-        proposal_record: dict[str, Any],
         current_filter_delay_ms: float,
         measured_latency_ms: float,
     ) -> Optional[ActuationResult]:
         if self.slice5_actuator is None:
             return None
-        proposal = {
-            **proposal_record,
-            "mac": target.mac,
-            "missed_burst": False,
-            "measured_latency_ms": measured_latency_ms,
-            "current_filter_delay_ms": current_filter_delay_ms,
-            "max_ppm": self.args.max_ppm,
-        }
-        result = self.slice5_actuator.apply(proposal)
-        if result.clock_prior_reset_cycles > 0:
-            target.clock_prior_reset_remaining = result.clock_prior_reset_cycles
-        return result
+
+        # Item 3: dynamic alignment target — accumulate per-speaker baseline samples.
+        # Use raw codec latency (measured - current filter delay) so the stored
+        # calibration delay doesn't inflate the baseline and produce a spurious
+        # 5000 ms target on BT-only sessions that follow a Sonos session.
+        mac = target.mac
+        target_total = read_startup_tune_target(mac, float(self.args.target_total_ms))
+        if target_total.source in {"shared", "per_speaker"}:
+            self._target_from_persistence = True
+
+        def emit_target_total_resolved() -> None:
+            _emit(
+                "runtime_target_total_resolved",
+                mac=target.mac,
+                target_total_ms=target_total.target_total_ms,
+                target_total_source=target_total.source,
+                target_total_path=str(target_total.path),
+            )
+
+        samples = self.baseline_samples.setdefault(mac, [])
+        if len(samples) < DYNAMIC_TARGET_BASELINE_N:
+            baseline_latency_ms = max(0.0, measured_latency_ms - current_filter_delay_ms)
+            samples.append(baseline_latency_ms)
+            _emit(
+                "dynamic_target_baseline_accumulating",
+                mac=mac,
+                baseline_count=len(samples),
+                baseline_needed=DYNAMIC_TARGET_BASELINE_N,
+                measured_latency_ms=measured_latency_ms,
+                current_filter_delay_ms=current_filter_delay_ms,
+                baseline_latency_ms=baseline_latency_ms,
+            )
+            # Don't feed to actuator yet on cold start — wait for enough baseline samples.
+            if not self._target_from_persistence and len(samples) < DYNAMIC_TARGET_BASELINE_N:
+                emit_target_total_resolved()
+                return None
+
+        # Once this speaker has its baseline, check if ALL active speakers do.
+        active_macs = {t.mac for t in self.state.targets}
+        all_have_baseline = all(
+            len(self.baseline_samples.get(m, [])) >= DYNAMIC_TARGET_BASELINE_N
+            for m in active_macs
+        )
+        if all_have_baseline and active_macs:
+            import statistics as _stat_target
+            per_speaker_medians = {
+                m: _stat_target.median(self.baseline_samples[m])
+                for m in active_macs
+                if len(self.baseline_samples.get(m, [])) >= DYNAMIC_TARGET_BASELINE_N
+            }
+            if per_speaker_medians:
+                new_target = max(per_speaker_medians.values()) + DYNAMIC_TARGET_MARGIN_MS
+                new_target = max(new_target, DYNAMIC_TARGET_MIN_MS)
+                old_target = float(self.args.target_total_ms)
+                if abs(new_target - old_target) > 10.0:
+                    self.args.target_total_ms = new_target
+                    _emit(
+                        "dynamic_target_set",
+                        old_target_ms=old_target,
+                        new_target_ms=new_target,
+                        per_speaker_medians=per_speaker_medians,
+                    )
+                    # Persist so BLE service stays in sync.
+                    try:
+                        from measurement.calibration_targets import record_startup_tune_target
+                        record_startup_tune_target(new_target)
+                    except Exception as _exc:  # noqa: BLE001
+                        _emit("dynamic_target_persist_failed", error=repr(_exc))
+
+        if not self._target_from_persistence:
+            target_total = read_startup_tune_target(mac, float(self.args.target_total_ms))
+        emit_target_total_resolved()
+        return self.slice5_actuator.apply(
+            target.mac,
+            measured_latency_ms,
+            target_total.target_total_ms,
+            current_filter_delay_ms,
+            confidence_window_n=self._confidence_window_n(),
+        )
 
     def _record_slice4_observation(
         self,
@@ -1820,14 +1711,13 @@ class RuntimeSyncService:
         measured_latency_ms: float,
         current_filter_delay_ms: float,
         snr_db: float,
-        proposal_record: dict[str, Any],
         pattern_state_snapshot: dict[str, Any],
         actuation_result: Optional[ActuationResult] = None,
     ) -> None:
         if self.slice4_observer is None:
             return
-        proposed_adjustment_ppm = float(proposal_record.get("proposed_rate_ppm", math.nan))
-        confidence = 1.0 if proposal_record.get("event") == "relative_correction_proposed" else 0.0
+        proposed_adjustment_ppm = math.nan
+        confidence = 1.0 if actuation_result is not None and actuation_result.action != "missed" else 0.0
         self.slice4_observer.write_observation(
             speaker_id=target.mac,
             measured_latency_ms=measured_latency_ms,
@@ -1838,7 +1728,7 @@ class RuntimeSyncService:
             },
             proposed_adjustment_ppm=proposed_adjustment_ppm,
             actuation_applied_ppm=(
-                actuation_result.actuation_applied_ppm if actuation_result is not None else 0.0
+                actuation_result.delta_ms if actuation_result is not None else 0.0
             ),
             confidence=confidence,
             current_filter_delay_ms=current_filter_delay_ms,
@@ -1848,18 +1738,15 @@ class RuntimeSyncService:
 
     def _pattern_state_base(self, target: SpeakerTarget) -> dict[str, Any]:
         baseline_latency_ms = None
-        slider_cooldown_cycles = None
         if self.slice5_actuator is not None:
             baseline_latency_ms = self.slice5_actuator.baseline_for(target.mac)
-            slider_cooldown_cycles = self.slice5_actuator.slider_cooldowns.get(target.mac.upper())
         return {
             "stable_count": target.stable_count,
             "sample_clock_baseline_samples": target.sample_clock_baseline_samples,
             "last_sample_clock_delta_samples": target.last_sample_clock_delta_samples,
             "pattern_clock_reject_count": target.pattern_clock_reject_count,
-            "clock_prior_reset_remaining": target.clock_prior_reset_remaining,
             "baseline_latency_ms": baseline_latency_ms,
-            "slider_cooldown_cycles": slider_cooldown_cycles,
+            "clock_prior_reset_remaining": target.clock_prior_reset_remaining,
         }
 
 
@@ -1885,11 +1772,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mic-source-prefix", default=DEFAULT_MIC_SOURCE_PREFIX)
     parser.add_argument("--cadence-sec", type=float, default=DEFAULT_CADENCE_SEC)
     parser.add_argument("--warmup-sec", type=float, default=DEFAULT_WARMUP_SEC)
-    parser.add_argument("--max-speakers", type=int, default=2)
+    parser.add_argument("--max-speakers", type=int, default=4)
     parser.add_argument("--freq-hz", type=float, default=DEFAULT_FREQ_HZ)
     parser.add_argument("--duration-ms", type=int, default=DEFAULT_DURATION_MS)
     parser.add_argument("--amplitude", type=float, default=DEFAULT_AMPLITUDE)
     parser.add_argument("--bt-codec-latency-ms", type=float, default=DEFAULT_BT_CODEC_LATENCY_MS)
+    parser.add_argument("--target-total-ms", type=float, default=500.0,
+                        help="Fixed wall-clock target latency in ms for every speaker (matches the startup-tune target_total_ms). Default 500.0.")
+    parser.add_argument("--observe-only", action="store_true",
+                        help="Slice-16 drift characterization: emit bursts, log measured_latency_ms, but skip actuator.apply(). CSV still written. Use for natural-drift soak experiments.")
+    parser.add_argument("--capture-raw", action="store_true",
+                        help="Slice-17 raw-mic archive: per burst arrival (or miss), write a WAV slice of the mic window + JSON sidecar with all detector metadata. Re-analyzable by any future detector.")
+    parser.add_argument("--capture-raw-dir", type=str, default="/var/lib/syncsonic/observe-raw",
+                        help="Parent directory for slice-17 raw-mic capture sessions. Each run gets its own timestamped subdirectory.")
     parser.add_argument(
         "--detector-mode",
         choices=("peak", "onset", "pattern"),
@@ -1932,30 +1827,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=PATTERN_LANDMARK,
         help="Mic-side timing landmark for pattern mode",
     )
-    # Slice 3: closed-loop drift correction flags.
-    # Spec: docs/maverick/proposals/09-slice-3-implementation-spec.md
-    parser.add_argument(
-        "--enable-correction",
-        action="store_true",
-        help="Enable closed-loop drift correction (default: measure-only)",
-    )
-    parser.add_argument(
-        "--max-ppm",
-        type=float,
-        default=50.0,
-        help="Maximum |ppm| correction bound per ROADMAP section 4",
-    )
-    parser.add_argument(
-        "--smoothing-window",
-        type=int,
-        default=5,
-        help="Rolling-mean window for drift estimation",
-    )
-    parser.add_argument(
-        "--enable-relative-proposals",
-        action="store_true",
-        help="Log group-relative correction proposals from pattern sample-clock measurements without actuating",
-    )
     parser.add_argument(
         "--slice4-observe",
         action="store_true",
@@ -1968,31 +1839,174 @@ def _build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--relative-gain-ppm-per-ms",
-        type=float,
-        default=RELATIVE_CORRECTION_GAIN_PPM_PER_MS,
-        help="Observe-only proportional gain for relative residual ms -> proposed ppm",
+        "--startup-gate-attempts",
+        type=int,
+        default=STARTUP_GATE_ATTEMPTS,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--relative-peer-max-age-sec",
+        "--startup-gate-interval-sec",
         type=float,
-        default=RELATIVE_PEER_MAX_AGE_SEC,
-        help="Maximum age of another speaker's last pattern measurement for common-mode subtraction",
+        default=STARTUP_GATE_INTERVAL_SEC,
+        help=argparse.SUPPRESS,
     )
     return parser
 
 
+
+
+# === Slice 17: raw-mic archive (capture-raw mode) =================================
+import wave as _wave_for_capture
+import datetime as _dt_for_capture
+import threading as _threading_for_capture
+import queue as _queue_for_capture
+
+_CAPTURE_QUEUE: "_queue_for_capture.Queue" = _queue_for_capture.Queue(maxsize=512)
+_CAPTURE_THREAD: Optional["_threading_for_capture.Thread"] = None
+_CAPTURE_DROPPED = 0
+
+
+class _CaptureSession:
+    """Per-run state for slice-17 raw-mic archive."""
+    def __init__(self, parent_dir: str, args_dict: dict):
+        self.session_id = _dt_for_capture.datetime.now().strftime("%Y%m%dT%H%M%S")
+        self.dir = Path(parent_dir) / self.session_id
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.sample_rate = SAMPLE_RATE
+        manifest = {
+            "schema": 1,
+            "session_id": self.session_id,
+            "started_unix": time.time(),
+            "started_iso": _dt_for_capture.datetime.now().isoformat(),
+            "sample_rate": SAMPLE_RATE,
+            "args": args_dict,
+        }
+        (self.dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    def stem_for(self, mac: str, arrival_monotonic: float) -> str:
+        return f"{mac.replace(':', '_')}_{int(arrival_monotonic * 1e6)}"
+
+
+_CAPTURE_SESSION: Optional[_CaptureSession] = None
+
+
+def _capture_writer_loop():
+    """Daemon thread: drain _CAPTURE_QUEUE, write WAV+JSON to disk. Never touches asyncio."""
+    while True:
+        try:
+            item = _CAPTURE_QUEUE.get()
+            if item is None:
+                return
+            pcm_i16, meta_dict, sess_dir, stem, sample_rate = item
+            wav_path = sess_dir / f"{stem}.wav"
+            json_path = sess_dir / f"{stem}.json"
+            try:
+                with _wave_for_capture.open(str(wav_path), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(pcm_i16.tobytes())
+                json_path.write_text(json.dumps(meta_dict, indent=2, default=str))
+            except Exception as exc:
+                print(f"[slice17-writer] WAV/JSON write failed stem={stem}: {exc!r}", file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"[slice17-writer] loop exc: {exc!r}", file=sys.stderr, flush=True)
+
+
+def _ensure_capture_thread() -> None:
+    global _CAPTURE_THREAD
+    if _CAPTURE_THREAD is None or not _CAPTURE_THREAD.is_alive():
+        _CAPTURE_THREAD = _threading_for_capture.Thread(target=_capture_writer_loop, name="slice17-writer", daemon=True)
+        _CAPTURE_THREAD.start()
+
+
+def _enqueue_arrival_capture(
+    ring,
+    mac: str,
+    detection: dict,
+    emit_records: list,
+    outcome: str,
+    burst_amp_x1000: int,
+    pattern_bursts: int,
+    pattern_gap_ms: float,
+    burst_freq_hz: float,
+    burst_duration_ms: int,
+    reject_reason: Optional[str] = None,
+    pre_pad_sec: float = 0.20,
+    post_pad_sec: float = 0.30,
+) -> None:
+    """SYNC entry. Snapshots ring chunks (no lock), enqueues to writer thread."""
+    global _CAPTURE_DROPPED
+    sess = _CAPTURE_SESSION
+    if sess is None:
+        return
+    try:
+        emit_t = emit_records[0]["emit_monotonic"]
+        if outcome == "arrival":
+            end_t = detection["arrival_monotonic"] + post_pad_sec
+        else:
+            end_t = detection.get("detect_end_monotonic", emit_t + 2.0) + post_pad_sec
+        start_t = emit_t - pre_pad_sec
+
+        pieces = []
+        for chunk in list(ring._chunks):
+            if chunk.end_time <= start_t:
+                continue
+            if chunk.start_time >= end_t:
+                break
+            si = max(0, int(math.floor((start_t - chunk.start_time) * ring.sample_rate)))
+            ei = min(len(chunk.samples), int(math.ceil((end_t - chunk.start_time) * ring.sample_rate)))
+            if ei <= si:
+                continue
+            pieces.append(chunk.samples[si:ei])
+        if not pieces:
+            return
+        samples = np.concatenate(pieces)
+        if samples.size == 0:
+            return
+        pcm = np.clip(samples, -1.0, 1.0)
+        pcm_i16 = (pcm * 32767.0).astype(np.int16)
+
+        stem = sess.stem_for(mac, detection.get("arrival_monotonic", emit_t))
+        meta = {
+            "schema": 1,
+            "mac": mac,
+            "outcome": outcome,
+            "reject_reason": reject_reason,
+            "sample_rate": sess.sample_rate,
+            "window_start_monotonic": start_t,
+            "window_end_monotonic": end_t,
+            "window_sample_count": int(pcm_i16.size),
+            "emit_records": [{"emit_monotonic": r.get("emit_monotonic"), "emit_frame_index": r.get("emit_frame_index")} for r in emit_records],
+            "arrival_monotonic": detection.get("arrival_monotonic"),
+            "snr_db": detection.get("snr_db"),
+            "envelope_noise_floor_db": detection.get("envelope_noise_floor_db"),
+            "envelope_peak_db": detection.get("envelope_peak_db"),
+            "pattern_clock_delta_spread_ms": detection.get("pattern_clock_delta_spread_ms"),
+            "pattern_mean_abs_error_ms": detection.get("pattern_mean_abs_error_ms"),
+            "burst_amp_x1000": burst_amp_x1000,
+            "burst_freq_hz": burst_freq_hz,
+            "burst_duration_ms": burst_duration_ms,
+            "pattern_bursts": pattern_bursts,
+            "pattern_gap_ms": pattern_gap_ms,
+        }
+        try:
+            _CAPTURE_QUEUE.put_nowait((pcm_i16, meta, sess.dir, stem, sess.sample_rate))
+        except _queue_for_capture.Full:
+            _CAPTURE_DROPPED += 1
+    except Exception as exc:
+        _emit("capture_raw_error", mac=mac, error=repr(exc))
+
+
+# === End slice 17 helpers ========================================================
+
 async def _amain(argv: Optional[Iterable[str]] = None) -> int:
     args = _build_parser().parse_args(list(argv) if argv is not None else None)
-    if args.enable_correction:
-        logging.basicConfig(level=logging.INFO, format="%(message)s")
-        args.detector_mode = "pattern"
-        args.amplitude = BURST_AMP_X1000 / 1000.0
     if args.slice4_observe:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         args.detector_mode = "pattern"
-    if args.detector_mode == "pattern" and args.pattern_bursts < 2:
-        raise SystemExit("--pattern-bursts must be >= 2 when --detector-mode=pattern")
+    if args.detector_mode == "pattern" and args.pattern_bursts < 1:
+        raise SystemExit("--pattern-bursts must be >= 1")
     service = RuntimeSyncService(args)
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -2000,6 +2014,11 @@ async def _amain(argv: Optional[Iterable[str]] = None) -> int:
             loop.add_signal_handler(signum, service.stop_event.set)
     with contextlib.suppress(NotImplementedError):
         loop.add_signal_handler(signal.SIGUSR1, service.emergency_stop)
+    global _CAPTURE_SESSION
+    if args.capture_raw:
+        _CAPTURE_SESSION = _CaptureSession(args.capture_raw_dir, vars(args))
+        _ensure_capture_thread()
+        _emit("slice17_capture_session_started", session_id=_CAPTURE_SESSION.session_id, dir=str(_CAPTURE_SESSION.dir))
     _emit("service_starting", args=vars(args))
     try:
         await service.run()

@@ -384,3 +384,13 @@ export async function calibrateAllSpeakers(
   console.log('CALIBRATE_ALL_SPEAKERS', payload);
   return bleWrite(device, MESSAGE_TYPES.CALIBRATE_ALL_SPEAKERS, payload);
 }
+
+export async function setUltrasonicParticipation(
+  device: Device,
+  mac: string,
+  included: boolean,
+): Promise<void> {
+  const payload = { mac, included };
+  console.log('SET_ULTRASONIC_PARTICIPATION', payload);
+  return bleWrite(device, MESSAGE_TYPES.SET_ULTRASONIC_PARTICIPATION, payload);
+}

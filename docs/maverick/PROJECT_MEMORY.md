@@ -2,6 +2,20 @@
 
 Durable cross-workstream facts, decisions, and conventions. Operator-editable; planning agents read this before each slice.
 
+## 2026-06-08 — ultrasonic-runtime-sync promoted to main
+
+**What shipped.** The `ultrasonic-runtime-sync` lane was validated and merged to `main` today. Ultrasonic alignment is now the unconditional default: `runtime-latency.service` starts automatically and actuates without any opt-in flag. Key changes in the conclusionary slice:
+
+- `FREAK_THRESHOLD_MS` removed — confidence window (median-of-3 + 2σ floor) is the sole input gate. Enables large initial-offset correction without false outlier rejection.
+- Per-speaker opt-out toggle in `SpeakerConfigScreen.tsx` — `SET_ULTRASONIC_PARTICIPATION` BLE opcode `0x6A`, exclusion state in `/run/syncsonic/ultrasonic_excluded.json`.
+- `RuntimeCorrectionWatcher` in `syncsonic_ble/runtime_corrections.py` — daemon thread inside the GATT service that tails `runtime_corrections.jsonl` and forwards all `phase=runtime_correction` events as `CALIBRATION_RESULT` BLE notifications. All actuation states (building_window, within_threshold, corrected) are now reflected in the frontend autosync card and latency slider in real time.
+- Measurement cadence tuned: `cadence_sec` 15 → 5, `CONFIDENCE_WINDOW_N` 5 → 3. Time to first correction ~36 s vs ~2.5 min previously.
+- Promotion gate override: the formal Slice 7 24-hour soak was waived by operator decision; conclusionary validation session on `syncsonic@10.0.0.89` accepted as sufficient.
+
+**Known open issue — post-correction settling race.** Short cadence (5 s) + window reset after every correction = the three post-correction measurements are taken while the BT codec pipeline is still settling at the new delay. With N=3 and no per-cycle magnitude cap, two transient readings can dominate the window median and fire a second large correction in the wrong direction. Observed in the JBL speaker during validation. Not regressed from before — it's a consequence of the cadence speedup. Scoped to `correction-hardening` workstream.
+
+**Planned follow-on workstream: correction-hardening.** Not yet opened. Scope: post-correction settling holdoff, per-cycle correction magnitude cap, adaptive per-sample input clamp (per-speaker rolling mean ± k×σ replacing the removed `FREAK_THRESHOLD_MS`), dynamic alignment target (`target = max(baselines) + margin` replaces stale static value — fixes the 5000 ms Sonos-legacy target that wastes latency on BT-only setups), and convergence/tracking two-phase control.
+
 ## 2026-05-01 - North Star reached on PipeWire stack
 
 - 3-speaker (2 BT + 1 Wi-Fi Sonos) auto-aligned playback validated end-to-end on Pi `syncsonic@10.0.0.89`.
@@ -548,3 +562,28 @@ Process correction: exploratory work was staged on
 `codex/ultrasonic-sample-clock-pattern`. Canonical review/merge must happen from
 a Maverick workstream branch targeting `ultrasonic-runtime-sync`; do not merge
 the `codex/*` branch directly.
+
+## 2026-06-03 — M5 ultrasonic-runtime-sync reached production-effective state
+
+After an iterative design conversation spanning slices 15-18 (cross-correlation detector, observe-only drift characterization, raw-mic archive, single-burst sparse cadence, symmetric amp ladder, confidence-gated actuation), the closed-loop ultrasonic alignment system is functioning as a fully-integrated production tool on the operator's 2-BT-speaker setup. Operator framing: "we have a very strong fully fleshed out tool."
+
+**Architectural journey:**
+
+- **Slice 15 (cross-correlation upgrade)** brought single-measurement precision to sub-millisecond via template-matched xcorr + quadratic sub-sample interpolation. Verified live: 0.4 ms median precision_us at SNR floor.
+- **Slice 16 (observe-only mode)** enabled drift characterization without controller interference. Subsequent 62-hour soak showed essentially zero slow drift (≤0.2 ms/min) on both speakers.
+- **Slice 17 (raw-mic capture archive)** persists every burst arrival as WAV + JSON sidecar so any future detector can re-analyze the same physical signal. 650 MB / 7,277 captures already accumulated.
+- **Slice 18 (single-burst sparse-cadence)** replaced 3-burst-at-300ms-spacing with a single isolated burst per 30-second cycle. Eliminated the ~100 ms artifacts that the close-spaced pattern matcher was producing (mis-locks to wrong burst, room-echo confusion). Cycle-to-cycle std dropped 42 ms -> 15 ms on 2C:FD (3x).
+- **Slice 18 smart amp adjustment** made the slice-9 amplitude ladder symmetric: one rung up on every miss, one rung down on every success. Eliminated the sticky-at-950 audibility regression that had caused bursts to become audible after the ladder escalated and never came back down.
+- **Slice 18.2 confidence-gated actuation** sources corrections from median of a sliding 5-measurement window per speaker, gated by both an absolute 30 ms apply threshold AND a 2-sigma noise-floor gate (correction only fires if signal exceeds 2x window std). Live verified: zero corrections during a 15-minute window when measurement noise was high; system audibly transparent.
+
+**Empirical findings worth remembering:**
+
+- **Apparent 100-200 ms "jumps" in earlier 3-burst data were detector artifacts**, not real physical events. Operator audibility check exposed this: a real 100+ ms latency jump on one of two paired speakers would be catastrophically audible (slap-back, clicks), and operator did not hear them.
+- **Cross-speaker analysis confirmed jumps are independent per-speaker** (0% coincidence vs 11% random baseline) — BT codec internal buffer re-anchoring, not common-mode pipeline issues. F4:6A and 2C:FD had their own independent jumpy windows that did not align.
+- **Long-window drift is essentially zero** at this timescale. BT speakers hold their position over hours; continuous tight-cadence correction was over-engineered for the actual drift pattern.
+
+**What this means architecturally:** the bottleneck was always measurement precision and detector ambiguity, not the speakers themselves. Once measurement quality (slice 15) and discriminator design (slice 18) were correct, the closed-loop became silent and stable.
+
+**Future exploration documented in `epics/ultrasonic-runtime-sync.md`** — six areas of potential improvement (xcorr precision, frequency adaptation, raw-mic analysis tooling, 24-hour soak, WiFi PipeWire integration, adaptive cadence). Operator decision 2026-06-03: not filed as committed workstreams. Only the WiFi integration is flagged as potentially warranting real workstream status eventually, and even there the architectural shape is undecided.
+
+**Epic promotion gate:** ultrasonic-runtime-sync epic remains unmerged to main as of 2026-06-03. Promotion is a separate operator-triggered step; not on this entry's critical path.

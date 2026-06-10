@@ -29,6 +29,8 @@ export const MESSAGE_TYPES = {
   CALIBRATE_SPEAKER: 0x68,
   // Slice 4.3: sequential calibration for all outputs
   CALIBRATE_ALL_SPEAKERS: 0x69,
+  // Runtime ultrasonic auto-align participation toggle
+  SET_ULTRASONIC_PARTICIPATION: 0x6A,
   // Connection Status Update
   CONNECTION_STATUS_UPDATE: 0x70,  // General connection status update
   // Slice 4.x: calibration / sequence progress from Pi (many phases per run)

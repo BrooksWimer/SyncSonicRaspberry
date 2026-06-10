@@ -16,6 +16,7 @@ sys.modules.setdefault("dbus", types.SimpleNamespace(SystemBus=lambda: None))
 
 from measurement.runtime_latency_service import RuntimeSyncService, SpeakerTarget, _build_parser  # noqa: E402
 from measurement.slice4_observer import CSV_COLUMNS, ObservationWriter  # noqa: E402
+from measurement.slice5_actuator import ActuationResult  # noqa: E402
 
 
 def _logger() -> tuple[logging.Logger, io.StringIO]:
@@ -134,7 +135,7 @@ def test_unwritable_path_raises_on_startup(tmp_path: Path, monkeypatch) -> None:
         raise AssertionError("RuntimeError not raised")
 
 
-def test_full_proposal_row_written(tmp_path: Path) -> None:
+def test_full_actuation_row_written(tmp_path: Path) -> None:
     path = tmp_path / "slice4.csv"
     args = _service_args(path, "--slice4-observe")
     service = RuntimeSyncService(args)
@@ -154,14 +155,15 @@ def test_full_proposal_row_written(tmp_path: Path) -> None:
             measured_latency_ms=103.0,
             current_filter_delay_ms=13.5,
             snr_db=22.0,
-            proposal_record=proposal,
             pattern_state_snapshot={"relative_proposal": proposal},
+            actuation_result=ActuationResult(action="corrected", delta_ms=-7.25),
         )
 
     row = _rows(path)[0]
     assert row["speaker_id"] == "AA:BB:CC:DD:EE:FF"
     assert float(row["measured_latency_ms"]) == 103.0
-    assert float(row["proposed_adjustment_ppm"]) == -7.25
+    assert math.isnan(float(row["proposed_adjustment_ppm"]))
+    assert float(row["actuation_applied_ppm"]) == -7.25
     assert float(row["confidence"]) == 1.0
     assert float(row["current_filter_delay_ms"]) == 13.5
     assert row["missed_burst"] == "False"

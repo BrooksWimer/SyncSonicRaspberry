@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+import json
 import sys
 from pathlib import Path
 
@@ -9,7 +9,14 @@ _BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from measurement.slice5_actuator import ACTIVE, SUSPENDED, WARMING_UP, SpeakerActuator  # noqa: E402
+from measurement.slice5_actuator import (  # noqa: E402
+    BURST_AMP_LADDER_X1000,
+    CONFIDENCE_WINDOW_N,
+    SpeakerActuator,
+)
+
+
+MAC = "AA:BB:CC:DD:EE:FF"
 
 
 def _writer(calls: list[tuple[str, str]]):
@@ -20,210 +27,210 @@ def _writer(calls: list[tuple[str, str]]):
     return write
 
 
-def _proposal(mac: str = "AA:BB:CC:DD:EE:FF", **overrides):
-    record = {
-        "event": "relative_correction_proposed",
-        "mac": mac,
-        "proposed_adjustment_ppm": 12.5,
-        "residual_ms": 1.0,
-        "current_filter_delay_ms": 100.0,
-        "missed_burst": False,
-        "max_ppm": 50.0,
-    }
-    record.update(overrides)
-    return record
-
-
-def _active_actuator(calls: list[tuple[str, str]], *, mac: str = "AA:BB:CC:DD:EE:FF") -> SpeakerActuator:
-    actuator = SpeakerActuator(
-        {mac: Path(f"/tmp/{mac.replace(':', '_')}.sock")},
-        warmup_cycles_required=1,
-        socket_writer=_writer(calls),
-    )
-    actuator.apply(_proposal(mac))
-    assert actuator.state_for(mac) == ACTIVE
-    calls.clear()
-    return actuator
-
-
-def _active_actuator_with_baseline(
+def _actuator(
     calls: list[tuple[str, str]],
     *,
-    mac: str = "AA:BB:CC:DD:EE:FF",
+    mac: str = MAC,
+    runtime_corrections_path: Path | str | None = None,
 ) -> SpeakerActuator:
-    actuator = SpeakerActuator(
+    return SpeakerActuator(
         {mac: Path(f"/tmp/{mac.replace(':', '_')}.sock")},
-        baseline_warmup_n=1,
-        warmup_cycles_required=1,
         socket_writer=_writer(calls),
-    )
-    actuator.apply(
-        _proposal(
-            mac,
-            measured_latency_ms=100.0,
-            current_filter_delay_ms=120.0,
-        )
-    )
-    assert actuator.state_for(mac) == ACTIVE
-    calls.clear()
-    return actuator
-
-
-def test_warming_up_blocks_actuation() -> None:
-    calls: list[tuple[str, str]] = []
-    actuator = SpeakerActuator(
-        {"AA:BB:CC:DD:EE:FF": Path("/tmp/a.sock")},
-        socket_writer=_writer(calls),
+        runtime_corrections_path=runtime_corrections_path,
     )
 
-    result = actuator.apply(_proposal())
 
-    assert result.actuation_applied_ppm == 0.0
-    assert result.skip_reason == "WARMING_UP"
-    assert calls == []
-
-
-def test_warmup_to_active_after_n_clean_cycles() -> None:
-    calls: list[tuple[str, str]] = []
-    actuator = SpeakerActuator(
-        {"AA:BB:CC:DD:EE:FF": Path("/tmp/a.sock")},
-        warmup_cycles_required=3,
-        socket_writer=_writer(calls),
-    )
-
-    for _idx in range(3):
-        result = actuator.apply(_proposal())
-
-    assert result.state == ACTIVE
-    assert result.actuation_applied_ppm == 0.0
-    assert actuator.state_for("AA:BB:CC:DD:EE:FF") == ACTIVE
-    assert calls == []
+def _establish_baseline(actuator: SpeakerActuator) -> None:
+    result = actuator.apply(MAC, 370.0, 370.0, 0.0)
+    assert result.action == "baseline"
 
 
-def test_clamped_proposal_applies_at_max_in_active() -> None:
-    # Slice-5 ppm-only redesign: clamped proposals are no longer skipped.
-    # The actuator bounds them to +/- max_rate_ppm and applies. Clamp flag is
-    # informational only (live data showed clamped at +/-50 ppm routinely
-    # under real BT clock drift; skipping them stalled the system).
-    calls: list[tuple[str, str]] = []
-    actuator = _active_actuator(calls)
-
-    result = actuator.apply(_proposal(proposed_adjustment_ppm=70.0, max_ppm=50.0))
-
-    assert result.actuation_applied_ppm == 50.0
-    assert result.skip_reason is None
-    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_rate_ppm 50.000")]
-
-
-def test_clamped_proposal_counts_as_clean_in_warmup() -> None:
-    # Slice-5 ppm-only redesign: relaxed WARMING_UP gate allows clamped
-    # proposals to count as clean cycles. Live testing showed a large initial
-    # residual (~10-14 ms) produces clamped ppm proposals indefinitely, which
-    # would otherwise prevent the actuator from ever leaving WARMING_UP. The
-    # actuator bounds the ppm safely either way; clamped is no longer a stop
-    # signal for warmup progression.
-    calls: list[tuple[str, str]] = []
-    actuator = SpeakerActuator(
-        {"AA:BB:CC:DD:EE:FF": Path("/tmp/a.sock")},
-        warmup_cycles_required=3,
-        socket_writer=_writer(calls),
-    )
-    for _idx in range(3):
-        actuator.apply(_proposal(proposed_adjustment_ppm=70.0, max_ppm=50.0))
-
-    assert actuator.state_for("AA:BB:CC:DD:EE:FF") == ACTIVE
-
-
-def test_ppm_applied_for_small_residual() -> None:
-    calls: list[tuple[str, str]] = []
-    actuator = _active_actuator(calls)
-
-    result = actuator.apply(_proposal(proposed_adjustment_ppm=75.0, residual_ms=5.0, max_ppm=100.0))
-
-    assert result.actuation_applied_ppm == 50.0
-    assert result.slider_applied_ms == 0.0
-    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_rate_ppm 50.000")]
-
-
-def test_auto_suspend_on_high_miss_rate() -> None:
-    calls: list[tuple[str, str]] = []
-    actuator = _active_actuator(calls)
-
-    for idx in range(10):
-        actuator.apply(_proposal(missed_burst=idx < 4))
-
-    assert actuator.state_for("AA:BB:CC:DD:EE:FF") == SUSPENDED
-
-
-def test_auto_suspend_zeros_ppm_and_restores_slider_reference_delay() -> None:
-    calls: list[tuple[str, str]] = []
-    mac = "AA:BB:CC:DD:EE:FF"
-    actuator = _active_actuator_with_baseline(calls, mac=mac)
-
-    actuator.apply(
-        _proposal(
-            mac,
-            measured_latency_ms=140.0,
-            current_filter_delay_ms=120.0,
-            proposed_adjustment_ppm=25.0,
-        )
-    )
-    assert calls == [
-        ("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 80.000"),
-        ("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_rate_ppm 25.000"),
-    ]
-    calls.clear()
-
-    for _idx in range(10):
-        actuator.apply(_proposal(mac, missed_burst=True))
-
-    assert actuator.state_for(mac) == SUSPENDED
-    assert calls == [
-        ("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_rate_ppm 0"),
-        ("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 120.000"),
+def _apply_confidence_window(
+    actuator: SpeakerActuator,
+    measured_latency_ms: float,
+    target_total_ms: float,
+    current_filter_delay: float,
+) -> list[str]:
+    return [
+        actuator.apply(
+            MAC,
+            measured_latency_ms,
+            target_total_ms,
+            current_filter_delay,
+        ).action
+        for _idx in range(CONFIDENCE_WINDOW_N)
     ]
 
 
-def test_slider_fire_reports_default_clock_prior_reset_cycles(monkeypatch) -> None:
-    monkeypatch.delenv("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES", raising=False)
+def test_first_valid_burst_establishes_baseline_and_does_not_correct() -> None:
     calls: list[tuple[str, str]] = []
-    actuator = _active_actuator_with_baseline(calls)
+    actuator = _actuator(calls)
 
-    result = actuator.apply(
-        _proposal(
-            measured_latency_ms=140.0,
-            current_filter_delay_ms=120.0,
-        )
-    )
+    result = actuator.apply(MAC, 370.0, 370.0, 0.0)
 
-    assert result.slider_applied_ms == -40.0
-    assert result.clock_prior_reset_cycles == 3
+    assert result.action == "baseline"
+    assert result.clock_prior_reset is False
+    assert actuator.baseline_established[MAC] is True
+    assert calls == []
 
 
-def test_slider_fire_reports_configured_clock_prior_reset_cycles(monkeypatch) -> None:
-    monkeypatch.setenv("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES", "5")
+def test_subsequent_burst_within_threshold_does_not_correct() -> None:
     calls: list[tuple[str, str]] = []
-    actuator = _active_actuator_with_baseline(calls)
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
 
-    result = actuator.apply(
-        _proposal(
-            measured_latency_ms=140.0,
-            current_filter_delay_ms=120.0,
-        )
-    )
+    actions = _apply_confidence_window(actuator, 370.75, 370.0, 20.0)
 
-    assert result.clock_prior_reset_cycles == 5
+    assert actions == ["building_window"] * (CONFIDENCE_WINDOW_N - 1) + ["within_threshold"]
+    assert calls == []
 
 
-def test_emergency_stop_zeros_all_ppm() -> None:
+def test_subsequent_burst_above_threshold_applies_set_delay_with_correct_sign() -> None:
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    actions = [
+        actuator.apply(MAC, 430.0, 370.0, 100.0)
+        for _idx in range(CONFIDENCE_WINDOW_N)
+    ]
+    result = actions[-1]
+
+    assert result.action == "corrected"
+    assert result.delta_ms == 60.0
+    assert result.clock_prior_reset is True
+    assert [item.action for item in actions] == ["building_window"] * (CONFIDENCE_WINDOW_N - 1) + ["corrected"]
+    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 40.000")]
+
+
+def test_apply_with_negative_offset_increases_delay() -> None:
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    actions = [
+        actuator.apply(MAC, 310.0, 370.0, 100.0)
+        for _idx in range(CONFIDENCE_WINDOW_N)
+    ]
+    result = actions[-1]
+
+    assert result.action == "corrected"
+    assert result.delta_ms == -60.0
+    assert result.clock_prior_reset is True
+    assert [item.action for item in actions] == ["building_window"] * (CONFIDENCE_WINDOW_N - 1) + ["corrected"]
+    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 160.000")]
+
+
+def test_large_consistent_initial_offset_confidence_corrects_once() -> None:
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    actions = [
+        actuator.apply(MAC, 970.0, 370.0, 800.0)
+        for _idx in range(CONFIDENCE_WINDOW_N)
+    ]
+    result = actions[-1]
+
+    assert [item.action for item in actions] == ["building_window"] * (CONFIDENCE_WINDOW_N - 1) + ["corrected"]
+    assert result.delta_ms == 600.0
+    assert result.clock_prior_reset is True
+    assert actuator.baseline_established[MAC] is True
+    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 200.000")]
+
+
+def test_disagreeing_high_std_window_does_not_correct_large_offset() -> None:
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    # Exactly CONFIDENCE_WINDOW_N alternating values so the window fills with
+    # high variance — the assertion list length must match values length.
+    values = [970.0, 370.0, 970.0][:CONFIDENCE_WINDOW_N]
+    actions = [
+        actuator.apply(MAC, measured, 370.0, 800.0)
+        for measured in values
+    ]
+
+    assert [item.action for item in actions] == ["building_window"] * (CONFIDENCE_WINDOW_N - 1) + ["insufficient_confidence"]
+    assert actions[-1].clock_prior_reset is False
+    assert calls == []
+
+
+def test_missed_burst_does_nothing() -> None:
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+
+    result = actuator.apply(MAC, None, None, 20.0, missed_burst=True)
+
+    assert result.action == "missed"
+    assert result.clock_prior_reset is False
+    assert actuator.baseline_established[MAC] is False
+    assert calls == []
+
+
+def test_burst_amp_escalates_after_misses_and_de_escalates_on_success() -> None:
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+
+    assert BURST_AMP_LADDER_X1000 == (300, 600, 950)
+    assert actuator.burst_amp_x1000_for(MAC) == 300
+
+    actuator.apply(MAC, None, None, 20.0, missed_burst=True)
+    assert actuator.burst_amp_x1000_for(MAC) == 600
+
+    actuator.apply(MAC, 370.0, 370.0, 20.0)
+    assert actuator.consecutive_missed_bursts[MAC] == 0
+    assert actuator.burst_amp_x1000_for(MAC) == 300
+
+    actuator.apply(MAC, None, None, 20.0, missed_burst=True)
+    actuator.apply(MAC, None, None, 20.0, missed_burst=True)
+    assert actuator.burst_amp_x1000_for(MAC) == 950
+
+    actuator.apply(MAC, 370.0, 370.0, 20.0)
+    assert actuator.burst_amp_x1000_for(MAC) == 600
+    assert calls == []
+
+
+def test_burst_amp_ladder_is_per_speaker() -> None:
+    other = "11:22:33:44:55:66"
     calls: list[tuple[str, str]] = []
     actuator = SpeakerActuator(
         {
-            "AA:BB:CC:DD:EE:FF": Path("/tmp/a.sock"),
+            MAC: Path("/tmp/a.sock"),
+            other: Path("/tmp/b.sock"),
+        },
+        socket_writer=_writer(calls),
+    )
+
+    actuator.apply(MAC, None, None, 20.0, missed_burst=True)
+
+    assert actuator.burst_amp_x1000_for(MAC) == 600
+    assert actuator.burst_amp_x1000_for(other) == 300
+    assert calls == []
+
+
+def test_speaker_disconnected_event_resets_baseline() -> None:
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    actuator.sync_sockets({})
+
+    assert actuator.baseline_established[MAC] is False
+    assert calls == []
+
+
+def test_emergency_stop_zeros_ppm_and_resets_baseline() -> None:
+    calls: list[tuple[str, str]] = []
+    actuator = SpeakerActuator(
+        {
+            MAC: Path("/tmp/a.sock"),
             "11:22:33:44:55:66": Path("/tmp/b.sock"),
         },
         socket_writer=_writer(calls),
     )
+    actuator.apply(MAC, 370.0, 370.0, 0.0)
 
     actuator.emergency_stop()
 
@@ -231,31 +238,97 @@ def test_emergency_stop_zeros_all_ppm() -> None:
         ("/tmp/b.sock", "set_rate_ppm 0"),
         ("/tmp/a.sock", "set_rate_ppm 0"),
     ]
-    assert actuator.state_for("AA:BB:CC:DD:EE:FF") == SUSPENDED
-    assert actuator.state_for("11:22:33:44:55:66") == SUSPENDED
+    assert actuator.baseline_established[MAC] is False
+    assert actuator.baseline_established["11:22:33:44:55:66"] is False
 
 
-def test_independent_per_speaker_state() -> None:
+def test_slider_aware_clock_prior_reset_cycles_still_emitted(monkeypatch) -> None:
+    monkeypatch.delenv("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES", raising=False)
     calls: list[tuple[str, str]] = []
-    suspended_mac = "AA:BB:CC:DD:EE:FF"
-    active_mac = "11:22:33:44:55:66"
-    actuator = SpeakerActuator(
-        {
-            suspended_mac: Path("/tmp/a.sock"),
-            active_mac: Path("/tmp/b.sock"),
-        },
-        warmup_cycles_required=1,
-        socket_writer=_writer(calls),
-    )
-    actuator.apply(_proposal(suspended_mac))
-    actuator.apply(_proposal(active_mac))
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    actions = [
+        actuator.apply(MAC, 310.0, 370.0, 100.0)
+        for _idx in range(CONFIDENCE_WINDOW_N)
+    ]
+    result = actions[-1]
+
+    assert result.action == "corrected"
+    assert result.delta_ms == -60.0
+    assert result.clock_prior_reset is True
+    assert result.clock_prior_reset_cycles == 3
+    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 160.000")]
+
+
+def test_slider_aware_clock_prior_reset_cycles_can_be_configured(monkeypatch) -> None:
+    monkeypatch.setenv("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES", "5")
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    actions = [
+        actuator.apply(MAC, 310.0, 370.0, 100.0)
+        for _idx in range(CONFIDENCE_WINDOW_N)
+    ]
+
+    assert actions[-1].clock_prior_reset_cycles == 5
+
+
+def test_startup_tune_convergence_with_fixed_target() -> None:
+    # Matches the startup-tune semantic verified empirically: target_total_ms is a fixed
+    # reference value; new_filter_delay = current_filter_delay + (target - measured).
+    # A speaker measuring 510ms against a 500ms target with current_filter_delay 100ms
+    # should be told to subtract 10ms of filter delay so its NEXT cycle measures closer
+    # to 500ms.
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    actions = [
+        actuator.apply(MAC, 560.0, 500.0, 100.0)
+        for _idx in range(CONFIDENCE_WINDOW_N)
+    ]
+    result = actions[-1]
+    assert result.action == "corrected"
+    assert result.delta_ms == 60.0
+    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 40.000")]
+
+    # And the converse: a fast speaker at 490ms vs target 500ms gets MORE filter delay.
     calls.clear()
+    actuator2 = _actuator(calls)
+    _establish_baseline(actuator2)
+    actions2 = [
+        actuator2.apply(MAC, 440.0, 500.0, 100.0)
+        for _idx in range(CONFIDENCE_WINDOW_N)
+    ]
+    result2 = actions2[-1]
+    assert result2.action == "corrected"
+    assert result2.delta_ms == -60.0
+    assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 160.000")]
 
-    for idx in range(10):
-        actuator.apply(_proposal(suspended_mac, missed_burst=idx < 4))
-    active_result = actuator.apply(_proposal(active_mac, proposed_adjustment_ppm=-10.0))
 
-    assert actuator.state_for(suspended_mac) == SUSPENDED
-    assert actuator.state_for(active_mac) == ACTIVE
-    assert active_result.actuation_applied_ppm == -10.0
-    assert calls[-1] == ("/tmp/b.sock", "set_rate_ppm -10.000")
+def test_corrected_action_appends_runtime_correction_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "runtime_corrections.jsonl"
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls, runtime_corrections_path=path)
+    _establish_baseline(actuator)
+
+    actions = [
+        actuator.apply(MAC, 430.0, 370.0, 100.0)
+        for _idx in range(CONFIDENCE_WINDOW_N)
+    ]
+    result = actions[-1]
+
+    assert result.action == "corrected"
+    # _log_action now writes all states to JSONL — read the last line which is the correction.
+    lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    event = json.loads(lines[-1])
+    assert event["action"] == "corrected"
+    assert event["event"] == "runtime_correction"
+    assert event["mac"] == MAC
+    assert event["measured_latency_ms"] == 430.0
+    assert event["target_total_ms"] == 370.0
+    assert event["current_filter_delay_ms"] == 100.0
+    assert event["delta_ms"] == 60.0
+    assert event["new_filter_delay_ms"] == 40.0

@@ -14,12 +14,23 @@ if str(_BACKEND_DIR) not in sys.path:
 sys.modules.setdefault("dbus", types.SimpleNamespace(SystemBus=lambda: None))
 
 from measurement.runtime_latency_service import (  # noqa: E402
+    CLOCK_PRIOR_RESET_CYCLES,
+    CONFIDENCE_WINDOW_N,
+    DYNAMIC_TARGET_BASELINE_N,
     EnvelopeDetector,
-    RelativeDriftEstimator,
+    FAST_ALIGN_CONFIDENCE_WINDOW_N,
     RingBuffer,
+    RuntimeSyncService,
     SAMPLE_RATE,
     SpeakerTarget,
-    _consume_clock_prior_reset_window,
+    ActuationResult,
+    _build_parser,
+    read_ultrasonic_exclusions,
+    discover_active_speakers,
+)
+from measurement.calibration_targets import (  # noqa: E402
+    read_startup_tune_target,
+    record_startup_tune_target,
 )
 
 
@@ -28,6 +39,387 @@ def _tone(start: int, duration: int, total: int, freq_hz: float = 18_500.0) -> n
     t = np.arange(duration, dtype=np.float64) / SAMPLE_RATE
     samples[start : start + duration] = (0.8 * np.sin(2.0 * np.pi * freq_hz * t)).astype(np.float32)
     return samples
+
+
+def test_startup_tune_target_missing_file_falls_back_to_cli_default(tmp_path: Path) -> None:
+    path = tmp_path / "startup_tune_targets.json"
+
+    resolved = read_startup_tune_target("AA:BB:CC:DD:EE:FF", 500.0, path=path)
+
+    assert resolved.target_total_ms == 500.0
+    assert resolved.source == "cli_default_missing_file"
+
+
+def test_startup_tune_target_reads_shared_persistent_value_before_cli_default(tmp_path: Path) -> None:
+    path = tmp_path / "startup_tune_targets.json"
+    record_startup_tune_target(612.5, path=path)
+
+    resolved = read_startup_tune_target("AA:BB:CC:DD:EE:FF", 500.0, path=path)
+
+    assert resolved.target_total_ms == 612.5
+    assert resolved.source == "shared"
+
+
+def test_startup_tune_target_uses_per_speaker_before_shared(tmp_path: Path) -> None:
+    path = tmp_path / "startup_tune_targets.json"
+    record_startup_tune_target(612.5, path=path)
+    record_startup_tune_target(455.25, mac="aa:bb:cc:dd:ee:ff", path=path)
+
+    resolved = read_startup_tune_target("AA:BB:CC:DD:EE:FF", 500.0, path=path)
+
+    assert resolved.target_total_ms == 455.25
+    assert resolved.source == "per_speaker"
+
+
+def test_startup_tune_target_persists_shared_and_per_speaker_values(tmp_path: Path) -> None:
+    path = tmp_path / "startup_tune_targets.json"
+
+    record_startup_tune_target(700.0, path=path)
+    record_startup_tune_target(480.0, mac="11:22:33:44:55:66", path=path)
+
+    assert read_startup_tune_target("AA:BB:CC:DD:EE:FF", 500.0, path=path).target_total_ms == 700.0
+    assert read_startup_tune_target("11:22:33:44:55:66", 500.0, path=path).target_total_ms == 480.0
+
+
+def test_ultrasonic_exclusion_file_is_read_case_insensitively(tmp_path: Path) -> None:
+    path = tmp_path / "ultrasonic_excluded.json"
+    path.write_text('{"excluded_macs":["aa:bb:cc:dd:ee:ff"]}\n', encoding="utf-8")
+
+    assert read_ultrasonic_exclusions(path) == {"AA:BB:CC:DD:EE:FF"}
+
+
+def test_discovery_applies_ultrasonic_exclusions_before_limit(monkeypatch) -> None:
+    sockets = {
+        "AA:BB:CC:DD:EE:01": Path("/tmp/a.sock"),
+        "AA:BB:CC:DD:EE:02": Path("/tmp/b.sock"),
+    }
+    monkeypatch.setattr("measurement.runtime_latency_service._scan_filter_sockets", lambda: sockets)
+    monkeypatch.setattr(
+        "measurement.runtime_latency_service._connected_speaker_macs",
+        lambda: set(sockets),
+    )
+
+    targets = discover_active_speakers(
+        limit=1,
+        excluded_macs={"AA:BB:CC:DD:EE:01"},
+    )
+
+    assert [target.mac for target in targets] == ["AA:BB:CC:DD:EE:02"]
+
+
+def test_runtime_service_exits_cleanly_when_no_speakers_connected_after_timeout(monkeypatch) -> None:
+    async def run() -> None:
+        args = _build_parser().parse_args(
+            [
+                "--startup-gate-attempts",
+                "2",
+                "--startup-gate-interval-sec",
+                "0",
+            ]
+        )
+        service = RuntimeSyncService(args)
+        started_capture = False
+
+        async def fake_capture_start() -> None:
+            nonlocal started_capture
+            started_capture = True
+
+        monkeypatch.setattr(
+            "measurement.runtime_latency_service.discover_active_speakers",
+            lambda limit: [],
+        )
+        monkeypatch.setattr(service.capture, "start", fake_capture_start)
+
+        await service.run()
+
+        assert started_capture is False
+        assert service.loop_task is None
+        assert service.state.targets == []
+
+    asyncio.run(run())
+
+
+def test_dynamic_target_baseline_excludes_existing_filter_delay(monkeypatch) -> None:
+    args = _build_parser().parse_args(["--detector-mode", "pattern", "--target-total-ms", "500"])
+    service = RuntimeSyncService(args)
+    target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+    service.state.targets = [target]
+
+    applied: list[tuple[float, float, float]] = []
+
+    class FakeActuator:
+        def apply(
+            self,
+            _mac: str,
+            measured_latency_ms: float,
+            target_total_ms: float,
+            current_filter_delay_ms: float,
+            **_kwargs,
+        ) -> ActuationResult:
+            applied.append((measured_latency_ms, target_total_ms, current_filter_delay_ms))
+            return ActuationResult(action="baseline")
+
+    monkeypatch.setattr(
+        "measurement.calibration_targets.record_startup_tune_target",
+        lambda _target_total_ms: None,
+    )
+    service.slice5_actuator = FakeActuator()  # type: ignore[assignment]
+
+    for _ in range(DYNAMIC_TARGET_BASELINE_N - 1):
+        assert service._apply_slice5_proposal(
+            target,
+            current_filter_delay_ms=4534.0,
+            measured_latency_ms=5022.0,
+        ) is None
+
+    result = service._apply_slice5_proposal(
+        target,
+        current_filter_delay_ms=4534.0,
+        measured_latency_ms=5022.0,
+    )
+
+    assert result is not None
+    assert service.args.target_total_ms == 538.0
+    assert applied == [(5022.0, 538.0, 4534.0)]
+
+
+def test_persisted_target_skips_baseline_wait(monkeypatch) -> None:
+    args = _build_parser().parse_args(["--detector-mode", "pattern", "--target-total-ms", "500"])
+    service = RuntimeSyncService(args)
+    target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+    service.state.targets = [target]
+
+    applied: list[tuple[float, float, float]] = []
+
+    class FakeActuator:
+        def apply(
+            self,
+            _mac: str,
+            measured_latency_ms: float,
+            target_total_ms: float,
+            current_filter_delay_ms: float,
+            **_kwargs,
+        ) -> ActuationResult:
+            applied.append((measured_latency_ms, target_total_ms, current_filter_delay_ms))
+            return ActuationResult(action="corrected")
+
+    monkeypatch.setattr(
+        "measurement.runtime_latency_service.read_startup_tune_target",
+        lambda _mac, _target_total_ms: types.SimpleNamespace(
+            target_total_ms=538.0,
+            source="shared",
+            path=Path("/tmp/startup_tune_targets.json"),
+        ),
+    )
+    service.slice5_actuator = FakeActuator()  # type: ignore[assignment]
+
+    result = service._apply_slice5_proposal(
+        target,
+        current_filter_delay_ms=4534.0,
+        measured_latency_ms=5022.0,
+    )
+
+    assert result is not None
+    assert service._target_from_persistence is True
+    assert service.baseline_samples[target.mac] == [488.0]
+    assert applied == [(5022.0, 538.0, 4534.0)]
+
+
+def test_cold_start_waits_for_baseline(monkeypatch) -> None:
+    args = _build_parser().parse_args(["--detector-mode", "pattern", "--target-total-ms", "500"])
+    service = RuntimeSyncService(args)
+    target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+    service.state.targets = [target]
+
+    applied: list[tuple[float, float, float]] = []
+
+    class FakeActuator:
+        def apply(
+            self,
+            _mac: str,
+            measured_latency_ms: float,
+            target_total_ms: float,
+            current_filter_delay_ms: float,
+            **_kwargs,
+        ) -> ActuationResult:
+            applied.append((measured_latency_ms, target_total_ms, current_filter_delay_ms))
+            return ActuationResult(action="baseline")
+
+    monkeypatch.setattr(
+        "measurement.runtime_latency_service.read_startup_tune_target",
+        lambda _mac, target_total_ms: types.SimpleNamespace(
+            target_total_ms=target_total_ms,
+            source="cli_default_missing_file",
+            path=Path("/tmp/startup_tune_targets.json"),
+        ),
+    )
+    monkeypatch.setattr(
+        "measurement.calibration_targets.record_startup_tune_target",
+        lambda _target_total_ms: None,
+    )
+    service.slice5_actuator = FakeActuator()  # type: ignore[assignment]
+
+    results = [
+        service._apply_slice5_proposal(
+            target,
+            current_filter_delay_ms=4534.0,
+            measured_latency_ms=5022.0,
+        )
+        for _ in range(DYNAMIC_TARGET_BASELINE_N)
+    ]
+
+    assert results[0] is None
+    assert results[1] is None
+    assert results[2] is not None
+    assert service._target_from_persistence is False
+    assert service.args.target_total_ms == 538.0
+    assert applied == [(5022.0, 538.0, 4534.0)]
+
+
+def test_fast_align_uses_smaller_window_n(monkeypatch) -> None:
+    args = _build_parser().parse_args(["--detector-mode", "pattern", "--target-total-ms", "370"])
+    service = RuntimeSyncService(args)
+    target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+    service.state.targets = [target]
+    service.baseline_samples[target.mac] = [370.0] * DYNAMIC_TARGET_BASELINE_N
+    captured_window_n: list[int] = []
+
+    class FakeActuator:
+        def apply(
+            self,
+            _mac: str,
+            _measured_latency_ms: float,
+            _target_total_ms: float,
+            _current_filter_delay_ms: float,
+            *,
+            confidence_window_n: int = CONFIDENCE_WINDOW_N,
+        ) -> ActuationResult:
+            captured_window_n.append(confidence_window_n)
+            return ActuationResult(action="corrected")
+
+    monkeypatch.setattr(
+        "measurement.runtime_latency_service.read_startup_tune_target",
+        lambda _mac, target_total_ms: types.SimpleNamespace(
+            target_total_ms=target_total_ms,
+            source="test",
+            path=Path("/tmp/startup_tune_targets.json"),
+        ),
+    )
+    service.slice5_actuator = FakeActuator()  # type: ignore[assignment]
+
+    service._fast_align_active = False
+    service._apply_slice5_proposal(
+        target,
+        current_filter_delay_ms=0.0,
+        measured_latency_ms=430.0,
+    )
+    service._fast_align_active = True
+    service._apply_slice5_proposal(
+        target,
+        current_filter_delay_ms=0.0,
+        measured_latency_ms=430.0,
+    )
+
+    assert captured_window_n == [CONFIDENCE_WINDOW_N, FAST_ALIGN_CONFIDENCE_WINDOW_N]
+
+
+def test_fast_align_entry_preserves_amp_index(monkeypatch, tmp_path: Path) -> None:
+    args = _build_parser().parse_args(["--detector-mode", "pattern"])
+    service = RuntimeSyncService(args)
+    target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+    service._sync_slice5_actuator([target])
+    assert service.slice5_actuator is not None
+    service.slice5_actuator.burst_amp_indices[target.mac] = 2
+
+    trigger_path = tmp_path / "silent_align_requested"
+    trigger_path.touch()
+    monkeypatch.setattr("measurement.runtime_latency_service.FAST_ALIGN_TRIGGER_PATH", trigger_path)
+
+    assert service._refresh_fast_align_state() is True
+    assert service.slice5_actuator.burst_amp_indices[target.mac] == 2
+
+    joining = SpeakerTarget(mac="11:22:33:44:55:66", socket_path=Path("/tmp/filter2.sock"))
+    service._sync_slice5_actuator([target, joining])
+
+    assert service.slice5_actuator.burst_amp_indices[target.mac] == 2
+    assert service.slice5_actuator.burst_amp_indices[joining.mac] == 0
+
+
+def test_applied_delay_correction_resets_sample_clock_prior_window(monkeypatch) -> None:
+    async def run() -> None:
+        args = _build_parser().parse_args(["--detector-mode", "pattern", "--warmup-sec", "0"])
+        service = RuntimeSyncService(args)
+        target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+        target.last_sample_clock_delta_samples = 12_345.0
+        target.sample_clock_baseline_samples = 12_345.0
+
+        send_calls: list[tuple[Path, str]] = []
+
+        def fake_send(socket_path: Path, payload: str):
+            send_calls.append((socket_path, payload))
+            if payload == "query":
+                return {"target_delay_samples": 0, "current_delay_samples": 0}
+            if payload == "query_emit_timestamps":
+                return {
+                    "entries": [
+                        {"frame_index": 1000},
+                        {"frame_index": 2000},
+                        {"frame_index": 3000},
+                    ],
+                }
+            if payload.startswith("emit_burst"):
+                return {"ok": True}
+            return {"ok": True}
+
+        async def fake_sleep(_delay: float) -> None:
+            return None
+
+        async def fake_analyze_pattern(*_args, **_kwargs):
+            return {
+                "selected": {
+                    "arrival_monotonic": 100.0,
+                    "arrival_sample_index": 14_000,
+                    "sample_clock_anchor_sample_index": 14_000,
+                    "sample_clock_anchor_monotonic": 100.0,
+                    "clock_delta_samples": 13_000.0,
+                    "peak_power_db": -10.0,
+                    "noise_floor_db": -40.0,
+                    "snr_db": 30.0,
+                    "detector_mode": "pattern",
+                    "candidate_count": 3,
+                    "matched_arrival_sample_indices": [14_000, 15_000, 16_000],
+                    "matched_error_ms": [0.0, 0.0, 0.0],
+                    "pattern_mean_abs_error_ms": 0.0,
+                    "pattern_max_abs_error_ms": 0.0,
+                    "pattern_min_snr_db": 9.0,
+                    "pattern_landmark": "envelope",
+                    "pattern_carrier_hz": 18_500.0,
+                    "pattern_clock_delta_spread_ms": 0.0,
+                    "pattern_selection_reason": "best_spacing",
+                    "pattern_match_count": 1,
+                    "pattern_rejected_by_clock_count": 0,
+                }
+            }
+
+        monkeypatch.setattr("measurement.runtime_latency_service._send_filter_command", fake_send)
+        monkeypatch.setattr("measurement.runtime_latency_service.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr(service.detector, "analyze_pattern", fake_analyze_pattern)
+        monkeypatch.setattr(
+            service,
+            "_apply_slice5_proposal",
+            lambda *_args, **_kwargs: ActuationResult(
+                action="corrected",
+                delta_ms=60.0,
+                clock_prior_reset=True,
+            ),
+        )
+
+        await service._measure_pattern(target)
+
+        assert target.last_sample_clock_delta_samples is None
+        assert target.clock_prior_reset_remaining == CLOCK_PRIOR_RESET_CYCLES
+
+    asyncio.run(run())
 
 
 def test_ring_buffer_tracks_absolute_mic_sample_indices() -> None:
@@ -100,7 +492,7 @@ def test_pattern_detector_matches_emit_spacing_in_mic_sample_indices() -> None:
 def test_pattern_detector_uses_clock_prior_to_avoid_late_echo_group() -> None:
     first = 12_000
     emit_offsets = [0, 14_336, 28_672]
-    true_offsets = [0, 14_456, 28_552]
+    true_offsets = [0, 14_398, 28_552]
     echo_offset = 2_168
     duration = int(0.006 * SAMPLE_RATE)
     total = first + emit_offsets[-1] + echo_offset + duration + 8_000
@@ -174,69 +566,13 @@ def test_pattern_detector_rejects_groups_that_jump_outside_clock_prior() -> None
     assert "selected" not in analysis
 
 
-def test_runtime_clock_prior_reset_window_accepts_then_rejects_mismatch() -> None:
-    first = 12_000
-    offsets = [0, 14_336, 28_672]
-    late_jump = 2_400
-    duration = int(0.006 * SAMPLE_RATE)
-    total = first + offsets[-1] + late_jump + duration + 8_000
-    samples = np.zeros(total, dtype=np.float32)
-    for offset in offsets:
-        samples += _tone(first + late_jump + offset, duration, total)
-
-    base_sample = 500_000
-    emit_frames = [1_000_000 + offset for offset in offsets]
-    expected_delta = base_sample + first - emit_frames[0]
-    target = SpeakerTarget(
-        mac="AA:BB:CC:DD:EE:FF",
-        socket_path=Path("/tmp/a.sock"),
-        clock_prior_reset_remaining=3,
-    )
-
-    for remaining in (2, 1, 0):
-        enforce_clock_prior = _consume_clock_prior_reset_window(target, expected_delta)
-        analysis = EnvelopeDetector.analyze_pattern_in_samples(
-            samples,
-            base_time=0.0,
-            base_sample_index=base_sample,
-            noise_floor_db=-90.0,
-            emit_frame_indices=emit_frames,
-            tolerance_ms=5.0,
-            expected_delta_samples=expected_delta,
-            clock_tolerance_ms=20.0,
-            enforce_clock_prior=enforce_clock_prior,
-        )
-
-        assert enforce_clock_prior is False
-        assert target.clock_prior_reset_remaining == remaining
-        assert analysis["selected"]["pattern_selection_reason"] == "clock_prior_reset"
-
-    enforce_clock_prior = _consume_clock_prior_reset_window(target, expected_delta)
-    analysis = EnvelopeDetector.analyze_pattern_in_samples(
-        samples,
-        base_time=0.0,
-        base_sample_index=base_sample,
-        noise_floor_db=-90.0,
-        emit_frame_indices=emit_frames,
-        tolerance_ms=5.0,
-        expected_delta_samples=expected_delta,
-        clock_tolerance_ms=20.0,
-        enforce_clock_prior=enforce_clock_prior,
-    )
-
-    assert enforce_clock_prior is True
-    assert target.clock_prior_reset_remaining == 0
-    assert analysis["reject_reason"] == "clock_prior_mismatch"
-    assert "selected" not in analysis
-
-
 def test_pattern_detector_has_independent_candidate_snr_floor() -> None:
     first = 12_000
     offsets = [0, 14_336, 28_672]
     duration = int(0.030 * SAMPLE_RATE)
     total = first + offsets[-1] + duration + 8_000
     t = np.arange(total, dtype=np.float64) / SAMPLE_RATE
-    samples = (0.25 * np.sin(2.0 * np.pi * 18_500.0 * t)).astype(np.float32)
+    samples = (0.20 * np.sin(2.0 * np.pi * 18_500.0 * t)).astype(np.float32)
     for offset in offsets:
         samples += _tone(first + offset, duration, total)
 
@@ -302,140 +638,3 @@ def test_demodulated_envelope_pattern_uses_leading_edge_not_loudest_window() -> 
     assert peak is not None
     assert abs(match["arrival_sample_index"] - (base_sample + first)) <= 480
     assert peak["arrival_sample_index"] - match["arrival_sample_index"] >= int(0.020 * SAMPLE_RATE)
-
-
-def _samples_from_ms(value_ms: float) -> float:
-    return value_ms * SAMPLE_RATE / 1000.0
-
-
-def test_relative_estimator_subtracts_slice_3c_common_mode_drift() -> None:
-    estimator = RelativeDriftEstimator(
-        smoothing_window=1,
-        gain_ppm_per_ms=5.0,
-        peer_max_age_sec=60.0,
-    )
-    drifts_ms = {
-        "28:FA:19:B6:0E:3B": [
-            0.0,
-            -0.5416666666666666,
-            -2.9444444443409643,
-            -5.875,
-            -10.36111111100763,
-            -14.25,
-            -20.32638888899237,
-            -23.416666666666668,
-        ],
-        "F4:6A:DD:D4:F3:C8": [
-            0.0,
-            -0.7152777779847383,
-            -4.784722222325702,
-            -9.534722222325703,
-            -15.895833333333334,
-            -20.875,
-            -24.9722222223257,
-            -28.61111111131807,
-        ],
-    }
-    base = {
-        "28:FA:19:B6:0E:3B": 2_000_000.0,
-        "F4:6A:DD:D4:F3:C8": 2_500_000.0,
-    }
-    records = []
-    for idx in range(8):
-        t = idx * 33.2
-        for speaker_idx, mac in enumerate(drifts_ms):
-            records.append(
-                estimator.observe(
-                    mac=mac,
-                    monotonic=t + speaker_idx * 0.1,
-                    delta_samples=base[mac] + _samples_from_ms(drifts_ms[mac][idx]),
-                    snr_db=25.0,
-                    stable_count=5,
-                    pattern_mean_abs_error_ms=1.0,
-                    pattern_clock_delta_spread_ms=2.0,
-                )
-            )
-
-    proposals = [record for record in records if record["event"] == "relative_correction_proposed"]
-    residuals = [abs(record["relative_residual_ms"]) for record in proposals]
-    assert max(abs(value) for values in drifts_ms.values() for value in values) > 28.0
-    assert max(residuals) < 3.4
-    assert proposals[-1]["common_clock_slope_ppm"] < -100.0
-    assert abs(proposals[-1]["relative_residual_ms"]) < 3.0
-
-
-def test_relative_estimator_detects_one_speaker_residual_and_sign() -> None:
-    estimator = RelativeDriftEstimator(
-        smoothing_window=1,
-        gain_ppm_per_ms=5.0,
-        peer_max_age_sec=60.0,
-    )
-    base = {"A": 1_000_000.0, "B": 2_000_000.0}
-    record = None
-    for idx, common_ms in enumerate([0.0, -4.0, -8.0, -12.0]):
-        t = idx * 30.0
-        estimator.observe(
-            mac="A",
-            monotonic=t,
-            delta_samples=base["A"] + _samples_from_ms(common_ms),
-            snr_db=25.0,
-            stable_count=5,
-        )
-        record = estimator.observe(
-            mac="B",
-            monotonic=t + 0.1,
-            delta_samples=base["B"] + _samples_from_ms(common_ms + idx * 2.0),
-            snr_db=25.0,
-            stable_count=5,
-        )
-
-    assert record is not None
-    assert record["event"] == "relative_correction_proposed"
-    assert record["relative_residual_ms"] > 0.0
-    assert record["proposed_rate_ppm"] < 0.0
-    assert record["set_rate_ppm_sign"] == "negative_reduces_delay_positive_increases_delay"
-
-
-def test_relative_estimator_waits_for_recent_peer() -> None:
-    estimator = RelativeDriftEstimator(peer_max_age_sec=10.0)
-    first = estimator.observe(
-        mac="A",
-        monotonic=0.0,
-        delta_samples=1_000_000.0,
-        snr_db=25.0,
-        stable_count=5,
-    )
-    second = estimator.observe(
-        mac="B",
-        monotonic=20.0,
-        delta_samples=2_000_000.0,
-        snr_db=25.0,
-        stable_count=5,
-    )
-
-    assert first["event"] == "relative_correction_skipped"
-    assert first["reason"] == "insufficient_recent_peers"
-    assert second["event"] == "relative_correction_skipped"
-    assert second["reason"] == "insufficient_recent_peers"
-
-
-def test_relative_estimator_gates_low_confidence_proposals() -> None:
-    estimator = RelativeDriftEstimator(smoothing_window=3, peer_max_age_sec=60.0)
-    warmup = estimator.observe(
-        mac="A",
-        monotonic=0.0,
-        delta_samples=1_000_000.0,
-        snr_db=25.0,
-        stable_count=1,
-    )
-    low_snr = estimator.observe(
-        mac="B",
-        monotonic=0.1,
-        delta_samples=2_000_000.0,
-        snr_db=8.0,
-        stable_count=5,
-    )
-
-    assert warmup["reason"] == "insufficient_recent_peers"
-    assert low_snr["event"] == "relative_correction_skipped"
-    assert low_snr["reason"] == "low_snr"

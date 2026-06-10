@@ -1,4 +1,4 @@
-"""Slice 5 safety-gated actuator for runtime ultrasonic corrections."""
+"""Slice 5 delay-step actuator for runtime ultrasonic corrections."""
 
 from __future__ import annotations
 
@@ -8,28 +8,20 @@ import math
 import os
 import signal
 import socket
-import statistics
 import time
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Deque, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 
-SLIDER_THRESHOLD_MS = 5.0
-BASELINE_WARMUP_N = 5
-SLIDER_COOLDOWN_CYCLES = 3
-WARMUP_CYCLES_REQUIRED = 3
-MISS_RATE_WINDOW = 10
-MISS_RATE_SUSPEND_THRESHOLD = 0.30
-MAX_RATE_PPM = 50
-BURST_AMP_X1000 = 300
-SAMPLE_RATE = 48_000
+APPLY_THRESHOLD_MS = 30.0  # 2026-05-31 iter 2: raised 15->30 based on empirical 57-min run showing ~50% cycles still correcting at 15ms; 30 is final value for current measurement-precision regime, future work upgrades the measurement protocol
+BURST_AMP_LADDER_X1000 = (300, 600, 950)
+BURST_MISS_ESCALATION_THRESHOLD = 1  # slice 18: smart adjustment - escalate on every miss, drop on every success
+CONFIDENCE_WINDOW_N = 3  # slice 18.2: act on median of last N successful measurements; gates over-correction from single bad measurements. 3 is sufficient — outliers inflate std which raises the sigma floor, so the gate is conservative under noise.
+CONFIDENCE_SIGMA_RATIO = 2.0  # |median_offset| must exceed window_std * this ratio to apply correction; prevents acting on noisy stretches
+BURST_AMP_X1000 = BURST_AMP_LADDER_X1000[0]
 SOCKET_TIMEOUT_SEC = 0.25
-
-WARMING_UP = "WARMING_UP"
-ACTIVE = "ACTIVE"
-SUSPENDED = "SUSPENDED"
+RUNTIME_CORRECTIONS_PATH = Path("/run/syncsonic/runtime_corrections.jsonl")
 
 BleStopCallback = Callable[[], None]
 SocketWriter = Callable[[Path, str], Optional[dict[str, Any]]]
@@ -39,23 +31,10 @@ _BLE_STOP_CALLBACKS: list[BleStopCallback] = []
 
 @dataclass(frozen=True)
 class ActuationResult:
-    mac: str
-    state: str
-    actuation_applied_ppm: float
-    skip_reason: Optional[str]
-    slider_applied_ms: float
+    action: str
+    delta_ms: float = 0.0
+    clock_prior_reset: bool = False
     clock_prior_reset_cycles: int = 0
-
-
-@dataclass
-class _SpeakerState:
-    state: str = WARMING_UP
-    clean_warmup_cycles: int = 0
-    misses: Deque[bool] | None = None
-    baseline_samples_ms: Deque[float] | None = None
-    baseline_latency_ms: Optional[float] = None
-    slider_cooldown_cycles: int = 0
-    slider_reference_delay_ms: Optional[float] = None
 
 
 def register_ble_stop_callback(fn: BleStopCallback) -> None:
@@ -64,59 +43,50 @@ def register_ble_stop_callback(fn: BleStopCallback) -> None:
 
 
 class SpeakerActuator:
-    """Apply relative drift proposals through a guarded two-stage controller."""
+    """Apply startup-tune style delay corrections to each valid burst."""
 
     def __init__(
         self,
         sockets: Mapping[str, Path | str],
         *,
-        slider_threshold_ms: float = SLIDER_THRESHOLD_MS,
-        baseline_warmup_n: int = BASELINE_WARMUP_N,
-        slider_cooldown_cycles: int = SLIDER_COOLDOWN_CYCLES,
-        warmup_cycles_required: int = WARMUP_CYCLES_REQUIRED,
-        miss_rate_window: int = MISS_RATE_WINDOW,
-        miss_rate_suspend_threshold: float = MISS_RATE_SUSPEND_THRESHOLD,
-        max_rate_ppm: float = MAX_RATE_PPM,
-        sample_rate: int = SAMPLE_RATE,
+        apply_threshold_ms: float = APPLY_THRESHOLD_MS,
         socket_writer: Optional[SocketWriter] = None,
+        runtime_corrections_path: Path | str | None = RUNTIME_CORRECTIONS_PATH,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.sockets = {mac.upper(): Path(path) for mac, path in sockets.items()}
-        self.slider_threshold_ms = _env_float("SLIDER_THRESHOLD_MS", slider_threshold_ms)
-        self.baseline_warmup_n = max(1, _env_int("BASELINE_WARMUP_N", baseline_warmup_n))
-        self.slider_cooldown_cycles = max(0, _env_int("SLIDER_COOLDOWN_CYCLES", slider_cooldown_cycles))
-        self.warmup_cycles_required = max(1, int(warmup_cycles_required))
-        self.miss_rate_window = max(1, int(miss_rate_window))
-        self.miss_rate_suspend_threshold = float(miss_rate_suspend_threshold)
-        self.max_rate_ppm = abs(float(max_rate_ppm))
-        self.sample_rate = int(sample_rate)
+        self.apply_threshold_ms = abs(float(apply_threshold_ms))
         self.socket_writer = socket_writer or _send_filter_command
+        self.runtime_corrections_path = (
+            Path(runtime_corrections_path) if runtime_corrections_path is not None else None
+        )
         self.logger = logger or logging.getLogger("measurement.slice5_actuator")
-        self._states: dict[str, _SpeakerState] = {
-            mac: self._new_state() for mac in self.sockets
-        }
+        self.baseline_established: dict[str, bool] = {mac: False for mac in self.sockets}
+        self.consecutive_missed_bursts: dict[str, int] = {mac: 0 for mac in self.sockets}
+        self.burst_amp_indices: dict[str, int] = {mac: 0 for mac in self.sockets}
+        # Slice 18.2: per-speaker sliding window of last N successful measurements.
+        # Confidence gate uses median(window) vs target as effective offset, and
+        # stdev(window) as the noise estimate that must be exceeded before acting.
+        self.measurement_window: dict[str, list[float]] = {mac: [] for mac in self.sockets}
 
     @property
     def states(self) -> dict[str, str]:
-        return {mac: state.state for mac, state in self._states.items()}
-
-    @property
-    def baseline_latency_ms(self) -> dict[str, float]:
         return {
-            mac: state.baseline_latency_ms
-            for mac, state in self._states.items()
-            if state.baseline_latency_ms is not None
+            mac: ("BASELINE_ESTABLISHED" if established else "AWAITING_BASELINE")
+            for mac, established in self.baseline_established.items()
         }
 
-    @property
-    def slider_cooldowns(self) -> dict[str, int]:
-        return {mac: state.slider_cooldown_cycles for mac, state in self._states.items()}
-
     def state_for(self, mac: str) -> str:
-        return self._state(mac).state
+        return self.states.get(mac.upper(), "AWAITING_BASELINE")
 
     def baseline_for(self, mac: str) -> Optional[float]:
-        return self._state(mac).baseline_latency_ms
+        return 0.0 if self.baseline_established.get(mac.upper(), False) else None
+
+    def burst_amp_x1000_for(self, mac: str) -> int:
+        normalized = mac.upper()
+        self.burst_amp_indices.setdefault(normalized, 0)
+        index = self.burst_amp_indices[normalized]
+        return BURST_AMP_LADDER_X1000[index]
 
     def register_signal_handler(self, signum: int = signal.SIGUSR1) -> None:
         signal.signal(signum, lambda _signum, _frame: self.emergency_stop())
@@ -126,144 +96,178 @@ class SpeakerActuator:
         previous = set(self.sockets)
         current = set(new_sockets)
         for mac in sorted(previous - current):
-            if mac in self._states:
-                state = self._states[mac]
-                state.state = WARMING_UP
-                state.clean_warmup_cycles = 0
-                self._reset_baseline(mac, state, "speaker_disconnected")
+            self.baseline_established[mac] = False
+            self._log_baseline_reset(mac, "speaker_disconnected")
         for mac in sorted(current):
-            if mac not in self._states:
-                self._states[mac] = self._new_state()
+            self.baseline_established.setdefault(mac, False)
+            self.consecutive_missed_bursts.setdefault(mac, 0)
+            self.burst_amp_indices.setdefault(mac, 0)
         self.sockets = new_sockets
 
     def re_enable(self, mac: Optional[str] = None) -> None:
-        macs = [mac.upper()] if mac else sorted(self._states)
+        macs = [mac.upper()] if mac else sorted(self.baseline_established)
         for item in macs:
-            state = self._state(item)
-            old = state.state
-            state.state = WARMING_UP
-            state.clean_warmup_cycles = 0
-            self._reset_baseline(item, state, "operator_reenable")
-            state.misses = deque(maxlen=self.miss_rate_window)
-            self._log_transition(item, old, state.state, "operator_reenable")
+            self.baseline_established[item] = False
+            self._log_baseline_reset(item, "operator_reenable")
 
-    def apply(self, proposal: Any) -> ActuationResult:
+    def apply(
+        self,
+        speaker_id: str,
+        measured_latency_ms: Optional[float],
+        target_total_ms: Optional[float],
+        current_filter_delay: Optional[float],
+        *,
+        missed_burst: bool = False,
+        confidence_window_n: int = CONFIDENCE_WINDOW_N,
+    ) -> ActuationResult:
+        mac = speaker_id.upper()
+        self.baseline_established.setdefault(mac, False)
+        self.consecutive_missed_bursts.setdefault(mac, 0)
+        self.burst_amp_indices.setdefault(mac, 0)
         if os.environ.get("MAVERICK_CORRECTION_STOP") == "1":
             self.emergency_stop()
-            mac = str(_proposal_get(proposal, "mac", "")).upper()
-            return self._result(mac, SUSPENDED, "EMERGENCY_STOP")
-
-        mac = str(_proposal_get(proposal, "mac", "")).upper()
-        if not mac:
-            raise ValueError("proposal is missing mac")
-        state = self._state(mac)
-
-        missed = _proposal_bool(proposal, "missed_burst", default=False)
-        self._record_miss(mac, state, missed)
-        self._decrement_slider_cooldown(state)
-        if state.state == SUSPENDED:
-            return self._result(mac, state.state, "SUSPENDED")
-
-        if missed:
-            if state.state == WARMING_UP:
-                state.clean_warmup_cycles = 0
-            return self._result(mac, state.state, "SKIP_MISSED")
-
-        if self._confidence_drop(proposal):
-            self._suspend(mac, state, "CONFIDENCE_DROP")
-            return self._result(mac, state.state, "CONFIDENCE_DROP")
-
-        proposal_warming = _proposal_get(proposal, "reason") == "warming_up" or _proposal_bool(
-            proposal,
-            "warming",
-            default=False,
-        )
-        self._observe_baseline_sample(mac, state, proposal, proposal_warming=proposal_warming)
-        slider_applied_ms = self._apply_slider_stage(mac, state, proposal)
-        clock_prior_reset_cycles = (
-            _env_int("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES", 3)
-            if slider_applied_ms != 0.0
-            else 0
-        )
-
-        proposed_ppm = _proposal_float(
-            proposal,
-            "proposed_adjustment_ppm",
-            fallback_keys=("proposed_rate_ppm", "applied_ppm"),
-        )
-        max_ppm = abs(_proposal_float(proposal, "max_ppm", default=self.max_rate_ppm))
-        # Clamped proposals no longer skip — the actuator bounds them to
-        # ±max_rate_ppm and applies. The clamp flag is informational only.
-        clamped = _is_clamped(proposed_ppm, max_ppm)
-
-        if state.state == WARMING_UP:
-            # Relaxed gate (ppm-only): allow clamped proposals to count as
-            # clean. The actuator bounds them safely; requiring non-clamped
-            # chicken-and-eggs large initial offsets.
-            if not missed and not proposal_warming and math.isfinite(proposed_ppm):
-                state.clean_warmup_cycles += 1
-                if (
-                    state.clean_warmup_cycles >= self.warmup_cycles_required
-                    and (
-                        state.baseline_latency_ms is not None
-                        or _proposal_get(proposal, "measured_latency_ms") is None
-                    )
-                ):
-                    self._log_transition(mac, state.state, ACTIVE, "warmup_clean_cycles")
-                    state.state = ACTIVE
-            else:
-                state.clean_warmup_cycles = 0
-            return ActuationResult(
+            return ActuationResult(action="emergency_stop", clock_prior_reset=True)
+        if missed_burst:
+            self._record_missed_burst(mac)
+            return ActuationResult(action="missed", clock_prior_reset=False)
+        if not _finite(measured_latency_ms) or not _finite(target_total_ms) or not _finite(current_filter_delay):
+            return ActuationResult(action="invalid", clock_prior_reset=False)
+        # Slice 18 smart-adjustment: on successful detection, drop one rung down the
+        # amplitude ladder (no lower than baseline). Symmetric to escalation in
+        # _record_missed_burst, so steady-state at the lowest amp that keeps the
+        # speaker detectable. Audibility regression fix.
+        previous_amp_index = self.burst_amp_indices.get(mac, 0)
+        de_escalated = False
+        if previous_amp_index > 0:
+            self.burst_amp_indices[mac] = previous_amp_index - 1
+            de_escalated = True
+        self.consecutive_missed_bursts[mac] = 0
+        if de_escalated:
+            self._log_action(
                 mac,
-                state.state,
-                0.0,
-                "WARMING_UP",
-                slider_applied_ms,
-                clock_prior_reset_cycles,
+                "amp_de_escalated",
+                previous_amp_x1000=BURST_AMP_LADDER_X1000[previous_amp_index],
+                burst_amp_x1000=self.burst_amp_x1000_for(mac),
+                burst_amp_ladder_x1000=list(BURST_AMP_LADDER_X1000),
             )
+        if not self.baseline_established[mac]:
+            self.baseline_established[mac] = True
+            self._log_action(mac, "baseline", measured_latency_ms=measured_latency_ms)
+            return ActuationResult(action="baseline", clock_prior_reset=False)
 
-        if state.state != ACTIVE:
-            return self._result(mac, state.state, state.state)
+        # Slice 18.2: confidence-gated actuation. The confidence window is the
+        # only large-offset gate: a big consistent initial offset is corrected,
+        # while a noisy/disagreeing window is held.
+        offset_single = float(measured_latency_ms) - float(target_total_ms)
+        window_needed = max(1, int(confidence_window_n))
 
-        applied_ppm = max(-self.max_rate_ppm, min(self.max_rate_ppm, proposed_ppm))
-        response = self._write(mac, f"set_rate_ppm {applied_ppm:.3f}")
-        self.logger.info(
-            json.dumps(
-                {
-                    "event": "slice5_rate_adjustment",
-                    "timestamp_iso": _timestamp_iso(),
-                    "mac": mac,
-                    "actuation_applied_ppm": applied_ppm,
-                    "proposed_adjustment_ppm": proposed_ppm,
-                    "clamped": clamped,
-                    "response": response,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
+        # Add to per-speaker sliding window
+        window = self.measurement_window.setdefault(mac, [])
+        window.append(float(measured_latency_ms))
+        if len(window) > window_needed:
+            window.pop(0)
+
+        # Building phase: not enough measurements yet to be confident
+        if len(window) < window_needed:
+            self._log_action(
+                mac, "building_window",
+                window_n=len(window),
+                window_needed=window_needed,
+                measured_latency_ms=measured_latency_ms,
+                offset_single_ms=offset_single,
             )
+            return ActuationResult(action="building_window", clock_prior_reset=False)
+
+        # Confidence-gated decision: median is robust to outliers, std gates noisy periods
+        import statistics as _stat_for_window
+        window_median = _stat_for_window.median(window)
+        window_std = _stat_for_window.stdev(window) if len(window) > 1 else 0.0
+        median_offset = window_median - float(target_total_ms)
+
+        # Within-threshold: median is close to target, no action regardless of std
+        if abs(median_offset) < self.apply_threshold_ms:
+            self._log_action(
+                mac, "within_threshold",
+                delta_ms=median_offset,
+                window_median_ms=window_median,
+                window_std_ms=window_std,
+            )
+            return ActuationResult(action="within_threshold", clock_prior_reset=False)
+
+        # Confidence gate: signal must exceed noise floor (window_std * sigma ratio)
+        confidence_floor = window_std * CONFIDENCE_SIGMA_RATIO
+        if abs(median_offset) < confidence_floor:
+            self._log_action(
+                mac, "insufficient_confidence",
+                delta_ms=median_offset,
+                window_median_ms=window_median,
+                window_std_ms=window_std,
+                confidence_floor_ms=confidence_floor,
+                window_n=len(window),
+            )
+            return ActuationResult(action="insufficient_confidence", clock_prior_reset=False)
+
+        # Apply correction using median-derived offset (NOT single-measurement offset).
+        # Reset window after applying since the speaker has just moved; otherwise pre-move
+        # measurements would bias the next decision.
+        new_delay = max(0.0, float(current_filter_delay) - median_offset)
+        self.measurement_window[mac] = []
+        self.set_delay(mac, new_delay)
+        offset = median_offset  # for downstream logging compatibility
+        self._log_action(
+            mac,
+            "corrected",
+            measured_latency_ms=measured_latency_ms,
+            target_total_ms=target_total_ms,
+            current_filter_delay_ms=current_filter_delay,
+            delta_ms=offset,
+            new_filter_delay_ms=new_delay,
+            new_delay_ms=new_delay,
+        )
+        self._write_runtime_correction(
+            mac,
+            measured_latency_ms=float(measured_latency_ms),
+            target_total_ms=float(target_total_ms),
+            current_filter_delay_ms=float(current_filter_delay),
+            delta_ms=offset,
+            new_filter_delay_ms=new_delay,
         )
         return ActuationResult(
+            action="corrected",
+            delta_ms=offset,
+            clock_prior_reset=True,
+            clock_prior_reset_cycles=_clock_prior_reset_cycles(),
+        )
+
+    def set_delay(self, speaker_id: str, delay_ms: float) -> Optional[dict[str, Any]]:
+        return self._write(speaker_id, f"set_delay {delay_ms:.3f}")
+
+    def _record_missed_burst(self, mac: str) -> None:
+        self.consecutive_missed_bursts[mac] += 1
+        previous_index = self.burst_amp_indices[mac]
+        escalated = False
+        if (
+            self.consecutive_missed_bursts[mac] >= BURST_MISS_ESCALATION_THRESHOLD
+            and previous_index < len(BURST_AMP_LADDER_X1000) - 1
+        ):
+            self.burst_amp_indices[mac] = previous_index + 1
+            self.consecutive_missed_bursts[mac] = 0
+            escalated = True
+        self._log_action(
             mac,
-            state.state,
-            applied_ppm,
-            None,
-            slider_applied_ms,
-            clock_prior_reset_cycles,
+            "missed",
+            consecutive_missed_bursts=self.consecutive_missed_bursts[mac],
+            burst_amp_x1000=self.burst_amp_x1000_for(mac),
+            burst_amp_ladder_x1000=list(BURST_AMP_LADDER_X1000),
+            burst_amp_escalated=escalated,
         )
 
     def emergency_stop(self) -> None:
         started = time.monotonic()
         for mac in sorted(self.sockets):
-            state = self._state(mac)
-            if state.slider_reference_delay_ms is not None:
-                self._write(mac, f"set_delay {state.slider_reference_delay_ms:.3f}")
             self._write(mac, "set_rate_ppm 0")
-            old = state.state
-            state.state = SUSPENDED
-            state.clean_warmup_cycles = 0
-            state.slider_cooldown_cycles = 0
-            state.slider_reference_delay_ms = None
-            self._log_transition(mac, old, SUSPENDED, "EMERGENCY_STOP")
+            self.baseline_established[mac] = False
+            self._log_baseline_reset(mac, "EMERGENCY_STOP")
         elapsed = time.monotonic() - started
         self.logger.info(
             json.dumps(
@@ -278,197 +282,73 @@ class SpeakerActuator:
             )
         )
 
-    def _state(self, mac: str) -> _SpeakerState:
-        mac = mac.upper()
-        if mac not in self._states:
-            self._states[mac] = self._new_state()
-        return self._states[mac]
-
-    def _new_state(self) -> _SpeakerState:
-        return _SpeakerState(
-            misses=deque(maxlen=self.miss_rate_window),
-            baseline_samples_ms=deque(maxlen=self.baseline_warmup_n),
-        )
-
-    def _reset_baseline(self, mac: str, state: _SpeakerState, reason: str) -> None:
-        state.baseline_samples_ms = deque(maxlen=self.baseline_warmup_n)
-        state.baseline_latency_ms = None
-        state.slider_cooldown_cycles = 0
-        state.slider_reference_delay_ms = None
-        self.logger.info(
-            json.dumps(
-                {
-                    "event": "slice6_baseline_reset",
-                    "timestamp_iso": _timestamp_iso(),
-                    "mac": mac,
-                    "reason": reason,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        )
-
-    def _observe_baseline_sample(
-        self,
-        mac: str,
-        state: _SpeakerState,
-        proposal: Any,
-        *,
-        proposal_warming: bool,
-    ) -> None:
-        if state.state != WARMING_UP or state.baseline_latency_ms is not None or proposal_warming:
-            return
-        measured_latency_ms = _proposal_float(proposal, "measured_latency_ms")
-        if not math.isfinite(measured_latency_ms):
-            return
-        if state.baseline_samples_ms is None:
-            state.baseline_samples_ms = deque(maxlen=self.baseline_warmup_n)
-        state.baseline_samples_ms.append(measured_latency_ms)
-        if len(state.baseline_samples_ms) < self.baseline_warmup_n:
-            return
-        state.baseline_latency_ms = float(statistics.median(state.baseline_samples_ms))
-        self.logger.info(
-            json.dumps(
-                {
-                    "event": "slice6_baseline_established",
-                    "timestamp_iso": _timestamp_iso(),
-                    "mac": mac,
-                    "baseline_latency_ms": state.baseline_latency_ms,
-                    "sample_count": len(state.baseline_samples_ms),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        )
-
-    def _apply_slider_stage(self, mac: str, state: _SpeakerState, proposal: Any) -> float:
-        if state.state not in {WARMING_UP, ACTIVE} or state.baseline_latency_ms is None:
-            return 0.0
-        if state.slider_cooldown_cycles > 0:
-            return 0.0
-        measured_latency_ms = _proposal_float(proposal, "measured_latency_ms")
-        current_filter_delay_ms = _proposal_float(proposal, "current_filter_delay_ms")
-        if not math.isfinite(measured_latency_ms) or not math.isfinite(current_filter_delay_ms):
-            return 0.0
-        latency_offset_ms = measured_latency_ms - state.baseline_latency_ms
-        if abs(latency_offset_ms) <= self.slider_threshold_ms:
-            return 0.0
-        new_delay_ms = max(0.0, current_filter_delay_ms - latency_offset_ms)
-        if state.slider_reference_delay_ms is None:
-            state.slider_reference_delay_ms = current_filter_delay_ms
-        response = self._write(mac, f"set_delay {new_delay_ms:.3f}")
-        state.slider_cooldown_cycles = self.slider_cooldown_cycles
-        self.logger.info(
-            json.dumps(
-                {
-                    "event": "slice6_slider_fire",
-                    "timestamp_iso": _timestamp_iso(),
-                    "mac": mac,
-                    "latency_offset_ms": latency_offset_ms,
-                    "new_delay_ms": new_delay_ms,
-                    "baseline_latency_ms": state.baseline_latency_ms,
-                    "measured_latency_ms": measured_latency_ms,
-                    "cooldown_cycles": state.slider_cooldown_cycles,
-                    "response": response,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        )
-        return -latency_offset_ms
-
-    def _decrement_slider_cooldown(self, state: _SpeakerState) -> None:
-        if state.slider_cooldown_cycles > 0:
-            state.slider_cooldown_cycles -= 1
-
-    def _record_miss(self, mac: str, state: _SpeakerState, missed: bool) -> None:
-        if state.misses is None:
-            state.misses = deque(maxlen=self.miss_rate_window)
-        state.misses.append(bool(missed))
-        if len(state.misses) < self.miss_rate_window:
-            return
-        miss_rate = sum(1 for item in state.misses if item) / len(state.misses)
-        if miss_rate > self.miss_rate_suspend_threshold:
-            self._suspend(mac, state, f"MISS_RATE_{miss_rate:.3f}")
-
-    def _confidence_drop(self, proposal: Any) -> bool:
-        if _proposal_bool(proposal, "confidence_drop", default=False):
-            return True
-        event = _proposal_get(proposal, "event")
-        reason = _proposal_get(proposal, "reason")
-        if event == "relative_correction_skipped" and reason in {"low_snr", "confidence_drop"}:
-            return True
-        confidence = _proposal_float(proposal, "confidence", default=1.0)
-        return math.isfinite(confidence) and confidence < 0.0
-
-    def _suspend(self, mac: str, state: _SpeakerState, reason: str) -> None:
-        old = state.state
-        if old == ACTIVE:
-            self._write(mac, "set_rate_ppm 0")
-            if state.slider_reference_delay_ms is not None:
-                self._write(mac, f"set_delay {state.slider_reference_delay_ms:.3f}")
-        state.state = SUSPENDED
-        state.clean_warmup_cycles = 0
-        state.slider_cooldown_cycles = 0
-        state.slider_reference_delay_ms = None
-        self._log_transition(mac, old, SUSPENDED, reason)
-
     def _write(self, mac: str, command: str) -> Optional[dict[str, Any]]:
         path = self.sockets.get(mac.upper())
         if path is None:
-            self.logger.info(
-                json.dumps(
-                    {
-                        "event": "slice5_skip",
-                        "timestamp_iso": _timestamp_iso(),
-                        "mac": mac,
-                        "reason": "SOCKET_NOT_FOUND",
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
+            self._log_action(mac.upper(), "socket_not_found")
             return None
         return self.socket_writer(path, command)
 
-    def _result(self, mac: str, state: str, skip_reason: Optional[str]) -> ActuationResult:
-        if mac:
-            self._log_skip(mac, skip_reason or state)
-        return ActuationResult(mac, state, 0.0, skip_reason, 0.0)
+    def _log_baseline_reset(self, mac: str, reason: str) -> None:
+        self.logger.info(
+            json.dumps(
+                {
+                    "event": "slice5_baseline_reset",
+                    "timestamp_iso": _timestamp_iso(),
+                    "mac": mac,
+                    "reason": reason,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
 
-    def _log_transition(self, mac: str, old: str, new: str, reason: str) -> None:
-        if old == new and reason != "EMERGENCY_STOP":
+    def _log_action(self, mac: str, action: str, **fields: Any) -> None:
+        payload = {
+            "event": "slice5_actuation",
+            "phase": "runtime_correction",
+            "timestamp_iso": _timestamp_iso(),
+            "mac": mac,
+            "action": action,
+            **fields,
+        }
+        self.logger.info(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        )
+        if self.runtime_corrections_path is None:
             return
-        self.logger.info(
-            json.dumps(
-                {
-                    "event": "slice5_state_transition",
-                    "timestamp_iso": _timestamp_iso(),
-                    "mac": mac,
-                    "old_state": old,
-                    "new_state": new,
-                    "reason": reason,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
+        try:
+            self.runtime_corrections_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.runtime_corrections_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+        except OSError as exc:
+            self.logger.warning(
+                "failed to write action event to %s: %s",
+                self.runtime_corrections_path,
+                exc,
             )
-        )
 
-    def _log_skip(self, mac: str, reason: str, **fields: Any) -> None:
-        self.logger.info(
-            json.dumps(
-                {
-                    "event": "slice5_actuation_skipped",
-                    "timestamp_iso": _timestamp_iso(),
-                    "mac": mac,
-                    "state": self.state_for(mac),
-                    "reason": reason,
-                    **fields,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
+    def _write_runtime_correction(self, mac: str, **fields: Any) -> None:
+        if self.runtime_corrections_path is None:
+            return
+        payload = {
+            "event": "runtime_correction",
+            "phase": "runtime_correction",
+            "timestamp_iso": _timestamp_iso(),
+            "mac": mac,
+            "action": "corrected",
+            **fields,
+        }
+        try:
+            self.runtime_corrections_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.runtime_corrections_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+        except OSError as exc:
+            self.logger.warning(
+                "failed to write runtime correction event to %s: %s",
+                self.runtime_corrections_path,
+                exc,
             )
-        )
 
 
 def trigger_ble_stop_callbacks() -> None:
@@ -499,60 +379,21 @@ def _send_filter_command(socket_path: Path, payload: str) -> Optional[dict[str, 
         return None
 
 
-def _proposal_get(proposal: Any, key: str, default: Any = None) -> Any:
-    if isinstance(proposal, Mapping):
-        return proposal.get(key, default)
-    return getattr(proposal, key, default)
-
-
-def _proposal_float(
-    proposal: Any,
-    key: str,
-    *,
-    fallback_keys: tuple[str, ...] = (),
-    default: float = math.nan,
-) -> float:
-    value = _proposal_get(proposal, key, None)
-    if value is None:
-        for fallback in fallback_keys:
-            value = _proposal_get(proposal, fallback, None)
-            if value is not None:
-                break
-    if value is None:
-        return float(default)
+def _finite(value: Any) -> bool:
     try:
-        return float(value)
+        return math.isfinite(float(value))
     except (TypeError, ValueError):
-        return float(default)
+        return False
 
 
-def _proposal_bool(proposal: Any, key: str, *, default: bool) -> bool:
-    value = _proposal_get(proposal, key, default)
-    return bool(value)
-
-
-def _is_clamped(value: float, max_ppm: float) -> bool:
-    return math.isfinite(value) and math.isclose(abs(value), abs(max_ppm), rel_tol=0.0, abs_tol=1e-9)
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.environ.get(name)
+def _clock_prior_reset_cycles() -> int:
+    value = os.environ.get("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES")
     if value is None:
-        return float(default)
-    try:
-        return float(value)
-    except ValueError:
-        return float(default)
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return int(default)
+        return 3
     try:
         return int(value)
     except ValueError:
-        return int(default)
+        return 3
 
 
 def _timestamp_iso() -> str:

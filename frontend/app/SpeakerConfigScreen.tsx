@@ -1,7 +1,7 @@
 import { useSearchParams } from 'expo-router/build/hooks';
 import { Clock3, Pencil, Play, RefreshCw, Volume1, Volume2, VolumeX } from '@tamagui/lucide-icons'
-import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, Alert, TouchableOpacity, ScrollView, View, Dimensions, Platform, TextInput } from 'react-native';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { StyleSheet, Alert, TouchableOpacity, ScrollView, View, Dimensions, Platform, TextInput, Switch } from 'react-native';
 import Slider from '@react-native-community/slider';
 import { useRouter, useNavigation } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -25,11 +25,24 @@ import {
   setVolume,
   setMute,
   calibrateAllSpeakers,
+  setUltrasonicParticipation,
 } from '../utils/ble_functions';
 import LottieView from 'lottie-react-native';
 import { Audio } from 'expo-av';
 import { Header } from '@/components/texts/TitleText';
 import { Body } from '@/components/texts/BodyText';
+
+type RuntimeAlignmentState = {
+  action: string;
+  measuredOffsetMs: number | null;
+  measuredLatencyMs: number | null;
+  targetTotalMs: number | null;
+  lastCorrectionMs: number | null;
+  newFilterDelayMs: number | null;
+  updatedAt: number;
+};
+
+const normalizeMac = (mac: string) => mac.toUpperCase().replace(/-/g, ':');
 
 
 export default function SpeakerConfigScreen() {
@@ -122,6 +135,49 @@ export default function SpeakerConfigScreen() {
   // slider scales to (anchor_lag * 1.2 or 4000ms, whichever is larger)
   // so relative slider positions stay meaningful across BT and Wi-Fi.
   const [latestAnchorLagMs, setLatestAnchorLagMs] = useState<number | null>(null);
+  const [runtimeCorrectionCounts, setRuntimeCorrectionCounts] = useState<Record<string, number>>({});
+  const [runtimeCorrectionFlash, setRuntimeCorrectionFlash] = useState<Record<string, boolean>>({});
+  const [runtimeAlignmentByMac, setRuntimeAlignmentByMac] = useState<Record<string, RuntimeAlignmentState>>({});
+  const [ultrasonicIncludedByMac, setUltrasonicIncludedByMac] = useState<Record<string, boolean>>({});
+  const runtimeCorrectionFlashTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const runtimeCorrectionAnimationTimersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
+
+  const animateLatencyTo = useCallback((mac: string, targetLatencyMs: number) => {
+    if (!Number.isFinite(targetLatencyMs)) return;
+    const startLatencyMs = settings[mac]?.latency ?? targetLatencyMs;
+    const steps = 8;
+    let step = 0;
+    if (runtimeCorrectionAnimationTimersRef.current[mac]) {
+      clearInterval(runtimeCorrectionAnimationTimersRef.current[mac]);
+    }
+    runtimeCorrectionAnimationTimersRef.current[mac] = setInterval(() => {
+      step += 1;
+      const progress = Math.min(1, step / steps);
+      const latency = Math.round(startLatencyMs + ((targetLatencyMs - startLatencyMs) * progress));
+      setSettings(prev => {
+        if (!prev[mac]) return prev;
+        return {
+          ...prev,
+          [mac]: { ...prev[mac], latency },
+        };
+      });
+      if (progress >= 1) {
+        clearInterval(runtimeCorrectionAnimationTimersRef.current[mac]);
+        delete runtimeCorrectionAnimationTimersRef.current[mac];
+      }
+    }, 24);
+  }, [settings]);
+
+  useEffect(() => {
+    return () => {
+      Object.keys(runtimeCorrectionFlashTimersRef.current).forEach(mac => {
+        clearTimeout(runtimeCorrectionFlashTimersRef.current[mac]);
+      });
+      Object.keys(runtimeCorrectionAnimationTimersRef.current).forEach(mac => {
+        clearInterval(runtimeCorrectionAnimationTimersRef.current[mac]);
+      });
+    };
+  }, []);
 
   useEffect(() => {
     const events = calibrationEvents;
@@ -145,6 +201,63 @@ export default function SpeakerConfigScreen() {
       const ev = events[calNotificationCursorRef.current] as Record<string, unknown>;
       calNotificationCursorRef.current += 1;
       const phase = String(ev.phase ?? '');
+
+      if (phase === 'runtime_correction') {
+        const mac = typeof ev.mac === 'string' ? ev.mac : '';
+        const localMac = Object.keys(connectedSpeakers).find(
+          key => normalizeMac(key) === normalizeMac(mac),
+        ) ?? mac;
+        const newDelay = Number(ev.new_filter_delay_ms);
+        const measuredLatency = Number(ev.measured_latency_ms);
+        const targetTotal = Number(ev.target_total_ms);
+        const delta = Number(ev.delta_ms);
+        if (mac) {
+          setRuntimeAlignmentByMac(prev => ({
+            ...prev,
+            [localMac]: {
+              action: String(ev.action ?? 'corrected'),
+              measuredOffsetMs: Number.isFinite(measuredLatency) && Number.isFinite(targetTotal)
+                ? measuredLatency - targetTotal
+                : null,
+              measuredLatencyMs: Number.isFinite(measuredLatency) ? measuredLatency : null,
+              targetTotalMs: Number.isFinite(targetTotal) ? targetTotal : null,
+              lastCorrectionMs: Number.isFinite(delta) ? delta : null,
+              newFilterDelayMs: Number.isFinite(newDelay) ? newDelay : null,
+              updatedAt: Date.now(),
+            },
+          }));
+        }
+        if (mac && Number.isFinite(newDelay)) {
+          animateLatencyTo(localMac, newDelay);
+          setRuntimeCorrectionCounts(prev => ({
+            ...prev,
+            [localMac]: (prev[localMac] ?? 0) + 1,
+          }));
+          setRuntimeCorrectionFlash(prev => ({
+            ...prev,
+            [localMac]: true,
+          }));
+          if (runtimeCorrectionFlashTimersRef.current[localMac]) {
+            clearTimeout(runtimeCorrectionFlashTimersRef.current[localMac]);
+          }
+          runtimeCorrectionFlashTimersRef.current[localMac] = setTimeout(() => {
+            setRuntimeCorrectionFlash(prev => ({
+              ...prev,
+              [localMac]: false,
+            }));
+            delete runtimeCorrectionFlashTimersRef.current[localMac];
+          }, 900);
+          if (configIDParam) {
+            try {
+              updateSpeakerSettings(
+                Number(configIDParam), localMac,
+                settings[localMac]?.volume ?? 50, Math.round(newDelay),
+              );
+            } catch (err) { console.warn('persist runtime correction latency failed', err); }
+          }
+        }
+        continue;
+      }
 
       // Reset accumulators at the start of each new sequence. We also
       // treat the first per-speaker `started` event with index 1 as a
@@ -278,7 +391,7 @@ export default function SpeakerConfigScreen() {
       // failed events: surface inline next to the speaker card; do not
       // fire a separate Alert for each.
     }
-  }, [calibrationEvents, connectedSpeakers, configIDParam]);
+  }, [animateLatencyTo, calibrationEvents, connectedSpeakers, configIDParam, settings]);
 
   // Unified slider scale across all cards (BT + Wi-Fi). When any Wi-Fi
   // output is connected we scale every slider to the anchor envelope so
@@ -913,13 +1026,6 @@ export default function SpeakerConfigScreen() {
     }
   };
 
-  const handleUltrasonicSync = async () => {
-    Alert.alert(
-      'Auto-sync unavailable',
-      'Ultrasonic auto-alignment is disabled on the neutral foundation branch and will return on Epic 3.'
-    );
-  };
-
   const handleAlignAllStartupTune = () => {
     if (!connectedDevice) {
       Alert.alert('Error', 'No Bluetooth device connected');
@@ -976,6 +1082,22 @@ export default function SpeakerConfigScreen() {
         },
       ],
     );
+  };
+
+  const handleUltrasonicParticipationToggle = async (mac: string, included: boolean) => {
+    setUltrasonicIncludedByMac(prev => ({ ...prev, [mac]: included }));
+    if (!connectedDevice) {
+      Alert.alert('Error', 'No Bluetooth device connected');
+      setUltrasonicIncludedByMac(prev => ({ ...prev, [mac]: !included }));
+      return;
+    }
+    try {
+      await setUltrasonicParticipation(connectedDevice, mac, included);
+    } catch (error) {
+      console.error('Error updating ultrasonic participation:', error);
+      setUltrasonicIncludedByMac(prev => ({ ...prev, [mac]: !included }));
+      Alert.alert('Error', 'Failed to update auto-align participation.');
+    }
   };
 
   // Single-speaker calibration is intentionally not surfaced as a UI
@@ -1082,23 +1204,6 @@ export default function SpeakerConfigScreen() {
               return (
                 <YStack alignSelf="center" marginTop={12} marginBottom={8} width="90%">
                   <Button
-                    backgroundColor={pc as any}
-                    borderRadius="$size.4"
-                    color="white"
-                    disabled={seqInFlight}
-                    height={48}
-                    icon={<Play size={18} color="white" />}
-                    onPress={handleAlignAllStartupTune}
-                    pressStyle={{ opacity: 0.85, scale: 0.98 }}
-                  >
-                    <Text fontFamily="Finlandica" color="white">
-                      {seqInFlight && seqTotal > 0
-                        ? `Aligning ${seqIdx}/${seqTotal} (${seqName})`
-                        : 'Align all speakers (startup tune)'}
-                    </Text>
-                  </Button>
-                  <Button
-                    marginTop={10}
                     backgroundColor={themeName === 'dark' ? '#3D2A55' : '#E8DCFA'}
                     borderRadius="$size.4"
                     color={tc as any}
@@ -1109,37 +1214,51 @@ export default function SpeakerConfigScreen() {
                     pressStyle={{ opacity: 0.85, scale: 0.98 }}
                   >
                     <Text fontFamily="Finlandica" color={tc}>
-                      Align all (use playing music)
+                      {seqInFlight && seqTotal > 0
+                        ? `Aligning ${seqIdx}/${seqTotal} (${seqName})`
+                        : 'Manual music alignment'}
+                    </Text>
+                  </Button>
+                  <Button
+                    marginTop={10}
+                    backgroundColor={pc as any}
+                    borderRadius="$size.4"
+                    color="white"
+                    disabled={seqInFlight}
+                    height={48}
+                    icon={<Play size={18} color="white" />}
+                    onPress={handleAlignAllStartupTune}
+                    pressStyle={{ opacity: 0.85, scale: 0.98 }}
+                  >
+                    <Text fontFamily="Finlandica" color="white">
+                      Audible alignment tune
                     </Text>
                   </Button>
                   <Body center style={{ marginTop: 8, fontSize: 12, color: stc }}>
                     {seqInFlight
                       ? `${String(lastPhase).replace(/_/g, ' ')}…`
-                      : 'Mic alignment runs on the Pi. Pause phone playback before startup tune so the reference signal stays clean.'}
+                      : 'Silent ultrasonic auto-align is the default. The audible tune runs only from the button above.'}
                   </Body>
                 </YStack>
               );
             })()}
-            {/* Auto-sync speakers (ultrasonic) – runs one sync cycle on the Pi */}
+            {/* Runtime ultrasonic auto-align is continuous on the Pi. */}
             {Object.keys(connectedSpeakers).length >= 2 && (
               <YStack alignSelf="center" marginTop={12} marginBottom={8} width="90%">
-                <Button
-                  backgroundColor={themeName === 'dark' ? '#333333' : '#E5E5E5'}
-                  borderRadius="$size.4"
-                  color={stc as any}
-                  disabled
-                  height={48}
-                  icon={<Clock3 size={18} color={stc} />}
-                  onPress={handleUltrasonicSync}
-                  opacity={0.72}
-                  pressStyle={{ opacity: 0.85, scale: 0.98 }}
-                >
-                  <Text fontFamily="Finlandica" color={stc}>
-                    Auto-sync speakers - coming soon
+                <View style={[
+                  styles.autoAlignStatus,
+                  {
+                    borderColor: pc,
+                    backgroundColor: themeName === 'dark' ? '#1D2230' : '#EDF7F2',
+                  },
+                ]}>
+                  <Clock3 size={18} color={green} />
+                  <Text style={{ fontFamily: 'Finlandica', color: tc, fontSize: 14, fontWeight: 'bold' }}>
+                    Silent auto-align active
                   </Text>
-                </Button>
+                </View>
                 <Body center style={{ marginTop: 6, fontSize: 12, color: stc }}>
-                  Epic 3 runtime ultrasonic alignment placeholder.
+                  Runtime ultrasonic corrections update below as the Pi measures each speaker.
                 </Body>
               </YStack>
             )}
@@ -1241,6 +1360,72 @@ export default function SpeakerConfigScreen() {
                   <Body center={false} bold={true} style={{fontSize: 18, letterSpacing: 1}}>
                     Latency: {settings[mac]?.latency ?? 100} ms
                   </Body>
+                  {(() => {
+                    const included = ultrasonicIncludedByMac[mac] ?? true;
+                    const runtime = runtimeAlignmentByMac[mac];
+                    const stateLabel = !included
+                      ? 'excluded'
+                      : runtime?.action === 'corrected'
+                      ? 'within target after correction'
+                      : runtime?.action
+                        ? runtime.action.replace(/_/g, ' ')
+                        : 'building window';
+                    const offsetText = runtime?.measuredOffsetMs === null || runtime?.measuredOffsetMs === undefined
+                      ? 'waiting'
+                      : `${runtime.measuredOffsetMs > 0 ? '+' : ''}${runtime.measuredOffsetMs.toFixed(1)} ms`;
+                    const correctionText = runtime?.lastCorrectionMs === null || runtime?.lastCorrectionMs === undefined
+                      ? 'none'
+                      : `${runtime.lastCorrectionMs > 0 ? '-' : '+'}${Math.abs(runtime.lastCorrectionMs).toFixed(1)} ms delay`;
+                    return (
+                      <View style={[
+                        styles.runtimeAlignmentPanel,
+                        {
+                          borderColor: included ? pc : stc,
+                          backgroundColor: themeName === 'dark' ? '#1D2230' : '#FFFFFF',
+                        },
+                      ]}>
+                        <View style={styles.runtimeAlignmentHeader}>
+                          <Text style={{ fontFamily: 'Finlandica', fontSize: 13, fontWeight: 'bold', color: tc }}>
+                            Include in auto-align
+                          </Text>
+                          <Switch
+                            value={included}
+                            onValueChange={(value) => handleUltrasonicParticipationToggle(mac, value)}
+                            trackColor={{ false: '#767577', true: green }}
+                            thumbColor="#FFFFFF"
+                          />
+                        </View>
+                        <View style={styles.runtimeAlignmentGrid}>
+                          <Text style={[styles.runtimeAlignmentCell, { color: tc }]}>Offset: {offsetText}</Text>
+                          <Text style={[styles.runtimeAlignmentCell, { color: tc }]}>Correction: {correctionText}</Text>
+                          <Text style={[styles.runtimeAlignmentCell, { color: included ? green : '#FF0055' }]}>State: {stateLabel}</Text>
+                          <Text style={[styles.runtimeAlignmentCell, { color: stc }]}>
+                            Target: {runtime?.targetTotalMs == null ? 'waiting' : `${runtime.targetTotalMs.toFixed(0)} ms`}
+                          </Text>
+                        </View>
+                      </View>
+                    );
+                  })()}
+                  {(runtimeCorrectionCounts[mac] ?? 0) > 0 && (
+                    <View
+                      style={[
+                        styles.runtimeCorrectionBadge,
+                        {
+                          backgroundColor: runtimeCorrectionFlash[mac] ? green : (themeName === 'dark' ? '#3D2A55' : '#E8DCFA'),
+                          borderColor: runtimeCorrectionFlash[mac] ? green : pc,
+                        },
+                      ]}
+                    >
+                      <Text style={{
+                        fontFamily: 'Finlandica',
+                        fontSize: 12,
+                        fontWeight: 'bold',
+                        color: runtimeCorrectionFlash[mac] ? '#26004E' : tc,
+                      }}>
+                        Runtime corrections: {runtimeCorrectionCounts[mac]}
+                      </Text>
+                    </View>
+                  )}
                   <Slider
                     style={styles.slider}
                     minimumValue={0}
@@ -1556,6 +1741,46 @@ export default function SpeakerConfigScreen() {
       speakerName: { fontSize: 18, marginBottom: 10 },
       label: { fontSize: 15, marginTop: 10, fontWeight: "bold"},
       slider: { width: '100%', height: 40, marginBottom: -5},
+      runtimeCorrectionBadge: {
+        alignSelf: 'center',
+        borderRadius: 8,
+        borderWidth: 1,
+        marginTop: 6,
+        paddingHorizontal: 10,
+        paddingVertical: 4,
+      },
+      autoAlignStatus: {
+        alignItems: 'center',
+        borderRadius: 8,
+        borderWidth: 1,
+        flexDirection: 'row',
+        gap: 8,
+        height: 48,
+        justifyContent: 'center',
+      },
+      runtimeAlignmentPanel: {
+        borderRadius: 8,
+        borderWidth: 1,
+        marginTop: 8,
+        paddingHorizontal: 10,
+        paddingVertical: 8,
+      },
+      runtimeAlignmentHeader: {
+        alignItems: 'center',
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+      },
+      runtimeAlignmentGrid: {
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        marginTop: 4,
+      },
+      runtimeAlignmentCell: {
+        fontFamily: 'Finlandica',
+        fontSize: 12,
+        lineHeight: 17,
+        width: '50%',
+      },
       instructions: { fontSize: 14, marginTop: 10, textAlign: 'center' },
       buttonContainer: { alignItems: "center", flexDirection: 'row', justifyContent: 'space-around', marginTop: 75 },
       saveButton: { backgroundColor: '#3E0094', padding: 15, borderRadius: 8 },

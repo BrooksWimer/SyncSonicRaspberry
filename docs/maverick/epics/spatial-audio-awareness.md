@@ -36,3 +36,4 @@ The coordinated engine currently sends the same stereo mix to every speaker. The
 ## Progress log (auto)
 
 - 2026-06-12 — Slice 0: spatial feasibility study - measurable vs pure research (af2c42db-a443-4c12-be02-00a539d958d8): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/af2c42db-a443-4c12-be02-00a539d958d8.md
+- 2026-06-12 — Slice 0: spatial feasibility study - measurable vs pure research (af2c42db-a443-4c12-be02-00a539d958d8): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/af2c42db-a443-4c12-be02-00a539d958d8.md

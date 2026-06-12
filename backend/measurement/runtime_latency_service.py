@@ -1542,7 +1542,10 @@ class RuntimeSyncService:
             )
         if actuation_result is not None and actuation_result.clock_prior_reset:
             target.last_sample_clock_delta_samples = None
-            target.clock_prior_reset_remaining = CLOCK_PRIOR_RESET_CYCLES
+            target.clock_prior_reset_remaining = (
+                actuation_result.clock_prior_reset_cycles
+                or CLOCK_PRIOR_RESET_CYCLES
+            )
         self._record_slice4_observation(
             target,
             measured_latency_ms=latency_ms,

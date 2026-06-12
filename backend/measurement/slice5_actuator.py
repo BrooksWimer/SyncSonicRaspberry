@@ -34,6 +34,7 @@ class ActuationResult:
     action: str
     delta_ms: float = 0.0
     clock_prior_reset: bool = False
+    clock_prior_reset_cycles: int = 0
 
 
 def register_ble_stop_callback(fn: BleStopCallback) -> None:
@@ -231,7 +232,12 @@ class SpeakerActuator:
             delta_ms=offset,
             new_filter_delay_ms=new_delay,
         )
-        return ActuationResult(action="corrected", delta_ms=offset, clock_prior_reset=True)
+        return ActuationResult(
+            action="corrected",
+            delta_ms=offset,
+            clock_prior_reset=True,
+            clock_prior_reset_cycles=_clock_prior_reset_cycles(),
+        )
 
     def set_delay(self, speaker_id: str, delay_ms: float) -> Optional[dict[str, Any]]:
         return self._write(speaker_id, f"set_delay {delay_ms:.3f}")
@@ -378,6 +384,16 @@ def _finite(value: Any) -> bool:
         return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+def _clock_prior_reset_cycles() -> int:
+    value = os.environ.get("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES")
+    if value is None:
+        return 3
+    try:
+        return int(value)
+    except ValueError:
+        return 3
 
 
 def _timestamp_iso() -> str:

@@ -36,4 +36,4 @@ The coordinated engine currently sends the same stereo mix to every speaker. The
 ## Progress log (auto)
 
 - 2026-06-12 — Slice 0: spatial feasibility study - measurable vs pure research (af2c42db-a443-4c12-be02-00a539d958d8): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/af2c42db-a443-4c12-be02-00a539d958d8.md
-- 2026-06-12 — Slice 0: spatial feasibility study - measurable vs pure research (af2c42db-a443-4c12-be02-00a539d958d8): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/af2c42db-a443-4c12-be02-00a539d958d8.md
+- 2026-06-12 — Slice 1: per-speaker EQ balancing - measure response, apply PipeWire correction filter (e31b022d-a3b0-446b-840b-68309dc1be65): Operator-confirmed verification (software-plus-pi) passed. → docs/maverick/workstreams/e31b022d-a3b0-446b-840b-68309dc1be65.md

@@ -32,3 +32,7 @@ The coordinated engine currently sends the same stereo mix to every speaker. The
 - Slices in this lane often produce documentation rather than code — and that's fine. Capture in `docs/maverick/proposals/spatial-*.md`.
 - A slice is "done" when it produces a deliberate go / no-go decision with documented reasoning. "Promising, defer to next slice" is also a valid outcome.
 - Decisions made here go into [`PROJECT_MEMORY.md`](../PROJECT_MEMORY.md) so they're durable. Don't bury experimental conclusions in slice transcripts.
+
+## Progress log (auto)
+
+- 2026-06-12 — Slice 0: spatial feasibility study - measurable vs pure research (af2c42db-a443-4c12-be02-00a539d958d8): Operator-confirmed verification (software-only) passed. → docs/maverick/workstreams/af2c42db-a443-4c12-be02-00a539d958d8.md

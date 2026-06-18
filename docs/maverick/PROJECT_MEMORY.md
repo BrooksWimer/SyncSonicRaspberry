@@ -9,6 +9,20 @@ Durable cross-workstream facts, decisions, and conventions. Operator-editable; p
 - **Go/no-go:** actuation infrastructure **go**; v1 full inverse EQ (85+ bands/speaker) **no-go** as product policy — next slice should use gentler correction and combined before/after A/B.
 - **Tooling:** `measurement.eq_measurement` (incl. `--combined`), `measurement.eq_apply`, `pipewire_eq_transport` (delay → eq → sink), `tools/pw_eq_filter.c` (128 bands max).
 
+## 2026-06-08 — ultrasonic-runtime-sync promoted to main
+
+**What shipped.** The `ultrasonic-runtime-sync` lane was validated and merged to `main` today. Ultrasonic alignment is now the unconditional default: `runtime-latency.service` starts automatically and actuates without any opt-in flag. Key changes in the conclusionary slice:
+
+- `FREAK_THRESHOLD_MS` removed — confidence window (median-of-3 + 2σ floor) is the sole input gate. Enables large initial-offset correction without false outlier rejection.
+- Per-speaker opt-out toggle in `SpeakerConfigScreen.tsx` — `SET_ULTRASONIC_PARTICIPATION` BLE opcode `0x6A`, exclusion state in `/run/syncsonic/ultrasonic_excluded.json`.
+- `RuntimeCorrectionWatcher` in `syncsonic_ble/runtime_corrections.py` — daemon thread inside the GATT service that tails `runtime_corrections.jsonl` and forwards all `phase=runtime_correction` events as `CALIBRATION_RESULT` BLE notifications. All actuation states (building_window, within_threshold, corrected) are now reflected in the frontend autosync card and latency slider in real time.
+- Measurement cadence tuned: `cadence_sec` 15 → 5, `CONFIDENCE_WINDOW_N` 5 → 3. Time to first correction ~36 s vs ~2.5 min previously.
+- Promotion gate override: the formal Slice 7 24-hour soak was waived by operator decision; conclusionary validation session on `syncsonic@10.0.0.89` accepted as sufficient.
+
+**Known open issue — post-correction settling race.** Short cadence (5 s) + window reset after every correction = the three post-correction measurements are taken while the BT codec pipeline is still settling at the new delay. With N=3 and no per-cycle magnitude cap, two transient readings can dominate the window median and fire a second large correction in the wrong direction. Observed in the JBL speaker during validation. Not regressed from before — it's a consequence of the cadence speedup. Scoped to `correction-hardening` workstream.
+
+**Planned follow-on workstream: correction-hardening.** Not yet opened. Scope: post-correction settling holdoff, per-cycle correction magnitude cap, adaptive per-sample input clamp (per-speaker rolling mean ± k×σ replacing the removed `FREAK_THRESHOLD_MS`), dynamic alignment target (`target = max(baselines) + margin` replaces stale static value — fixes the 5000 ms Sonos-legacy target that wastes latency on BT-only setups), and convergence/tracking two-phase control.
+
 ## 2026-05-01 - North Star reached on PipeWire stack
 
 - 3-speaker (2 BT + 1 Wi-Fi Sonos) auto-aligned playback validated end-to-end on Pi `syncsonic@10.0.0.89`.
@@ -580,3 +594,28 @@ After an iterative design conversation spanning slices 15-18 (cross-correlation 
 **Future exploration documented in `epics/ultrasonic-runtime-sync.md`** — six areas of potential improvement (xcorr precision, frequency adaptation, raw-mic analysis tooling, 24-hour soak, WiFi PipeWire integration, adaptive cadence). Operator decision 2026-06-03: not filed as committed workstreams. Only the WiFi integration is flagged as potentially warranting real workstream status eventually, and even there the architectural shape is undecided.
 
 **Epic promotion gate:** ultrasonic-runtime-sync epic remains unmerged to main as of 2026-06-03. Promotion is a separate operator-triggered step; not on this entry's critical path.
+
+## 2026-06-10 — spatial-audio-awareness Slice 0 feasibility conclusion
+
+Slice 0 documented the Pi 4 + one USB mic + three-speaker spatial boundary in
+[`workstreams/spatial-slice-0-feasibility.md`](workstreams/spatial-slice-0-feasibility.md).
+
+Durable conclusions:
+
+- **Go candidate:** per-speaker stereo channel-role routing is measurable now.
+  The current PipeWire graph already has one stereo delay filter per speaker and
+  consumed per-speaker left/right mix state; the missing product piece is
+  explicit speaker placement/role metadata plus an engine channel-selection
+  policy.
+- **Promising but not automatic:** one static USB mic can measure time of
+  arrival/range-to-mic after transport latency is controlled, but it cannot
+  infer unique 2D/3D speaker coordinates or bearing. Room geometry needs a
+  second mic, known mic relocation points, or user-entered placement.
+- **Defer as research:** listener-position awareness via BLE RSSI, UWB, or
+  phone audio TOA is not a current Pi 4 feature. RSSI remains a coarse
+  transport-health signal, UWB needs new radios, and phone TOA needs a new
+  phone-side measurement protocol.
+- **No-go for now:** Atmos/surround decode requires multichannel input, decode
+  or render support, output-role metadata, and an N-to-M mix matrix. HDMI
+  ARC/eARC is a Pi 4 hardware dead end without an external extractor/capture
+  device because the Pi exposes HDMI output, not ARC/eARC input.

@@ -17,7 +17,7 @@ from typing import Any, Callable, Mapping, Optional
 APPLY_THRESHOLD_MS = 30.0  # 2026-05-31 iter 2: raised 15->30 based on empirical 57-min run showing ~50% cycles still correcting at 15ms; 30 is final value for current measurement-precision regime, future work upgrades the measurement protocol
 BURST_AMP_LADDER_X1000 = (300, 600, 950)
 BURST_MISS_ESCALATION_THRESHOLD = 1  # slice 18: smart adjustment - escalate on every miss, drop on every success
-CONFIDENCE_WINDOW_N = 5  # slice 18.2: act on median of last N successful measurements; gates over-correction from single bad measurements
+CONFIDENCE_WINDOW_N = 3  # slice 18.2: act on median of last N successful measurements; gates over-correction from single bad measurements. 3 is sufficient — outliers inflate std which raises the sigma floor, so the gate is conservative under noise.
 CONFIDENCE_SIGMA_RATIO = 2.0  # |median_offset| must exceed window_std * this ratio to apply correction; prevents acting on noisy stretches
 BURST_AMP_X1000 = BURST_AMP_LADDER_X1000[0]
 SOCKET_TIMEOUT_SEC = 0.25
@@ -34,6 +34,7 @@ class ActuationResult:
     action: str
     delta_ms: float = 0.0
     clock_prior_reset: bool = False
+    clock_prior_reset_cycles: int = 0
 
 
 def register_ble_stop_callback(fn: BleStopCallback) -> None:
@@ -117,6 +118,7 @@ class SpeakerActuator:
         current_filter_delay: Optional[float],
         *,
         missed_burst: bool = False,
+        confidence_window_n: int = CONFIDENCE_WINDOW_N,
     ) -> ActuationResult:
         mac = speaker_id.upper()
         self.baseline_established.setdefault(mac, False)
@@ -157,19 +159,20 @@ class SpeakerActuator:
         # only large-offset gate: a big consistent initial offset is corrected,
         # while a noisy/disagreeing window is held.
         offset_single = float(measured_latency_ms) - float(target_total_ms)
+        window_needed = max(1, int(confidence_window_n))
 
         # Add to per-speaker sliding window
         window = self.measurement_window.setdefault(mac, [])
         window.append(float(measured_latency_ms))
-        if len(window) > CONFIDENCE_WINDOW_N:
+        if len(window) > window_needed:
             window.pop(0)
 
         # Building phase: not enough measurements yet to be confident
-        if len(window) < CONFIDENCE_WINDOW_N:
+        if len(window) < window_needed:
             self._log_action(
                 mac, "building_window",
                 window_n=len(window),
-                window_needed=CONFIDENCE_WINDOW_N,
+                window_needed=window_needed,
                 measured_latency_ms=measured_latency_ms,
                 offset_single_ms=offset_single,
             )
@@ -229,7 +232,12 @@ class SpeakerActuator:
             delta_ms=offset,
             new_filter_delay_ms=new_delay,
         )
-        return ActuationResult(action="corrected", delta_ms=offset, clock_prior_reset=True)
+        return ActuationResult(
+            action="corrected",
+            delta_ms=offset,
+            clock_prior_reset=True,
+            clock_prior_reset_cycles=_clock_prior_reset_cycles(),
+        )
 
     def set_delay(self, speaker_id: str, delay_ms: float) -> Optional[dict[str, Any]]:
         return self._write(speaker_id, f"set_delay {delay_ms:.3f}")
@@ -296,25 +304,36 @@ class SpeakerActuator:
         )
 
     def _log_action(self, mac: str, action: str, **fields: Any) -> None:
+        payload = {
+            "event": "slice5_actuation",
+            "phase": "runtime_correction",
+            "timestamp_iso": _timestamp_iso(),
+            "mac": mac,
+            "action": action,
+            **fields,
+        }
         self.logger.info(
-            json.dumps(
-                {
-                    "event": "slice5_actuation",
-                    "timestamp_iso": _timestamp_iso(),
-                    "mac": mac,
-                    "action": action,
-                    **fields,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+            json.dumps(payload, sort_keys=True, separators=(",", ":"))
         )
+        if self.runtime_corrections_path is None:
+            return
+        try:
+            self.runtime_corrections_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.runtime_corrections_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+        except OSError as exc:
+            self.logger.warning(
+                "failed to write action event to %s: %s",
+                self.runtime_corrections_path,
+                exc,
+            )
 
     def _write_runtime_correction(self, mac: str, **fields: Any) -> None:
         if self.runtime_corrections_path is None:
             return
         payload = {
             "event": "runtime_correction",
+            "phase": "runtime_correction",
             "timestamp_iso": _timestamp_iso(),
             "mac": mac,
             "action": "corrected",
@@ -365,6 +384,16 @@ def _finite(value: Any) -> bool:
         return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+def _clock_prior_reset_cycles() -> int:
+    value = os.environ.get("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES")
+    if value is None:
+        return 3
+    try:
+        return int(value)
+    except ValueError:
+        return 3
 
 
 def _timestamp_iso() -> str:

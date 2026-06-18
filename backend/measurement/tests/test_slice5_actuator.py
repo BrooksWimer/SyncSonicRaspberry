@@ -144,7 +144,9 @@ def test_disagreeing_high_std_window_does_not_correct_large_offset() -> None:
     actuator = _actuator(calls)
     _establish_baseline(actuator)
 
-    values = [970.0, 370.0, 970.0, 370.0, 970.0]
+    # Exactly CONFIDENCE_WINDOW_N alternating values so the window fills with
+    # high variance — the assertion list length must match values length.
+    values = [970.0, 370.0, 970.0][:CONFIDENCE_WINDOW_N]
     actions = [
         actuator.apply(MAC, measured, 370.0, 800.0)
         for measured in values
@@ -240,7 +242,8 @@ def test_emergency_stop_zeros_ppm_and_resets_baseline() -> None:
     assert actuator.baseline_established["11:22:33:44:55:66"] is False
 
 
-def test_slider_aware_clock_prior_reset_cycles_still_emitted() -> None:
+def test_slider_aware_clock_prior_reset_cycles_still_emitted(monkeypatch) -> None:
+    monkeypatch.delenv("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES", raising=False)
     calls: list[tuple[str, str]] = []
     actuator = _actuator(calls)
     _establish_baseline(actuator)
@@ -254,7 +257,23 @@ def test_slider_aware_clock_prior_reset_cycles_still_emitted() -> None:
     assert result.action == "corrected"
     assert result.delta_ms == -60.0
     assert result.clock_prior_reset is True
+    assert result.clock_prior_reset_cycles == 3
     assert calls == [("/tmp/AA_BB_CC_DD_EE_FF.sock", "set_delay 160.000")]
+
+
+def test_slider_aware_clock_prior_reset_cycles_can_be_configured(monkeypatch) -> None:
+    monkeypatch.setenv("SYNCSONIC_SLIDER_CLOCK_PRIOR_RESET_CYCLES", "5")
+    calls: list[tuple[str, str]] = []
+    actuator = _actuator(calls)
+    _establish_baseline(actuator)
+
+    actions = [
+        actuator.apply(MAC, 310.0, 370.0, 100.0)
+        for _idx in range(CONFIDENCE_WINDOW_N)
+    ]
+
+    assert actions[-1].clock_prior_reset_cycles == 5
+
 
 def test_startup_tune_convergence_with_fixed_target() -> None:
     # Matches the startup-tune semantic verified empirically: target_total_ms is a fixed
@@ -302,7 +321,9 @@ def test_corrected_action_appends_runtime_correction_jsonl(tmp_path: Path) -> No
     result = actions[-1]
 
     assert result.action == "corrected"
-    event = json.loads(path.read_text(encoding="utf-8").strip())
+    # _log_action now writes all states to JSONL — read the last line which is the correction.
+    lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    event = json.loads(lines[-1])
     assert event["action"] == "corrected"
     assert event["event"] == "runtime_correction"
     assert event["mac"] == MAC

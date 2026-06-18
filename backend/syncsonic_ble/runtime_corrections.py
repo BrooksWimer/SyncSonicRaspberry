@@ -20,6 +20,14 @@ log = get_logger(__name__)
 class RuntimeCorrectionWatcher:
     """Follow the actuator JSONL stream and emit one BLE event per correction."""
 
+    _FORWARDED_PHASES: frozenset[str] = frozenset(
+        {
+            "runtime_correction",
+            "silent_align_started",
+            "silent_align_complete",
+        },
+    )
+
     def __init__(
         self,
         notification_sink: NotificationSink,
@@ -99,21 +107,14 @@ class RuntimeCorrectionWatcher:
         except json.JSONDecodeError as exc:
             log.warning("Skipping malformed runtime correction JSONL line: %s", exc)
             return
-        if event.get("action") != "corrected":
+        # Forward all events that carry recognised phases so the frontend
+        # can render the full progression (building_window → within_threshold → corrected)
+        # as well as silent_align lifecycle events.
+        if event.get("phase") is None and event.get("action") == "corrected":
+            event["phase"] = "runtime_correction"
+        if event.get("phase") not in self._FORWARDED_PHASES:
             return
-
-        payload = {
-            "phase": "runtime_correction",
-            "mac": event.get("mac"),
-            "action": "corrected",
-            "timestamp_iso": event.get("timestamp_iso"),
-            "measured_latency_ms": event.get("measured_latency_ms"),
-            "target_total_ms": event.get("target_total_ms"),
-            "current_filter_delay_ms": event.get("current_filter_delay_ms"),
-            "delta_ms": event.get("delta_ms"),
-            "new_filter_delay_ms": event.get("new_filter_delay_ms"),
-        }
-        self.notification_sink(Msg.CALIBRATION_RESULT, payload)
+        self.notification_sink(Msg.CALIBRATION_RESULT, event)
 
 
 def build_and_start_runtime_correction_watcher(

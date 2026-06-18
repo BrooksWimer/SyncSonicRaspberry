@@ -13,7 +13,7 @@ Environment=PULSE_SERVER=unix:/run/syncsonic/pulse/native
 Environment=PULSE_SYSTEM_BUS=1
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/etc/default/syncsonic
-ExecStart=/home/syncsonic/SyncSonicPi/backend/.venv/bin/python3 /home/syncsonic/SyncSonicPi/backend/measurement/runtime_latency_service.py --max-speakers 4 --detector-mode pattern --pattern-bursts 3 --pattern-gap-ms 300 --amplitude 0.3
+ExecStart=/home/syncsonic/SyncSonicPi/backend/.venv/bin/python3 /home/syncsonic/SyncSonicPi/backend/measurement/runtime_latency_service.py --max-speakers 4 --detector-mode pattern --pattern-bursts 3 --pattern-gap-ms 300 --amplitude 0.3 --cadence-sec 5
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

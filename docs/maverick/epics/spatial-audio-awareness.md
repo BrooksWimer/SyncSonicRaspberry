@@ -171,3 +171,8 @@ USB mic is at the seat; using the **phone mic** for this is a future experiment 
   the lane branch, then explicitly promoted. Don't add spatial infra to `main` ad hoc.
 - Use Raspberry Pi validation for any claim about audio routing, latency, level, or
   end-to-end alignment — never local syntax-only verification (`reference_syncsonic_pi`).
+
+## Progress log
+
+- 2026-06-12 — Slice 0: spatial feasibility study → `docs/maverick/workstreams/spatial-slice-0-feasibility.md`
+- 2026-06-17 — Slice 1 EQ validation (measure → apply → combined): actuation go, v1 policy no-go → `docs/maverick/proposals/spatial-eq-per-speaker-experiment.md`, `docs/maverick/workstreams/spatial-slice-1-eq-validation.md`

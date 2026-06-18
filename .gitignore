@@ -35,5 +35,10 @@ spectrum.png
 .env.local
 .env.*.local
 
-# Claude Code worktrees + agent scratch
-.claude/
+# Generated EQ artifacts (room/speaker specific — reproduce via eq_measurement.py)
+backend/eq_profiles/
+backend/eq_measurements/
+
+# Compiled PipeWire filters (built on Pi via Makefile)
+backend/tools/pw_eq_filter
+backend/tools/pw_delay_filter

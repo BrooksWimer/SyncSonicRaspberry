@@ -92,6 +92,7 @@ defer" is a valid outcome. Durable conclusions go to `PROJECT_MEMORY.md`, eviden
 - **Track E — Correction probe (background, cheap).** A small experiment: how much does coarse
   per-speaker IIR EQ actually help through our chain? Settles where the codec wall is so we
   *know* rather than assume. Produces a doc + go/no-go, not engine code.
+  - **2026-06-17 result (done):** See [`proposals/spatial-eq-per-speaker-experiment.md`](proposals/spatial-eq-per-speaker-experiment.md). Actuation **go** (measure → infer → apply → combined validate). Full inverse flattening policy **no-go** for listening quality — noticeable but not preferred. All four levers (timing, volume, stereo L/R, EQ) confirmed available; next work is coordinated policy, not new infrastructure.
 
 ### Shared substrate
 

@@ -7,10 +7,13 @@
 # resolves correctly.
 
 PYTHON ?= python3
+CC ?= gcc
+PKG_CONFIG ?= pkg-config
+CFLAGS ?= -O2 -Wall -Wextra
 NAME ?= adhoc
 DURATION ?= 30
 
-.PHONY: help session report session-and-report compile
+.PHONY: help session report session-and-report compile tools
 
 help:
 	@echo "SyncSonic Slice 1 measurement targets:"
@@ -30,6 +33,9 @@ help:
 	@echo ""
 	@echo "  make compile"
 	@echo "      python -m compileall syncsonic_ble + measurement (CI sanity)."
+	@echo ""
+	@echo "  make tools"
+	@echo "      Build pw_delay_filter and pw_eq_filter."
 
 session:
 	$(PYTHON) -m measurement.run_session --name $(NAME) --duration $(DURATION)
@@ -47,3 +53,11 @@ session-and-report:
 
 compile:
 	$(PYTHON) -m compileall syncsonic_ble measurement
+
+tools: tools/pw_delay_filter tools/pw_eq_filter
+
+tools/pw_delay_filter: tools/pw_delay_filter.c
+	$(CC) $(CFLAGS) -pthread -o $@ $< $$($(PKG_CONFIG) --cflags --libs libpipewire-0.3) -latomic -lm
+
+tools/pw_eq_filter: tools/pw_eq_filter.c
+	$(CC) $(CFLAGS) -pthread -o $@ $< $$($(PKG_CONFIG) --cflags --libs libpipewire-0.3) -latomic -lm

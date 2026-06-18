@@ -2,6 +2,13 @@
 
 Durable cross-workstream facts, decisions, and conventions. Operator-editable; planning agents read this before each slice.
 
+## 2026-06-17 - Spatial Track E: per-speaker EQ actuation validated (policy no-go)
+
+- **Goal refined:** multi-speaker listening experience requires coordinating **timing + volume + stereo L/R + EQ**, not EQ alone. See `docs/maverick/proposals/spatial-eq-per-speaker-experiment.md`.
+- **Pi evidence (2026-06-17, 3× VIZIO BT, mic at listening position):** isolated per-speaker sweeps succeeded; `pw_eq_filter` applied in-chain after delay filters for all three speakers; combined post-EQ span 36.9 dB at MLP. Operator: clearly audible change, not clearly better.
+- **Go/no-go:** actuation infrastructure **go**; v1 full inverse EQ (85+ bands/speaker) **no-go** as product policy — next slice should use gentler correction and combined before/after A/B.
+- **Tooling:** `measurement.eq_measurement` (incl. `--combined`), `measurement.eq_apply`, `pipewire_eq_transport` (delay → eq → sink), `tools/pw_eq_filter.c` (128 bands max).
+
 ## 2026-05-01 - North Star reached on PipeWire stack
 
 - 3-speaker (2 BT + 1 Wi-Fi Sonos) auto-aligned playback validated end-to-end on Pi `syncsonic@10.0.0.89`.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -343,6 +345,41 @@ def test_fast_align_entry_preserves_amp_index(monkeypatch, tmp_path: Path) -> No
 
     assert service.slice5_actuator.burst_amp_indices[target.mac] == 2
     assert service.slice5_actuator.burst_amp_indices[joining.mac] == 0
+
+
+def test_fast_align_bounded_exit_writes_silent_align_complete(monkeypatch, tmp_path: Path) -> None:
+    args = _build_parser().parse_args(["--detector-mode", "pattern"])
+    service = RuntimeSyncService(args)
+    target = SpeakerTarget(mac="AA:BB:CC:DD:EE:FF", socket_path=Path("/tmp/filter.sock"))
+    service.state.targets = [target]
+    service._fast_align_active = True
+    service._fast_align_start_monotonic = time.monotonic()
+    service._fast_align_converged_cycles = 0
+
+    corrections_path = tmp_path / "runtime_corrections.jsonl"
+    monkeypatch.setattr(
+        "measurement.runtime_latency_service.RUNTIME_CORRECTIONS_PATH",
+        corrections_path,
+    )
+
+    # One converged cycle is not enough to exit the bounded fast pass.
+    service._maybe_complete_fast_align(["within_threshold"])
+    assert service._fast_align_active is True
+    assert not corrections_path.exists()
+
+    # A cycle that still needed a correction resets the converged counter.
+    service._maybe_complete_fast_align(["corrected"])
+    assert service._fast_align_active is True
+
+    # Two consecutive converged cycles end fast-align and write the event.
+    service._maybe_complete_fast_align(["within_threshold"])
+    service._maybe_complete_fast_align(["within_threshold"])
+    assert service._fast_align_active is False
+    lines = corrections_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["phase"] == "silent_align_complete"
+    assert event["speaker_macs"] == ["AA:BB:CC:DD:EE:FF"]
 
 
 def test_applied_delay_correction_resets_sample_clock_prior_window(monkeypatch) -> None:

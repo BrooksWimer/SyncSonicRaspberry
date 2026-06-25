@@ -68,6 +68,7 @@ from measurement.slice5_actuator import (
     BURST_AMP_LADDER_X1000,
     BURST_MISS_ESCALATION_THRESHOLD,
     CONFIDENCE_WINDOW_N,
+    RUNTIME_CORRECTIONS_PATH,
     ActuationResult,
     SpeakerActuator,
     register_ble_stop_callback,
@@ -1057,6 +1058,8 @@ class RuntimeSyncService:
         self.baseline_samples: dict[str, list[float]] = {}  # dynamic target: per-speaker raw codec latency samples
         self._target_from_persistence: bool = False
         self._fast_align_active = False
+        self._fast_align_start_monotonic: Optional[float] = None
+        self._fast_align_converged_cycles = 0
         self._slice4_observe_enabled = bool(getattr(args, "slice4_observe", False))
         self.slice4_observer: Optional[ObservationWriter] = (
             ObservationWriter(Path(args.slice4_observation_path))
@@ -1124,7 +1127,7 @@ class RuntimeSyncService:
     async def _measurement_loop(self) -> None:
         await self.detector.warmup(self.args.warmup_sec)
         while self.state.measuring:
-            fast_align_active = self._refresh_fast_align_state()
+            self._refresh_fast_align_state()
             previous = {target.mac: target for target in self.state.targets}
             excluded_macs = read_ultrasonic_exclusions()
             discovered = discover_active_speakers(
@@ -1156,36 +1159,111 @@ class RuntimeSyncService:
                 _emit("measurement_idle", reason="no_active_speakers")
                 await asyncio.sleep(5.0)
                 continue
+            cycle_actions: list[str] = []
             for target in list(self.state.targets):
                 if not self.state.measuring:
                     break
-                await self._measure_once(target)
-                cadence_sec = FAST_ALIGN_CADENCE_SEC if fast_align_active else self.args.cadence_sec
+                result = await self._measure_once(target)
+                if result is not None:
+                    cycle_actions.append(result.action)
+                cadence_sec = FAST_ALIGN_CADENCE_SEC if self._fast_align_active else self.args.cadence_sec
                 await asyncio.sleep(cadence_sec)
             self.state.cycles += 1
+            self._maybe_complete_fast_align(cycle_actions)
 
     def _refresh_fast_align_state(self) -> bool:
+        """Item 4d: detect the Silent Align trigger and enter bounded fast-align.
+
+        The trigger file (created by the BLE ``START_SILENT_ALIGN`` handler) is
+        consumed on detection. Entering fast-align resets per-speaker
+        measurement windows, holdoff counters, and dynamic-target baselines so
+        the fast pass converges from a clean state, then runs at
+        ``FAST_ALIGN_CADENCE_SEC`` until two consecutive converged cycles
+        (see ``_maybe_complete_fast_align``). Returns whether fast-align is
+        currently active.
+        """
         try:
-            active = FAST_ALIGN_TRIGGER_PATH.exists()
+            triggered = FAST_ALIGN_TRIGGER_PATH.exists()
         except OSError as exc:
             _emit(
                 "fast_align_trigger_probe_failed",
                 path=str(FAST_ALIGN_TRIGGER_PATH),
                 error=repr(exc),
             )
-            active = False
-        if active != self._fast_align_active:
-            self._fast_align_active = active
+            triggered = False
+        if triggered:
+            try:
+                FAST_ALIGN_TRIGGER_PATH.unlink()
+            except OSError:
+                pass
+            self._fast_align_active = True
+            self._fast_align_start_monotonic = time.monotonic()
+            self._fast_align_converged_cycles = 0
+            if self.slice5_actuator is not None:
+                for mac in list(self.slice5_actuator.measurement_window):
+                    self.slice5_actuator.measurement_window[mac] = []
+                holdoff = getattr(self.slice5_actuator, "holdoff_remaining", None)
+                if isinstance(holdoff, dict):
+                    for mac in list(holdoff):
+                        holdoff[mac] = 0
+            self.baseline_samples = {}
             _emit(
-                "fast_align_mode_changed",
-                active=active,
+                "fast_align_started",
                 trigger_path=str(FAST_ALIGN_TRIGGER_PATH),
-                cadence_sec=FAST_ALIGN_CADENCE_SEC if active else self.args.cadence_sec,
-                confidence_window_n=(
-                    FAST_ALIGN_CONFIDENCE_WINDOW_N if active else CONFIDENCE_WINDOW_N
-                ),
+                cadence_sec=FAST_ALIGN_CADENCE_SEC,
+                confidence_window_n=FAST_ALIGN_CONFIDENCE_WINDOW_N,
             )
-        return active
+        return self._fast_align_active
+
+    def _maybe_complete_fast_align(self, cycle_actions: list[str]) -> None:
+        """Item 4d: exit fast-align after two consecutive converged cycles.
+
+        A cycle is converged when every measured speaker reported
+        ``within_threshold`` (or ``holdoff``) — i.e. no further correction was
+        needed. On the second consecutive converged cycle the fast pass ends and
+        a ``silent_align_complete`` event is written to the runtime-corrections
+        stream so the BLE watcher forwards it to the app.
+        """
+        if not (self._fast_align_active and cycle_actions):
+            return
+        all_converged = all(
+            action in ("within_threshold", "holdoff") for action in cycle_actions
+        )
+        if all_converged:
+            self._fast_align_converged_cycles += 1
+        else:
+            self._fast_align_converged_cycles = 0
+        if self._fast_align_converged_cycles >= 2:
+            self._fast_align_active = False
+            duration_sec = time.monotonic() - (
+                self._fast_align_start_monotonic or time.monotonic()
+            )
+            speaker_macs = [target.mac for target in self.state.targets]
+            _emit(
+                "fast_align_complete",
+                speaker_macs=speaker_macs,
+                duration_sec=duration_sec,
+            )
+            self._write_silent_align_complete(speaker_macs, duration_sec)
+
+    def _write_silent_align_complete(
+        self, speaker_macs: list[str], duration_sec: float
+    ) -> None:
+        payload = {
+            "event": "runtime_correction",
+            "phase": "silent_align_complete",
+            "speaker_macs": speaker_macs,
+            "duration_sec": duration_sec,
+            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        try:
+            RUNTIME_CORRECTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with RUNTIME_CORRECTIONS_PATH.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+                )
+        except OSError as exc:
+            _emit("fast_align_complete_write_failed", error=repr(exc))
 
     def _confidence_window_n(self) -> int:
         return FAST_ALIGN_CONFIDENCE_WINDOW_N if self._fast_align_active else CONFIDENCE_WINDOW_N
@@ -1207,10 +1285,9 @@ class RuntimeSyncService:
             return
         self.slice5_actuator.sync_sockets(sockets)
 
-    async def _measure_once(self, target: SpeakerTarget) -> None:
+    async def _measure_once(self, target: SpeakerTarget) -> Optional[ActuationResult]:
         if self.args.detector_mode == "pattern":
-            await self._measure_pattern(target)
-            return
+            return await self._measure_pattern(target)
         query = _send_filter_command(target.socket_path, "query") or {}
         target_delay_samples = int(query.get("target_delay_samples") or 0)
         target_delay_ms = (target_delay_samples / SAMPLE_RATE) * 1000.0
@@ -1235,7 +1312,7 @@ class RuntimeSyncService:
         )
         if not ack or not ack.get("ok"):
             _emit("burst_emit_failed", mac=target.mac, ack=ack)
-            return
+            return None
 
         expected_arrival = emit_monotonic + (target_delay_samples / SAMPLE_RATE) + (self.args.bt_codec_latency_ms / 1000.0)
         margin_ms = STABLE_WINDOW_MARGIN_MS if target.stable_count >= STABLE_MEASUREMENT_COUNT else INITIAL_WINDOW_MARGIN_MS
@@ -1257,7 +1334,7 @@ class RuntimeSyncService:
                 slider_target_delay_samples=target_delay_samples,
                 frame_entries=entries,
             )
-            return
+            return None
 
         latency_ms = (detection["arrival_monotonic"] - emit_monotonic) * 1000.0
         target.stable_count += 1
@@ -1283,7 +1360,7 @@ class RuntimeSyncService:
         )
 
 
-    async def _measure_pattern(self, target: SpeakerTarget) -> None:
+    async def _measure_pattern(self, target: SpeakerTarget) -> Optional[ActuationResult]:
         query = _send_filter_command(target.socket_path, "query") or {}
         target_delay_samples = int(query.get("target_delay_samples") or 0)
         target_delay_ms = (target_delay_samples / SAMPLE_RATE) * 1000.0
@@ -1328,7 +1405,7 @@ class RuntimeSyncService:
             )
             if not ack or not ack.get("ok"):
                 _emit("burst_emit_failed", mac=target.mac, ack=ack, pattern_index=pattern_index)
-                return
+                return None
             if pattern_index < self.args.pattern_bursts - 1:
                 await asyncio.sleep(pattern_gap_sec)
 
@@ -1354,7 +1431,7 @@ class RuntimeSyncService:
         )
         if len(emit_entries) < self.args.pattern_bursts:
             target.stable_count = 0
-            self._apply_slice5_missed_burst(target, current_filter_delay_ms=current_filter_delay_ms)
+            missed_result = self._apply_slice5_missed_burst(target, current_filter_delay_ms=current_filter_delay_ms)
             self._record_slice4_missed_burst(
                 target,
                 current_filter_delay_ms=current_filter_delay_ms,
@@ -1379,7 +1456,7 @@ class RuntimeSyncService:
                 detect_end_monotonic=detect_end,
                 burst_amp_x1000=burst_amp_x1000,
             )
-            return
+            return missed_result
 
         emit_frame_indices = [int(entry["frame_index"]) for entry in emit_entries[: self.args.pattern_bursts]]
         clock_prior_delta_samples = (
@@ -1412,7 +1489,7 @@ class RuntimeSyncService:
                 target.sample_clock_baseline_samples = None
                 target.last_sample_clock_delta_samples = None
                 target.pattern_clock_reject_count = 0
-            self._apply_slice5_missed_burst(target, current_filter_delay_ms=current_filter_delay_ms)
+            missed_result = self._apply_slice5_missed_burst(target, current_filter_delay_ms=current_filter_delay_ms)
             self._record_slice4_missed_burst(
                 target,
                 current_filter_delay_ms=current_filter_delay_ms,
@@ -1467,7 +1544,7 @@ class RuntimeSyncService:
                 burst_amp_x1000=burst_amp_x1000,
                 **analysis,
             )
-            return
+            return missed_result
 
         latency_ms = (detection["arrival_monotonic"] - emit_records[0]["emit_monotonic"]) * 1000.0
         target.stable_count += 1
@@ -1574,6 +1651,7 @@ class RuntimeSyncService:
             },
             actuation_result=actuation_result,
         )
+        return actuation_result
 
     def _record_slice4_missed_burst(
         self,

@@ -29,6 +29,8 @@ logger = get_logger(__name__)
 ULTRASONIC_EXCLUDED_PATH = Path(
     os.environ.get("SYNCSONIC_ULTRASONIC_EXCLUDED_PATH", "/run/syncsonic/ultrasonic_excluded.json")
 )
+# Item 4: Silent Align button — runtime-latency service watches for this file.
+SILENT_ALIGN_TRIGGER_PATH = Path("/run/syncsonic/silent_align_requested")
 
 
 def _encode(msg: Msg, payload: Dict[str, Any]):
@@ -548,6 +550,18 @@ def handle_calibrate_all_speakers(char, data):
     )
 
 
+def handle_start_silent_align(char, data):
+    """Item 4c: create the trigger file and immediately notify frontend."""
+    try:
+        SILENT_ALIGN_TRIGGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SILENT_ALIGN_TRIGGER_PATH.touch()
+    except OSError as exc:
+        logger.warning("Failed to create silent_align trigger file: %s", exc)
+        return _encode(Msg.ERROR, {"error": f"Failed to create trigger file: {exc}"})
+    char.send_notification(Msg.CALIBRATION_RESULT, {"phase": "silent_align_started"})
+    return _encode(Msg.SUCCESS, {"queued": True})
+
+
 def unknown_handler(char, _):
     return _encode(Msg.ERROR, {"error": "Unknown message"})
 
@@ -564,6 +578,7 @@ HANDLERS = {
     Msg.ULTRASONIC_SYNC: handle_ultrasonic_sync,
     Msg.CALIBRATE_SPEAKER: handle_calibrate_speaker,
     Msg.CALIBRATE_ALL_SPEAKERS: handle_calibrate_all_speakers,
+    Msg.START_SILENT_ALIGN: handle_start_silent_align,
     Msg.SCAN_START: _scan_start,
     Msg.SCAN_STOP: _scan_stop,
     Msg.WIFI_SCAN_START: handle_wifi_scan_start,

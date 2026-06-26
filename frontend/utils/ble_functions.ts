@@ -394,3 +394,14 @@ export async function setUltrasonicParticipation(
   console.log('SET_ULTRASONIC_PARTICIPATION', payload);
   return bleWrite(device, MESSAGE_TYPES.SET_ULTRASONIC_PARTICIPATION, payload);
 }
+
+/**
+ * Item 4f: trigger fast ultrasonic silent alignment on the Pi.
+ * The Pi's runtime-latency service will enter fast-align mode and
+ * complete when all speakers converge. Progress arrives via CALIBRATION_RESULT
+ * notifications with phase "silent_align_started" / "silent_align_complete".
+ */
+export async function startSilentAlign(device: Device): Promise<void> {
+  console.log('START_SILENT_ALIGN');
+  return bleWrite(device, MESSAGE_TYPES.START_SILENT_ALIGN, {});
+}

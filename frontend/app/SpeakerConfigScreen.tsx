@@ -26,6 +26,7 @@ import {
   setMute,
   calibrateAllSpeakers,
   setUltrasonicParticipation,
+  startSilentAlign,
 } from '../utils/ble_functions';
 import LottieView from 'lottie-react-native';
 import { Audio } from 'expo-av';
@@ -142,6 +143,10 @@ export default function SpeakerConfigScreen() {
   const runtimeCorrectionFlashTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const runtimeCorrectionAnimationTimersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
 
+  // Item 4e: silent align button state ('idle' | 'aligning' | 'aligned').
+  const [silentAlignPhase, setSilentAlignPhase] = useState<'idle' | 'aligning' | 'aligned'>('idle');
+  const silentAlignResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const animateLatencyTo = useCallback((mac: string, targetLatencyMs: number) => {
     if (!Number.isFinite(targetLatencyMs)) return;
     const startLatencyMs = settings[mac]?.latency ?? targetLatencyMs;
@@ -176,6 +181,9 @@ export default function SpeakerConfigScreen() {
       Object.keys(runtimeCorrectionAnimationTimersRef.current).forEach(mac => {
         clearInterval(runtimeCorrectionAnimationTimersRef.current[mac]);
       });
+      if (silentAlignResetTimerRef.current) {
+        clearTimeout(silentAlignResetTimerRef.current);
+      }
     };
   }, []);
 
@@ -385,6 +393,23 @@ export default function SpeakerConfigScreen() {
         // are not affected; the completion alert is already handled
         // above via the seqOutcomesRef accumulator. Just record the
         // event for diagnostics and move on without alarming the user.
+        continue;
+      }
+
+      // Item 4e: silent align phase events from the runtime-latency service.
+      if (phase === 'silent_align_started') {
+        setSilentAlignPhase('aligning');
+        continue;
+      }
+      if (phase === 'silent_align_complete') {
+        setSilentAlignPhase('aligned');
+        if (silentAlignResetTimerRef.current) {
+          clearTimeout(silentAlignResetTimerRef.current);
+        }
+        silentAlignResetTimerRef.current = setTimeout(() => {
+          setSilentAlignPhase('idle');
+          silentAlignResetTimerRef.current = null;
+        }, 2000);
         continue;
       }
 
@@ -1084,6 +1109,19 @@ export default function SpeakerConfigScreen() {
     );
   };
 
+  const handleSilentAlign = async () => {
+    if (!connectedDevice) {
+      Alert.alert('Error', 'No Bluetooth device connected');
+      return;
+    }
+    try {
+      await startSilentAlign(connectedDevice);
+    } catch (error) {
+      console.error('Error starting silent align:', error);
+      Alert.alert('Error', 'Failed to send Silent Align command.');
+    }
+  };
+
   const handleUltrasonicParticipationToggle = async (mac: string, included: boolean) => {
     setUltrasonicIncludedByMac(prev => ({ ...prev, [mac]: included }));
     if (!connectedDevice) {
@@ -1234,10 +1272,34 @@ export default function SpeakerConfigScreen() {
                       Audible alignment tune
                     </Text>
                   </Button>
+                  <Button
+                    marginTop={10}
+                    backgroundColor={
+                      silentAlignPhase === 'aligned'
+                        ? (themeName === 'dark' ? '#00C853' : '#34A853')
+                        : (themeName === 'dark' ? '#1D2230' : '#EDF7F2')
+                    }
+                    borderRadius="$size.4"
+                    borderWidth={1}
+                    borderColor={pc as any}
+                    color={silentAlignPhase === 'aligned' ? 'white' : (tc as any)}
+                    disabled={silentAlignPhase === 'aligning'}
+                    height={48}
+                    onPress={handleSilentAlign}
+                    pressStyle={{ opacity: 0.85, scale: 0.98 }}
+                  >
+                    <Text fontFamily="Finlandica" color={silentAlignPhase === 'aligned' ? 'white' : tc}>
+                      {silentAlignPhase === 'aligning'
+                        ? 'Aligning...'
+                        : silentAlignPhase === 'aligned'
+                        ? 'Aligned ✓'
+                        : 'Silent Align'}
+                    </Text>
+                  </Button>
                   <Body center style={{ marginTop: 8, fontSize: 12, color: stc }}>
                     {seqInFlight
                       ? `${String(lastPhase).replace(/_/g, ' ')}…`
-                      : 'Silent ultrasonic auto-align is the default. The audible tune runs only from the button above.'}
+                      : 'Silent Align runs one quick ultrasonic pass now; continuous auto-align also runs in the background.'}
                   </Body>
                 </YStack>
               );

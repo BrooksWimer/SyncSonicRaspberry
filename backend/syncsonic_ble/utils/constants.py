@@ -63,6 +63,8 @@ class Msg(IntEnum):
     CALIBRATE_ALL_SPEAKERS  = 0x69
     # Runtime ultrasonic auto-align participation toggle
     SET_ULTRASONIC_PARTICIPATION = 0x6A
+    # Item 4: silent ultrasonic alignment button
+    START_SILENT_ALIGN          = 0x6B
     CONNECTION_STATUS_UPDATE= 0x70
     COORDINATOR_STATE       = 0x71  # Slice 3.6: 1 Hz per-speaker health snapshot
     COORDINATOR_EVENT       = 0x72  # Slice 3.6: edge-triggered soft_mute / state-change
